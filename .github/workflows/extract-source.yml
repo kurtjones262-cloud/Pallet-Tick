@@ -2,6 +2,9 @@
 name: Extract PartTrack Source
 
 on:
+  push:
+    paths:
+      - 'PartTrack-AI-Studio-Source.zip'
   workflow_dispatch:
 
 permissions:
@@ -15,7 +18,6 @@ jobs:
 
       - name: Extract project
         run: |
-          mkdir unpacked
           unzip -q PartTrack-AI-Studio-Source.zip -d unpacked
           rsync -a unpacked/ ./
           rm -rf unpacked
@@ -26,5 +28,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Restore PartTrack source"
+          git commit -m "Restore PartTrack source" || true
           git push

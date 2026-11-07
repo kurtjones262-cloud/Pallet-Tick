@@ -410,9 +410,18 @@ export default {
       return handleRecoverDocketItems(request, env);
     }
 
-    // If running in Cloudflare Worker with static assets binding
+    // Serve frontend static assets through Cloudflare Worker with SPA fallback
     if (env.ASSETS && typeof env.ASSETS.fetch === 'function') {
-      return env.ASSETS.fetch(request);
+      const assetRes = await env.ASSETS.fetch(request);
+      if (assetRes.status !== 404) {
+        return assetRes;
+      }
+      // For any non-API 404 route in GET / HEAD, fall back to index.html for SPA client routing
+      if (request.method === 'GET' || request.method === 'HEAD') {
+        const indexUrl = new URL('/', request.url);
+        return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+      }
+      return assetRes;
     }
 
     return new Response(JSON.stringify({ error: `Not found: ${url.pathname}` }), {

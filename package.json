@@ -5,10 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --platform=node --format=esm --outfile=server.js --bundle --packages=external",
+    "build": "vite build && esbuild worker.ts --platform=neutral --format=esm --outfile=dist/_worker.js --bundle && esbuild server.ts --platform=node --format=esm --outfile=server.js --bundle --packages=external",
     "build:static": "vite build",
+    "build:worker": "vite build && esbuild worker.ts --platform=neutral --format=esm --outfile=dist/_worker.js --bundle",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:worker": "npm run build && wrangler deploy",
     "start": "node server.ts",
     "preview": "vite preview",
+    "preview:worker": "wrangler dev",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "mobile:sync": "vite build && npx cap sync",
@@ -57,6 +61,7 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "vite-plugin-pwa": "^2.0.0"
+    "vite-plugin-pwa": "^2.0.0",
+    "wrangler": "^4.158.0"
   }
 }

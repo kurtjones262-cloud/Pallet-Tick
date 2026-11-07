@@ -121,7 +121,7 @@ export function App() {
     <div
       className={`${
         activeTab === 'scanner' ? 'h-dvh overflow-hidden' : 'min-h-dvh'
-      } bg-[#F6F5F2] text-[#18181B] flex flex-col font-sans selection:bg-emerald-600/15 selection:text-emerald-950`}
+      } bg-[#070A0F] text-slate-100 flex flex-col font-sans selection:bg-cyan-500/20 selection:text-cyan-200`}
     >
       {/* Startup Splash Screen */}
       {showSplash && (
@@ -159,6 +159,8 @@ export function App() {
             }}
             onStartScanning={() => setActiveTab('scanner')}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+            onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
+            onOpenSettings={() => setIsSettingsOpen(true)}
           />
         )}
 

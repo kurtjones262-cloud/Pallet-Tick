@@ -3,10 +3,13 @@ import {
   QrCode,
   ListChecks,
   LayoutGrid,
+  Boxes,
+  FileText,
   Settings,
   ChevronDown,
 } from 'lucide-react';
 import { Delivery } from '../types/delivery';
+import { exportDeliveryPdf } from '../utils/pdfExport';
 
 interface NavbarProps {
   activeTab: 'scanner' | 'checklist' | 'dashboard';
@@ -17,6 +20,7 @@ interface NavbarProps {
   onOpenDeliveriesList: () => void;
   onOpenTestSheet?: () => void;
   onOpenSettings: () => void;
+  onExportPdf?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -25,61 +29,87 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
+  onExportPdf,
 }) => {
   const total = activeDelivery?.parts.length || 0;
   const received = activeDelivery?.parts.filter((p) => p.status === 'received').length || 0;
   const remaining = total - received;
 
+  const handleReportsClick = () => {
+    if (onExportPdf) {
+      onExportPdf();
+    } else if (activeDelivery) {
+      exportDeliveryPdf(activeDelivery);
+    } else {
+      onOpenDeliveriesList();
+    }
+  };
+
   return (
     <>
-      {/* Top Bar: Minimal Native App Header */}
-      <header className="sticky top-0 z-30 bg-[#F6F5F2]/95 backdrop-blur-md border-b border-[#E4E3DE] pt-safe">
-        <div className="max-w-2xl mx-auto px-3 sm:px-4 h-11 flex items-center justify-between gap-2">
-          {/* Left: Brand + Delivery Selector */}
-          <div className="flex items-center gap-1.5 min-w-0">
+      {/* =========================================================================
+       * TOP BAR: Premium Dark Industrial Native Header
+       * ========================================================================= */}
+      <header className="sticky top-0 z-30 bg-[#070A0F]/95 backdrop-blur-md border-b border-[#1E2D44] pt-safe">
+        <div className="max-w-6xl mx-auto px-3 sm:px-6 h-12 flex items-center justify-between gap-3">
+          {/* Left: Brand + Active Docket Selector */}
+          <div className="flex items-center gap-2 min-w-0">
             <button
               onClick={() => setActiveTab('dashboard')}
-              className="flex items-center gap-1.5 shrink-0 cursor-pointer text-left group"
-              title="PalletTick Home"
+              className="flex items-center gap-2 shrink-0 cursor-pointer text-left group"
+              title="PalletTrack Home Dashboard"
             >
-              <img
-                src="/pallettrack-icon.png"
-                alt="PalletTick"
-                className="w-5 h-5 rounded-[4px] object-cover shadow-2xs group-hover:scale-105 transition-transform"
-              />
-              <span className="font-bold text-[13px] tracking-tight text-[#18181B]">
-                PalletTick
+              <div className="w-6 h-6 rounded-md overflow-hidden bg-black border border-cyan-500/30 shadow-[0_0_8px_rgba(0,168,255,0.3)] group-hover:scale-105 transition-transform">
+                <img
+                  src="/pallettrack-icon.png"
+                  alt="PalletTrack"
+                  className="w-full h-full object-cover"
+                />
+              </div>
+              <span className="font-bold text-sm tracking-tight text-white font-sans">
+                PalletTrack
               </span>
             </button>
 
-            <span className="text-zinc-300 text-xs select-none">/</span>
+            <span className="text-slate-600 text-xs select-none">/</span>
 
             {activeDelivery ? (
               <button
                 onClick={onOpenDeliveriesList}
-                className="flex items-center gap-1 py-1 px-1.5 -mx-1 rounded hover:bg-black/[0.04] text-[#18181B] transition-colors text-xs font-mono font-medium truncate max-w-[110px] sm:max-w-[180px] cursor-pointer"
-                title="Switch active delivery"
+                className="flex items-center gap-1.5 py-1 px-2 rounded-md hover:bg-white/5 text-slate-200 transition-colors text-xs font-mono font-medium truncate max-w-[130px] sm:max-w-[240px] cursor-pointer border border-transparent hover:border-[#1E2D44]"
+                title="Switch active delivery docket"
               >
                 <span className="truncate">{activeDelivery.docketNumber}</span>
-                <ChevronDown className="w-3 h-3 text-zinc-400 shrink-0" />
+                <span className="text-[10px] text-slate-400 hidden sm:inline">({activeDelivery.supplier})</span>
+                <ChevronDown className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
               </button>
             ) : (
               <button
                 onClick={onOpenDeliveriesList}
-                className="text-xs text-zinc-500 hover:text-zinc-900 cursor-pointer font-medium truncate"
+                className="text-xs text-slate-400 hover:text-white cursor-pointer font-mono font-medium truncate flex items-center gap-1 py-1 px-2 rounded hover:bg-white/5"
               >
-                Select docket
+                <span>Select docket</span>
+                <ChevronDown className="w-3 h-3 text-slate-500" />
               </button>
             )}
           </div>
 
-          {/* Right: Settings */}
-          <div className="flex items-center gap-1.5 shrink-0">
+          {/* Right: Quick Action & Settings */}
+          <div className="flex items-center gap-2 shrink-0">
+            {activeDelivery && (
+              <div className="hidden sm:flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded-md bg-[#0E1626] border border-[#1E2D44] text-slate-300">
+                <span className="text-cyan-400 font-bold">{received}</span>
+                <span className="text-slate-500">/</span>
+                <span>{total}</span>
+                <span className="text-slate-500 text-[10px] uppercase">rcvd</span>
+              </div>
+            )}
+
             <button
               onClick={onOpenSettings}
-              className="w-7 h-7 inline-flex items-center justify-center text-zinc-500 hover:text-[#18181B] hover:bg-black/[0.04] rounded transition-colors cursor-pointer"
+              className="w-8 h-8 inline-flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-colors cursor-pointer border border-transparent hover:border-[#1E2D44]"
               aria-label="Settings"
-              title="Settings"
+              title="Settings & System Configurations"
             >
               <Settings className="w-4 h-4 stroke-[1.75]" />
             </button>
@@ -87,69 +117,84 @@ export const Navbar: React.FC<NavbarProps> = ({
         </div>
       </header>
 
-      {/* Bottom Navigation: Minimal Fixed 3-Tab Bar */}
-      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#F6F5F2]/95 backdrop-blur-md border-t border-[#E4E3DE] pb-safe">
-        <div className="max-w-2xl mx-auto grid grid-cols-3 h-12">
-          {/* Tab 1: Dashboard */}
+      {/* =========================================================================
+       * BOTTOM NAVIGATION: Clean 5-Section Mobile & Tablet Layout
+       * [ Home · Pallets · (SCAN - Elevated Center) · Reports · Settings ]
+       * ========================================================================= */}
+      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0F1A]/95 backdrop-blur-md border-t border-[#1E2D44] pb-safe shadow-[0_-4px_20px_rgba(0,0,0,0.5)]">
+        <div className="max-w-2xl mx-auto grid grid-cols-5 h-14 items-center px-1">
+
+          {/* 1. Home */}
           <button
+            type="button"
             onClick={() => setActiveTab('dashboard')}
-            className={`relative flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+            className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer py-1 ${
               activeTab === 'dashboard'
-                ? 'text-[#18181B]'
-                : 'text-zinc-400 hover:text-zinc-700'
+                ? 'text-cyan-400'
+                : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            {activeTab === 'dashboard' && (
-              <span className="absolute top-0 inset-x-8 h-[2px] bg-[#18181B]" />
-            )}
-            <LayoutGrid className="w-4 h-4 stroke-[1.8]" />
-            <span className="text-[10px] font-medium tracking-tight leading-none">
-              Dashboard
+            <LayoutGrid className="w-4 h-4 stroke-[1.9]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Home
             </span>
           </button>
 
-          {/* Tab 2: Scan */}
+          {/* 2. Pallets */}
           <button
-            onClick={() => setActiveTab('scanner')}
-            className={`relative flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
-              activeTab === 'scanner'
-                ? 'text-[#059669]'
-                : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            {activeTab === 'scanner' && (
-              <span className="absolute top-0 inset-x-8 h-[2px] bg-[#059669]" />
-            )}
-            <QrCode className="w-4 h-4 stroke-[1.9]" />
-            <span className="text-[10px] font-medium tracking-tight leading-none">
-              Scan
-            </span>
-          </button>
-
-          {/* Tab 3: Checklist */}
-          <button
+            type="button"
             onClick={() => setActiveTab('checklist')}
-            className={`relative flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+            className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer py-1 ${
               activeTab === 'checklist'
-                ? 'text-[#18181B]'
-                : 'text-zinc-400 hover:text-zinc-700'
+                ? 'text-cyan-400'
+                : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            {activeTab === 'checklist' && (
-              <span className="absolute top-0 inset-x-8 h-[2px] bg-[#18181B]" />
-            )}
-            <div className="relative flex items-center justify-center">
-              <ListChecks className="w-4 h-4 stroke-[1.8]" />
-              {remaining > 0 && (
-                <span className="ml-1 text-[9px] font-mono font-semibold text-zinc-500 tabular-nums">
-                  {remaining}
-                </span>
-              )}
-            </div>
-            <span className="text-[10px] font-medium tracking-tight leading-none">
-              Checklist
+            <Boxes className="w-4 h-4 stroke-[1.9]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Pallets
             </span>
           </button>
+
+          {/* 3. Scan (Center Visually Prominent Elevated Button) */}
+          <div className="flex items-center justify-center -mt-5">
+            <button
+              type="button"
+              onClick={() => setActiveTab('scanner')}
+              className="w-13 h-13 rounded-2xl bg-gradient-to-tr from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-black flex flex-col items-center justify-center shadow-[0_0_22px_rgba(0,168,255,0.45)] border-2 border-[#070A0F] active:scale-95 transition-all cursor-pointer group"
+              title="Launch High-Speed Scanner"
+              aria-label="Scan parts"
+            >
+              <QrCode className="w-6 h-6 stroke-[2.4] group-hover:scale-105 transition-transform" />
+            </button>
+          </div>
+
+          {/* 4. Reports */}
+          <button
+            type="button"
+            onClick={handleReportsClick}
+            className="flex flex-col items-center justify-center gap-1 text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer py-1"
+            title="Generate & Export PDF Report"
+          >
+            <FileText className="w-4 h-4 stroke-[1.9]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Reports
+            </span>
+          </button>
+
+          {/* 5. Settings */}
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="flex flex-col items-center justify-center gap-1 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer py-1"
+            title="Application Settings"
+          >
+            <Settings className="w-4 h-4 stroke-[1.9]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Settings
+            </span>
+          </button>
+
         </div>
       </nav>
     </>

@@ -26,11 +26,14 @@ export function isCapacitorNativeRuntime(): boolean {
 
 export function resolveApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  const envBase = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
-    ?.VITE_API_BASE_URL;
+  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
+  const workerBase =
+    env.VITE_CLOUDFLARE_WORKER_URL ||
+    env.VITE_WORKER_URL ||
+    env.VITE_API_BASE_URL;
 
-  if (envBase && envBase.trim().length > 0) {
-    return `${envBase.trim().replace(/\/+$/, '')}${normalizedPath}`;
+  if (workerBase && workerBase.trim().length > 0) {
+    return `${workerBase.trim().replace(/\/+$/, '')}${normalizedPath}`;
   }
 
   return normalizedPath;

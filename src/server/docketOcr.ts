@@ -523,11 +523,12 @@ function normalizeRawBatchItem(
 export async function extractDocketWithGeminiVision(
   base64Images: string[],
   startItemIndex: number = 1,
-  pageSlices?: PageSlicePayload[]
+  pageSlices?: PageSlicePayload[],
+  overrideApiKey?: string
 ): Promise<ExtractedDocketResult> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = overrideApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
+    throw new Error('Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.');
   }
 
   const { GoogleGenAI, Type, ThinkingLevel } = await import('@google/genai');
@@ -777,9 +778,10 @@ export async function extractDocketWithGeminiVision(
 export async function recoverMissingDocketItems(
   slicePayload: PageSlicePayload,
   pageNumber: number,
-  missingNos: number[]
+  missingNos: number[],
+  overrideApiKey?: string
 ): Promise<ExtractedDocketItem[]> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = overrideApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey || !Array.isArray(missingNos) || missingNos.length === 0) {
     return [];
   }

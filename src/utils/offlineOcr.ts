@@ -1,10 +1,3 @@
-import { createWorker, OEM } from 'tesseract.js';
-import { preprocessDocketImage } from './imagePreprocessing';
-import {
-  parseIndustrialDocketText,
-  combineMultiPageDocketResults,
-  RawOcrLine,
-} from './docketParser';
 import {
   ExtractedDocketResult,
   PageSlicePayload,
@@ -13,9 +6,15 @@ import {
 export interface OcrProgressUpdate {
   currentPage: number;
   totalPages: number;
-  stage: 'preparing' | 'preprocessing' | 'recognizing' | 'parsing' | 'complete';
+  stage: 'preparing' | 'recognizing' | 'parsing' | 'complete';
   percent: number; // 0 - 100
   statusText: string;
+}
+
+export interface PageTextHint {
+  selectableLines?: Array<{ text: string; confidence?: number }>;
+  rawText?: string;
+  hasSelectableText?: boolean;
 }
 
 export interface OfflineDocketExtractionOutput {
@@ -30,23 +29,8 @@ export interface OfflineDocketExtractionOutput {
   }>;
 }
 
-/**
- * Resolves the API endpoint URL so both Web App and standalone Android APK (when online)
- * can reach the Gemini AI server route.
- */
-export function resolveApiUrl(path: string): string {
-  if (typeof window !== 'undefined' && window.location) {
-    const { protocol, hostname } = window.location;
-    if (
-      protocol === 'capacitor:' ||
-      protocol === 'file:' ||
-      (hostname === 'localhost' && window.location.port === '')
-    ) {
-      return `https://ais-pre-ylb2fbnp5zlbokgpprntyu-908589663728.asia-southeast1.run.app${path}`;
-    }
-  }
-  return path;
-}
+import { resolveApiUrl } from './apiConfig';
+export { resolveApiUrl };
 
 /**
  * Quickly resizes/compresses a photo in full color for Gemini AI Vision
@@ -200,30 +184,15 @@ async function preparePageSlicesForGemini(
 }
 
 /**
- * Smart Delivery Docket & Tax Invoice Parts Compiler:
- * - Coordinates extraction in a single server request using batched Dual-Zoom slices
- *   + single-call Global 1..MaxNo Gap Recovery (staying well under the 15-RPM Free Tier limit
- *   while capturing 100% of rows, e.g. 199/199).
- * - Falls back to on-device Tesseract.js OCR only when offline or when forceOffline is enabled.
- */
-export interface PageTextHint {
-  selectableLines?: RawOcrLine[];
-  rawText?: string;
-  hasSelectableText?: boolean;
-}
-
-/**
- * Smart Delivery Docket, PDF & Tax Invoice Parts Compiler:
- * - Supports both uploaded images and PDF documents (selectable text PDFs + scanned PDFs).
- * - When a PDF contains selectable text, extracts the text directly and uses it (both for instant
- *   offline compilation and to enrich Gemini AI structured extraction when online).
- * - Where a PDF contains scanned pages without selectable text, automatically uses OCR
- *   (Gemini AI Vision when online, or on-device Tesseract.js OCR when offline).
+ * Dedicated Invoice & Delivery Docket Parts Extraction:
+ * - Uses Gemini AI Vision exclusively on the server to identify individual parts, descriptions, and quantities.
+ * - Does NOT invoke on-device OCR under any circumstances.
+ * - If Gemini is unconfigured or unavailable, cleanly reports the error to the user without silent OCR fallback.
  */
 export async function performSmartDocketExtraction(
   images: Array<string | File>,
   onProgress?: (update: OcrProgressUpdate) => void,
-  forceOffline: boolean = false,
+  _forceOffline: boolean = false,
   pageTextHints?: PageTextHint[]
 ): Promise<OfflineDocketExtractionOutput> {
   const totalPages = images.length;
@@ -231,94 +200,86 @@ export async function performSmartDocketExtraction(
     throw new Error('No docket pages provided for extraction.');
   }
 
+  // Device-based OCR is completely removed from invoice importing.
+  // Gemini AI is used exclusively for extracting invoice parts.
   const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+  if (!isOnline) {
+    throw new Error(
+      'Invoice importing requires Gemini AI and an active internet connection. On-device OCR has been disabled for invoices. Please reconnect to the internet to compile invoices.'
+    );
+  }
 
-  // Check if any pages have direct selectable PDF text
-  const directPdfPageResults: Array<ReturnType<typeof parseIndustrialDocketText> | null> =
-    images.map((_, idx) => {
-      const hint = pageTextHints?.[idx];
-      if (hint?.hasSelectableText && hint.selectableLines && hint.selectableLines.length > 0) {
-        const parsed = parseIndustrialDocketText(hint.selectableLines, idx + 1);
-        if (parsed.items.length > 0) {
-          return parsed;
-        }
-      }
-      return null;
-    });
+  onProgress?.({
+    currentPage: 1,
+    totalPages,
+    stage: 'preparing',
+    percent: 15,
+    statusText:
+      totalPages > 1
+        ? `Preparing ${totalPages} document pages for Gemini AI extraction...`
+        : 'Preparing document for Gemini AI extraction...',
+  });
 
-  const allPagesHaveParsedPdfText =
-    directPdfPageResults.length > 0 && directPdfPageResults.every((r) => r !== null);
+  const preparedList = await Promise.all(
+    images.map((img) => preparePageSlicesForGemini(img, 2100))
+  );
 
-  if (isOnline && !forceOffline) {
+  const colorPages: OfflineDocketExtractionOutput['processedPages'] = preparedList.map(
+    (prepared, idx) => ({
+      pageNumber: idx + 1,
+      originalDataUrl: prepared.fullDataUrl,
+      preprocessedDataUrl: prepared.fullDataUrl,
+      width: prepared.width,
+      height: prepared.height,
+      slicePayload: {
+        fullDataUrl: prepared.fullDataUrl,
+        upperDataUrl: prepared.upperDataUrl,
+        lowerDataUrl: prepared.lowerDataUrl,
+        pdfSelectableText: pageTextHints?.[idx]?.rawText || undefined,
+      },
+    })
+  );
+
+  let progressTimer: ReturnType<typeof setInterval> | null = null;
+
+  try {
+    let simulatedPercent = 30;
     onProgress?.({
       currentPage: 1,
       totalPages,
-      stage: 'preparing',
-      percent: 15,
+      stage: 'recognizing',
+      percent: simulatedPercent,
       statusText:
         totalPages > 1
-          ? `Preparing ${totalPages} document pages for extraction...`
-          : 'Preparing document for parts extraction...',
+          ? `Extracting parts across ${totalPages} pages with Gemini AI...`
+          : 'Extracting parts with Gemini AI...',
     });
 
-    const preparedList = await Promise.all(
-      images.map((img) => preparePageSlicesForGemini(img, 2100))
-    );
-
-    const colorPages: OfflineDocketExtractionOutput['processedPages'] = preparedList.map(
-      (prepared, idx) => ({
-        pageNumber: idx + 1,
-        originalDataUrl: prepared.fullDataUrl,
-        preprocessedDataUrl: prepared.fullDataUrl,
-        width: prepared.width,
-        height: prepared.height,
-        slicePayload: {
-          fullDataUrl: prepared.fullDataUrl,
-          upperDataUrl: prepared.upperDataUrl,
-          lowerDataUrl: prepared.lowerDataUrl,
-          pdfSelectableText: pageTextHints?.[idx]?.rawText || undefined,
-        },
-      })
-    );
-
-    let progressTimer: ReturnType<typeof setInterval> | null = null;
-
-    try {
-      let simulatedPercent = 30;
-      onProgress?.({
-        currentPage: 1,
+    progressTimer = setInterval(() => {
+      simulatedPercent = Math.min(92, simulatedPercent + 6);
+      const estPage = Math.min(
         totalPages,
-        stage: 'recognizing',
+        Math.max(1, Math.ceil(((simulatedPercent - 25) / 68) * totalPages))
+      );
+      onProgress?.({
+        currentPage: estPage,
+        totalPages,
+        stage: simulatedPercent >= 82 ? 'parsing' : 'recognizing',
         percent: simulatedPercent,
         statusText:
-          totalPages > 1
-            ? `Extracting all parts across ${totalPages} pages & verifying 100% sequence...`
-            : 'Extracting all parts & verifying 100% sequence...',
+          simulatedPercent >= 82
+            ? 'Structuring parts checklist and verifying sequence...'
+            : totalPages > 1
+            ? `Scanning Page ${estPage} of ${totalPages} with Gemini AI...`
+            : 'Extracting part numbers, descriptions, and quantities...',
       });
+    }, 900);
 
-      progressTimer = setInterval(() => {
-        simulatedPercent = Math.min(92, simulatedPercent + 6);
-        const estPage = Math.min(
-          totalPages,
-          Math.max(1, Math.ceil(((simulatedPercent - 25) / 68) * totalPages))
-        );
-        onProgress?.({
-          currentPage: estPage,
-          totalPages,
-          stage: simulatedPercent >= 82 ? 'parsing' : 'recognizing',
-          percent: simulatedPercent,
-          statusText:
-            simulatedPercent >= 82
-              ? 'Verifying 100% sequence completeness (checking for any missing No. rows)...'
-              : totalPages > 1
-              ? `Scanning Page ${estPage} of ${totalPages}...`
-              : 'Compiling individual parts & details...',
-        });
-      }, 900);
+    const extractApiUrl = resolveApiUrl('/api/extract-docket');
 
-      const extractApiUrl = resolveApiUrl('/api/extract-docket');
-
-      const response = await fetch(extractApiUrl, {
+    let response: Response;
+    try {
+      response = await fetch(extractApiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -327,316 +288,66 @@ export async function performSmartDocketExtraction(
           startItemIndex: 1,
         }),
       });
-
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = null;
-      }
-
-      if (!response.ok) {
-        const errBody = await response.json().catch(() => ({}));
-        throw new Error(
-          errBody?.error || `AI extraction returned status ${response.status}`
-        );
-      }
-
-      const extractedResult: ExtractedDocketResult = await response.json();
-
-      // If AI returned 0 items on a PDF that had direct selectable text items, use the direct PDF text result
-      if (extractedResult.items.length === 0 && allPagesHaveParsedPdfText) {
-        const combinedPdf = combineMultiPageDocketResults(
-          directPdfPageResults.filter(Boolean) as Array<ReturnType<typeof parseIndustrialDocketText>>
-        );
-        combinedPdf.extractionMethod = 'pdf-text';
-        return {
-          extractedData: combinedPdf,
-          processedPages: colorPages,
-        };
-      }
-
-      onProgress?.({
-        currentPage: totalPages,
-        totalPages,
-        stage: 'complete',
-        percent: 100,
-        statusText: `Compiled ${extractedResult.items.length} parts across ${totalPages} ${
-          totalPages === 1 ? 'page' : 'pages'
-        }.`,
-      });
-
-      return {
-        extractedData: extractedResult,
-        processedPages: colorPages,
-      };
-    } catch (err: any) {
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = null;
-      }
-      // If all pages came from a PDF with selectable text that parsed cleanly, return that immediately!
-      if (allPagesHaveParsedPdfText) {
-        const combinedPdf = combineMultiPageDocketResults(
-          directPdfPageResults.filter(Boolean) as Array<ReturnType<typeof parseIndustrialDocketText>>
-        );
-        combinedPdf.extractionMethod = 'pdf-text';
-        onProgress?.({
-          currentPage: totalPages,
-          totalPages,
-          stage: 'complete',
-          percent: 100,
-          statusText: `Extracted ${combinedPdf.items.length} parts directly from PDF text.`,
-        });
-        return {
-          extractedData: combinedPdf,
-          processedPages: colorPages,
-        };
-      }
-      // Fall back to offline OCR if network is unreachable or if PDF pages need OCR
-      const stillOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
-      if (!stillOnline || pageTextHints?.some((h) => h !== undefined)) {
-        console.info('Switching to on-device PDF/OCR extraction:', err);
-        return performOfflineDocketOcr(images, onProgress, pageTextHints);
-      }
-      throw err;
-    }
-  }
-
-  // Explicit Offline / On-Device Extraction (uses direct PDF text where selectable, and Tesseract OCR on scanned pages)
-  return performOfflineDocketOcr(images, onProgress, pageTextHints);
-}
-
-/**
- * Runs completely on-device extraction across one or more docket pages:
- * - If a page is from a PDF with selectable text, extracts parts directly from the PDF text.
- * - If a page is an image or a scanned PDF page without selectable text, runs on-device Tesseract OCR.
- */
-export async function performOfflineDocketOcr(
-  images: Array<string | File>,
-  onProgress?: (update: OcrProgressUpdate) => void,
-  pageTextHints?: PageTextHint[]
-): Promise<OfflineDocketExtractionOutput> {
-  const totalPages = images.length;
-  if (totalPages === 0) {
-    throw new Error('No docket photos or PDF pages provided for processing.');
-  }
-
-  const processedPages: OfflineDocketExtractionOutput['processedPages'] = [];
-  for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
-    const pageNum = pageIdx + 1;
-    onProgress?.({
-      currentPage: pageNum,
-      totalPages,
-      stage: 'preprocessing',
-      percent: 8 + Math.round((pageIdx / totalPages) * 15),
-      statusText: `Preparing page ${pageNum} of ${totalPages}...`,
-    });
-    const preprocessed = await preprocessDocketImage(images[pageIdx]);
-    processedPages.push({
-      pageNumber: pageNum,
-      originalDataUrl: preprocessed.displayDataUrl,
-      preprocessedDataUrl: preprocessed.ocrDataUrl,
-      width: preprocessed.width,
-      height: preprocessed.height,
-    });
-  }
-
-  return performOfflineDocketOcrWithPreprocessed(processedPages, onProgress, pageTextHints);
-}
-
-async function performOfflineDocketOcrWithPreprocessed(
-  processedPages: OfflineDocketExtractionOutput['processedPages'],
-  onProgress?: (update: OcrProgressUpdate) => void,
-  pageTextHints?: PageTextHint[]
-): Promise<OfflineDocketExtractionOutput> {
-  const totalPages = processedPages.length;
-
-  onProgress?.({
-    currentPage: 1,
-    totalPages,
-    stage: 'preparing',
-    percent: 22,
-    statusText: 'Preparing document extraction engine...',
-  });
-
-  let worker: any = null;
-  const parsedPageResults: Array<ReturnType<typeof parseIndustrialDocketText>> = [];
-  let usedPdfTextCount = 0;
-
-  try {
-    const origin =
-      typeof window !== 'undefined' && window.location && window.location.origin
-        ? window.location.origin
-        : '';
-
-    const ensureTesseractWorker = async () => {
-      if (worker) return worker;
-
-      // Purge any stale/corrupted tesseract keyval-store IndexedDB cache from earlier sessions
-      if (typeof window !== 'undefined' && 'indexedDB' in window) {
-        try {
-          window.indexedDB.deleteDatabase('keyval-store');
-        } catch {
-          // Ignore IndexedDB cleanup errors
-        }
-      }
-
-      const loggerFn = (m: any) => {
-        if (m.status === 'recognizing text') {
-          const ocrProgress = Math.round((m.progress || 0) * 100);
-          onProgress?.({
-            currentPage: parsedPageResults.length + 1,
-            totalPages,
-            stage: 'recognizing',
-            percent: Math.min(92, 25 + Math.round(ocrProgress * 0.65)),
-            statusText: `Reading docket parts table: ${ocrProgress}%`,
-          });
-        }
-      };
-
-      const errorHandlerFn = (err: any) => {
-        console.warn('Tesseract worker internal error:', err);
-      };
-
-      worker = await createWorker('eng', OEM.LSTM_ONLY, {
-        workerPath: '/tesseract/worker.min.js',
-        workerBlobURL: false,
-        corePath: `${origin}/tesseract/core`,
-        langPath: `${origin}/tesseract/lang-data`,
-        gzip: true,
-        cacheMethod: 'none',
-        logger: loggerFn,
-        errorHandler: errorHandlerFn,
-      });
-
-      return worker;
-    };
-
-    for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
-      const pageNum = pageIdx + 1;
-      const pageData = processedPages[pageIdx];
-      const hint = pageTextHints?.[pageIdx];
-
-      // 1. If this page is from a PDF with selectable text, try direct PDF text extraction first
-      if (hint?.hasSelectableText && hint.selectableLines && hint.selectableLines.length > 0) {
-        onProgress?.({
-          currentPage: pageNum,
-          totalPages,
-          stage: 'parsing',
-          percent: 30 + Math.round((pageIdx / totalPages) * 55),
-          statusText: `Extracting selectable text from PDF page ${pageNum} of ${totalPages}...`,
-        });
-
-        const pdfParsed = parseIndustrialDocketText(hint.selectableLines, pageNum);
-        if (pdfParsed.items.length > 0) {
-          usedPdfTextCount++;
-          parsedPageResults.push(pdfParsed);
-          continue;
-        }
-      }
-
-      // 2. Otherwise (image upload or scanned PDF page without selectable text), run OCR
-      onProgress?.({
-        currentPage: pageNum,
-        totalPages,
-        stage: 'recognizing',
-        percent: 25 + Math.round((pageIdx / totalPages) * 60),
-        statusText: `Running on-device OCR on page ${pageNum} of ${totalPages}...`,
-      });
-
-      const activeWorker = await ensureTesseractWorker();
-      const ocrResult = await activeWorker.recognize(
-        pageData.preprocessedDataUrl,
-        {},
-        { blocks: true, text: true }
+    } catch (networkErr: any) {
+      throw new Error(
+        `Unable to reach the Gemini invoice extraction service at ${extractApiUrl}. Please verify your server or internet connection: ${
+          networkErr?.message || networkErr
+        }`
       );
-      const data = ocrResult.data || {};
-
-      // Extract line blocks from Tesseract v7 blocks hierarchy or fallback to text lines
-      const lines: RawOcrLine[] = [];
-
-      if (data.blocks && Array.isArray(data.blocks)) {
-        for (const block of data.blocks) {
-          if (block.paragraphs && Array.isArray(block.paragraphs)) {
-            for (const para of block.paragraphs) {
-              if (para.lines && Array.isArray(para.lines)) {
-                for (const line of para.lines) {
-                  const text = (line.text || '').trim();
-                  if (text) {
-                    lines.push({
-                      text,
-                      confidence: line.confidence || 75,
-                      bbox: line.bbox,
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
+    } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = null;
       }
-
-      if (lines.length === 0 && data.lines && Array.isArray(data.lines)) {
-        for (const line of data.lines) {
-          const text = (line.text || '').trim();
-          if (text) {
-            lines.push({
-              text,
-              confidence: line.confidence || 75,
-              bbox: line.bbox,
-            });
-          }
-        }
-      }
-
-      if (lines.length === 0 && data.text) {
-        const rawLines = data.text.split('\n');
-        for (const rl of rawLines) {
-          const text = rl.trim();
-          if (text) {
-            lines.push({
-              text,
-              confidence: data.confidence || 75,
-            });
-          }
-        }
-      }
-
-      onProgress?.({
-        currentPage: pageNum,
-        totalPages,
-        stage: 'parsing',
-        percent: 90,
-        statusText: `Compiling individual parts & details (Page ${pageNum})...`,
-      });
-
-      const pageParsed = parseIndustrialDocketText(lines, pageNum);
-      parsedPageResults.push(pageParsed);
     }
 
-    const combinedExtracted = combineMultiPageDocketResults(parsedPageResults);
-    if (usedPdfTextCount === totalPages) {
-      combinedExtracted.extractionMethod = 'pdf-text';
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      const code = errBody?.code || '';
+      const rawMsg = errBody?.error || '';
+
+      if (
+        response.status === 503 ||
+        code === 'MISSING_GEMINI_API_KEY' ||
+        rawMsg.includes('GEMINI_API_KEY') ||
+        rawMsg.toLowerCase().includes('api key')
+      ) {
+        throw new Error(
+          'Gemini AI API key is not configured on the server. Please configure the GEMINI_API_KEY secret in your server environment or Cloudflare Pages project settings (Settings > Environment variables).'
+        );
+      }
+
+      if (response.status === 429 || rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
+        throw new Error(
+          'Gemini AI rate limit reached. Please wait a few moments and click Retry Extraction.'
+        );
+      }
+
+      throw new Error(
+        rawMsg || `Gemini AI invoice extraction failed (HTTP status ${response.status}).`
+      );
     }
+
+    const extractedResult: ExtractedDocketResult = await response.json();
 
     onProgress?.({
       currentPage: totalPages,
       totalPages,
       stage: 'complete',
       percent: 100,
-      statusText: `Compiled ${combinedExtracted.items.length} parts successfully.`,
+      statusText: `Compiled ${extractedResult.items.length} parts across ${totalPages} ${
+        totalPages === 1 ? 'page' : 'pages'
+      }.`,
     });
 
     return {
-      extractedData: combinedExtracted,
-      processedPages,
+      extractedData: extractedResult,
+      processedPages: colorPages,
     };
   } finally {
-    if (worker) {
-      try {
-        await worker.terminate();
-      } catch (err) {
-        console.warn('Worker termination note:', err);
-      }
+    if (progressTimer) {
+      clearInterval(progressTimer);
+      progressTimer = null;
     }
   }
 }

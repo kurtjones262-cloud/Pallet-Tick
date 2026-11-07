@@ -129,6 +129,16 @@ app.post('/api/extract-docket', async (req: Request, res: Response) => {
     ) {
       return res.status(400).json({ error: 'No docket images provided.' });
     }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({
+        error:
+          'Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings or Cloudflare Pages project secrets.',
+        code: 'MISSING_GEMINI_API_KEY',
+      });
+    }
+
     const startIdx =
       typeof startItemIndex === 'number' && startItemIndex > 0 ? startItemIndex : 1;
     const result = await extractDocketWithGeminiVision(
@@ -138,10 +148,14 @@ app.post('/api/extract-docket', async (req: Request, res: Response) => {
     );
     return res.status(200).json(result);
   } catch (err: any) {
-    console.warn('AI vision docket extraction error, falling back to offline OCR:', err?.message || err);
-    return res.status(500).json({
-      error: err?.message || 'AI docket extraction unavailable.',
-      code: 'AI_EXTRACTION_FAILED',
+    const rawMsg = err?.message || String(err || '');
+    console.error('Gemini AI docket extraction error:', rawMsg);
+    const isMissingKey = rawMsg.includes('GEMINI_API_KEY');
+    return res.status(isMissingKey ? 503 : 500).json({
+      error: isMissingKey
+        ? 'Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.'
+        : rawMsg || 'Gemini AI docket extraction failed.',
+      code: isMissingKey ? 'MISSING_GEMINI_API_KEY' : 'AI_EXTRACTION_FAILED',
     });
   }
 });

@@ -19,13 +19,17 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({
 
   useEffect(() => {
     if (isReady && !error) {
-      // Begin smooth transition immediately when essential initialisation completes
-      setIsFadingOut(true);
-      const timer = setTimeout(() => {
-        setIsMounted(false);
-        onTransitionComplete?.();
-      }, 420);
-      return () => clearTimeout(timer);
+      // Display the splash screen first for 2 full seconds (2000ms)
+      const splashTimer = setTimeout(() => {
+        setIsFadingOut(true);
+        const exitTimer = setTimeout(() => {
+          setIsMounted(false);
+          onTransitionComplete?.();
+        }, 400); // 400ms smooth fade-out transition
+        return () => clearTimeout(exitTimer);
+      }, 2000); // 2 seconds startup display duration
+
+      return () => clearTimeout(splashTimer);
     }
   }, [isReady, error, onTransitionComplete]);
 

@@ -1,0 +1,615 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  ClipboardList,
+  Search,
+  Plus,
+  Trash2,
+  CheckCircle2,
+  Clock,
+  AlertCircle,
+  ChevronDown,
+  ChevronUp,
+  QrCode,
+  ListChecks,
+  Printer,
+  Calendar,
+  Boxes,
+  Truck,
+  Check,
+  AlertTriangle,
+  ArrowUpRight,
+} from 'lucide-react';
+import { Delivery, DeliveryPart } from '../types/delivery';
+import {
+  getStoredDeliveries,
+  setActiveDeliveryId,
+  deleteDelivery,
+  getPartVerificationState,
+} from '../utils/storage';
+import { exportDeliveryPdf } from '../utils/pdfExport';
+
+interface OrdersViewProps {
+  activeDelivery: Delivery | null;
+  onSelectDelivery: (delivery: Delivery) => void;
+  onNavigateToChecklist: (palletFilter?: string) => void;
+  onStartScanning: () => void;
+  onOpenNewDelivery: () => void;
+}
+
+type OrderCategoryFilter = 'all' | 'incomplete' | 'started' | 'finished';
+
+export const OrdersView: React.FC<OrdersViewProps> = ({
+  activeDelivery,
+  onSelectDelivery,
+  onNavigateToChecklist,
+  onStartScanning,
+  onOpenNewDelivery,
+}) => {
+  const [deliveries, setDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
+  const [categoryFilter, setCategoryFilter] = useState<OrderCategoryFilter>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [expandedOrderId, setExpandedOrderId] = useState<string | null>(() => activeDelivery?.id || null);
+  const [partsFilter, setPartsFilter] = useState<'all' | 'outstanding' | 'received'>('all');
+
+  const refreshDeliveries = () => {
+    setDeliveries(getStoredDeliveries());
+  };
+
+  useEffect(() => {
+    const handleDeliveriesUpdated = () => refreshDeliveries();
+    const handleActiveChanged = () => refreshDeliveries();
+
+    window.addEventListener('parttrack_deliveries_updated', handleDeliveriesUpdated);
+    window.addEventListener('parttrack_active_delivery_changed', handleActiveChanged);
+
+    return () => {
+      window.removeEventListener('parttrack_deliveries_updated', handleDeliveriesUpdated);
+      window.removeEventListener('parttrack_active_delivery_changed', handleActiveChanged);
+    };
+  }, []);
+
+  // Compute order state: 'incomplete' (0% scanned), 'started' (>0% and <100%), 'finished' (100% or completed)
+  const categorizedOrders = useMemo(() => {
+    return deliveries.map((d) => {
+      const parts = d.parts || [];
+      const total = parts.length;
+      const received = parts.filter((p) => p.status === 'received').length;
+      const percentage = total > 0 ? Math.round((received / total) * 100) : 0;
+
+      let category: 'incomplete' | 'started' | 'finished';
+      if (d.status === 'completed' || (total > 0 && received === total)) {
+        category = 'finished';
+      } else if (received > 0) {
+        category = 'started';
+      } else {
+        category = 'incomplete';
+      }
+
+      return {
+        delivery: d,
+        total,
+        received,
+        remaining: total - received,
+        percentage,
+        category,
+        isActive: activeDelivery?.id === d.id,
+      };
+    });
+  }, [deliveries, activeDelivery?.id]);
+
+  // Counts for filter pills
+  const counts = useMemo(() => {
+    let incomplete = 0;
+    let started = 0;
+    let finished = 0;
+
+    categorizedOrders.forEach((o) => {
+      if (o.category === 'finished') finished += 1;
+      else if (o.category === 'started') started += 1;
+      else incomplete += 1;
+    });
+
+    return {
+      all: categorizedOrders.length,
+      incomplete,
+      started,
+      finished,
+    };
+  }, [categorizedOrders]);
+
+  // Filtered orders list
+  const filteredOrders = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+
+    return categorizedOrders.filter((item) => {
+      // Category filter
+      if (categoryFilter !== 'all' && item.category !== categoryFilter) {
+        return false;
+      }
+
+      // Search query filter
+      if (q) {
+        const d = item.delivery;
+        const matchesDocket = (d.docketNumber || '').toLowerCase().includes(q);
+        const matchesSupplier = (d.supplier || '').toLowerCase().includes(q);
+        const matchesOrder = (d.orderNumber || '').toLowerCase().includes(q);
+        const matchesCarrier = (d.carrier || '').toLowerCase().includes(q);
+        const matchesParts = (d.parts || []).some(
+          (p) =>
+            (p.partNumber || '').toLowerCase().includes(q) ||
+            (p.description || '').toLowerCase().includes(q)
+        );
+        return matchesDocket || matchesSupplier || matchesOrder || matchesCarrier || matchesParts;
+      }
+
+      return true;
+    });
+  }, [categorizedOrders, categoryFilter, searchQuery]);
+
+  // Handle deleting an order
+  const handleDeleteOrder = (order: Delivery, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const docketName = order.docketNumber || 'Untitled Docket';
+    const supplier = order.supplier || 'Unknown Supplier';
+    const partsCount = (order.parts || []).length;
+
+    if (
+      confirm(
+        `Permanently remove order "${docketName}" (${supplier})?\n\nAll ${partsCount} parts and scan history records will be completely deleted.`
+      )
+    ) {
+      deleteDelivery(order.id);
+      refreshDeliveries();
+      if (activeDelivery?.id === order.id) {
+        const remaining = getStoredDeliveries();
+        if (remaining.length > 0) {
+          onSelectDelivery(remaining[0]);
+        }
+      }
+    }
+  };
+
+  // Select an order and make it active
+  const handleSelectOrder = (order: Delivery) => {
+    setActiveDeliveryId(order.id);
+    onSelectDelivery(order);
+    setExpandedOrderId(order.id);
+  };
+
+  // Toggle order expansion
+  const toggleExpand = (orderId: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setExpandedOrderId((prev) => (prev === orderId ? null : orderId));
+  };
+
+  return (
+    <div className="flex-1 w-full bg-[#070A0F] text-slate-100 flex flex-col pb-24 selection:bg-cyan-500/30 selection:text-cyan-200">
+      <div className="w-full max-w-5xl mx-auto px-3 sm:px-6 pt-4 sm:pt-6 space-y-4 sm:space-y-6">
+
+        {/* =========================================================================
+         * 1. ORDERS HEADER & NEW ORDER CTA
+         * ========================================================================= */}
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 sm:p-5 rounded-xl bg-[#0E1626] border border-[#1E2D44] shadow-md">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <ClipboardList className="w-5 h-5 text-cyan-400 shrink-0" />
+              <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white font-sans">
+                Orders &amp; Shipments
+              </h1>
+              <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30">
+                {counts.all} Total
+              </span>
+            </div>
+            <p className="text-xs font-mono text-slate-400 mt-1">
+              Select any order to inspect individual parts, launch scanning, or remove completed dockets.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={onOpenNewDelivery}
+              className="h-10 px-4 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-black font-bold text-xs tracking-wider uppercase inline-flex items-center gap-2 shadow-[0_0_15px_rgba(0,168,255,0.35)] transition-all cursor-pointer"
+            >
+              <Plus className="w-4 h-4 stroke-[2.5]" />
+              <span>New Order</span>
+            </button>
+          </div>
+        </header>
+
+        {/* =========================================================================
+         * 2. SEARCH & STATUS CATEGORY FILTERS (Incomplete / Started / Finished)
+         * ========================================================================= */}
+        <div className="space-y-3">
+          {/* Search bar */}
+          <div className="relative">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search by docket #, supplier, carrier, or part number..."
+              className="w-full h-11 pl-10 pr-4 rounded-xl bg-[#0E1626] border border-[#1E2D44] focus:border-cyan-500 focus:outline-none text-xs text-white placeholder-slate-500 font-sans shadow-sm transition-colors"
+            />
+          </div>
+
+          {/* Category Filter Tabs: All, Incomplete, Started, Finished */}
+          <div className="flex items-center gap-1.5 p-1 rounded-xl bg-[#0E1626] border border-[#1E2D44] overflow-x-auto no-scrollbar">
+            {/* All */}
+            <button
+              type="button"
+              onClick={() => setCategoryFilter('all')}
+              className={`flex-1 min-w-[70px] py-2 px-3 rounded-lg text-xs font-mono font-bold tracking-wide transition-all cursor-pointer text-center ${
+                categoryFilter === 'all'
+                  ? 'bg-cyan-500 text-black shadow-sm'
+                  : 'text-slate-400 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              All ({counts.all})
+            </button>
+
+            {/* Incomplete */}
+            <button
+              type="button"
+              onClick={() => setCategoryFilter('incomplete')}
+              className={`flex-1 min-w-[95px] py-2 px-3 rounded-lg text-xs font-mono font-bold tracking-wide transition-all cursor-pointer text-center ${
+                categoryFilter === 'incomplete'
+                  ? 'bg-amber-500 text-black shadow-sm'
+                  : 'text-slate-400 hover:text-amber-400 hover:bg-white/5'
+              }`}
+            >
+              Incomplete ({counts.incomplete})
+            </button>
+
+            {/* Started / In Progress */}
+            <button
+              type="button"
+              onClick={() => setCategoryFilter('started')}
+              className={`flex-1 min-w-[85px] py-2 px-3 rounded-lg text-xs font-mono font-bold tracking-wide transition-all cursor-pointer text-center ${
+                categoryFilter === 'started'
+                  ? 'bg-blue-500 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-cyan-400 hover:bg-white/5'
+              }`}
+            >
+              Started ({counts.started})
+            </button>
+
+            {/* Finished / Completed */}
+            <button
+              type="button"
+              onClick={() => setCategoryFilter('finished')}
+              className={`flex-1 min-w-[85px] py-2 px-3 rounded-lg text-xs font-mono font-bold tracking-wide transition-all cursor-pointer text-center ${
+                categoryFilter === 'finished'
+                  ? 'bg-emerald-500 text-black shadow-sm'
+                  : 'text-slate-400 hover:text-emerald-400 hover:bg-white/5'
+              }`}
+            >
+              Finished ({counts.finished})
+            </button>
+          </div>
+        </div>
+
+        {/* =========================================================================
+         * 3. ORDERS LIST
+         * ========================================================================= */}
+        <div className="space-y-3.5">
+          {filteredOrders.length > 0 ? (
+            filteredOrders.map(({ delivery: d, total, received, remaining, percentage, category, isActive }) => {
+              const isExpanded = expandedOrderId === d.id;
+
+              return (
+                <div
+                  key={d.id}
+                  className={`rounded-2xl transition-all border overflow-hidden ${
+                    isActive
+                      ? 'bg-[#101C31] border-cyan-500/60 shadow-[0_0_20px_rgba(0,168,255,0.15)]'
+                      : 'bg-[#0E1626] border-[#1E2D44] hover:border-slate-600'
+                  }`}
+                >
+                  {/* Order Summary Header / Card Row */}
+                  <div
+                    onClick={() => handleSelectOrder(d)}
+                    className="p-4 sm:p-5 cursor-pointer flex flex-col gap-3"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                      {/* Left: Docket Number & Supplier */}
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono font-bold text-base text-cyan-300">
+                            #{d.docketNumber}
+                          </span>
+                          <span className="text-sm font-bold text-white font-sans">
+                            {d.supplier}
+                          </span>
+                          {isActive && (
+                            <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-cyan-400 text-black">
+                              ACTIVE
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Order Metadata */}
+                        <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-slate-400 mt-1">
+                          <span className="inline-flex items-center gap-1">
+                            <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                            {d.deliveryDate || 'No date'}
+                          </span>
+                          {d.palletCount ? (
+                            <span className="inline-flex items-center gap-1">
+                              <Boxes className="w-3.5 h-3.5 text-slate-500" />
+                              {d.palletCount} Pallets
+                            </span>
+                          ) : null}
+                          {d.carrier ? (
+                            <span className="inline-flex items-center gap-1">
+                              <Truck className="w-3.5 h-3.5 text-slate-500" />
+                              {d.carrier}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      {/* Right: Status Pill & Delete Order */}
+                      <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                        {/* Status Pill */}
+                        {category === 'finished' ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/40">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            FINISHED
+                          </span>
+                        ) : category === 'started' ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-cyan-950/80 text-cyan-300 border border-cyan-500/40">
+                            <Clock className="w-3.5 h-3.5" />
+                            STARTED ({percentage}%)
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-amber-950/80 text-amber-400 border border-amber-500/40">
+                            <AlertCircle className="w-3.5 h-3.5" />
+                            INCOMPLETE
+                          </span>
+                        )}
+
+                        {/* Delete Order Button */}
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteOrder(d, e)}
+                          className="h-8 w-8 rounded-lg bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-400 hover:text-red-200 flex items-center justify-center transition-colors cursor-pointer"
+                          title="Remove entire order"
+                          aria-label="Delete order"
+                        >
+                          <Trash2 className="w-4 h-4 stroke-[1.8]" />
+                        </button>
+
+                        {/* Expand / Collapse parts chevron */}
+                        <button
+                          type="button"
+                          onClick={(e) => toggleExpand(d.id, e)}
+                          className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono text-slate-300 hover:text-white inline-flex items-center gap-1 cursor-pointer transition-colors"
+                          title={isExpanded ? 'Collapse parts' : 'View individual parts'}
+                        >
+                          <span>{isExpanded ? 'Hide' : 'Parts'}</span>
+                          {isExpanded ? (
+                            <ChevronUp className="w-3.5 h-3.5 text-cyan-400" />
+                          ) : (
+                            <ChevronDown className="w-3.5 h-3.5 text-cyan-400" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Progress Bar */}
+                    <div className="space-y-1.5 pt-1">
+                      <div className="flex items-center justify-between text-xs font-mono">
+                        <span className="text-slate-400">
+                          {received} of {total} parts received
+                        </span>
+                        <span className="font-bold text-white tabular-nums">
+                          {percentage}% complete
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 rounded-full bg-[#142036] overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-300 ${
+                            category === 'finished'
+                              ? 'bg-emerald-400'
+                              : category === 'started'
+                              ? 'bg-gradient-to-r from-cyan-400 to-blue-500'
+                              : 'bg-amber-400/50'
+                          }`}
+                          style={{ width: `${percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* =========================================================================
+                   * EXPANDED INDIVIDUAL PARTS LIST (When Order is Opened)
+                   * ========================================================================= */}
+                  {isExpanded && (
+                    <div className="border-t border-[#1E2D44] bg-[#0A101C] p-4 sm:p-5 space-y-4">
+                      {/* Action Bar for this Order */}
+                      <div className="flex flex-wrap items-center justify-between gap-2.5 pb-3 border-b border-white/5">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-mono font-bold uppercase tracking-wider text-slate-400">
+                            Individual Parts ({d.parts.length})
+                          </span>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-xs font-mono text-cyan-400">
+                            {remaining} Outstanding
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleSelectOrder(d);
+                              onStartScanning();
+                            }}
+                            className="h-8 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs font-mono tracking-wider uppercase inline-flex items-center gap-1.5 cursor-pointer shadow-sm"
+                          >
+                            <QrCode className="w-3.5 h-3.5 stroke-[2.2]" />
+                            <span>Scan Parts</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleSelectOrder(d);
+                              onNavigateToChecklist();
+                            }}
+                            className="h-8 px-3 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono font-medium text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <ListChecks className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>Full Checklist</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => exportDeliveryPdf(d)}
+                            className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono text-slate-300 inline-flex items-center gap-1 cursor-pointer"
+                            title="Export colour-coded PDF report"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Parts Quick Status Filter */}
+                      <div className="flex items-center gap-1.5 text-xs font-mono">
+                        <span className="text-slate-500 text-[11px] uppercase tracking-wider mr-1">Filter:</span>
+                        <button
+                          type="button"
+                          onClick={() => setPartsFilter('all')}
+                          className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                            partsFilter === 'all'
+                              ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          All ({total})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPartsFilter('outstanding')}
+                          className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                            partsFilter === 'outstanding'
+                              ? 'bg-amber-950 text-amber-300 border border-amber-500/40'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Outstanding ({remaining})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPartsFilter('received')}
+                          className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                            partsFilter === 'received'
+                              ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/40'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Received ({received})
+                        </button>
+                      </div>
+
+                      {/* Parts Rows */}
+                      <div className="divide-y divide-white/5 border border-[#1E2D44] rounded-xl overflow-hidden bg-[#070A0F]">
+                        {d.parts
+                          .filter((p) => {
+                            if (partsFilter === 'outstanding') return p.status !== 'received';
+                            if (partsFilter === 'received') return p.status === 'received';
+                            return true;
+                          })
+                          .slice(0, 100)
+                          .map((part) => {
+                            const verState = getPartVerificationState(part);
+                            const isReceived = part.status === 'received';
+
+                            return (
+                              <div
+                                key={part.id}
+                                className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-white/[0.02] transition-colors"
+                              >
+                                <div className="min-w-0 space-y-0.5">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-mono font-bold text-xs text-white">
+                                      {part.partNumber}
+                                    </span>
+                                    {part.palletNumber ? (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#131E33] text-cyan-300 border border-cyan-500/30">
+                                        Pallet {part.palletNumber}
+                                      </span>
+                                    ) : null}
+                                    {part.thickness ? (
+                                      <span className="text-[10px] font-mono text-slate-500">
+                                        {part.thickness}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <p className="text-xs text-slate-400 truncate font-sans">
+                                    {part.description || 'Laser-cut item'}
+                                  </p>
+                                </div>
+
+                                <div className="flex items-center gap-3 self-end sm:self-auto shrink-0">
+                                  <div className="text-right font-mono">
+                                    <div className="text-xs font-bold text-white tabular-nums">
+                                      {verState.receivedQty} / {verState.requiredQty}
+                                    </div>
+                                    <div className="text-[10px] text-slate-500">Qty</div>
+                                  </div>
+
+                                  <div>
+                                    {verState.state === 'verified' ? (
+                                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/30">
+                                        VERIFIED
+                                      </span>
+                                    ) : verState.state === 'quantity_mismatch' ? (
+                                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-400 border border-amber-500/30">
+                                        MISMATCH
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                                        UNSCANNED
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            /* Empty State */
+            <div className="py-16 px-6 rounded-2xl bg-[#0E1626] border border-dashed border-[#1E2D44] text-center flex flex-col items-center justify-center space-y-3">
+              <ClipboardList className="w-10 h-10 text-slate-500" />
+              <h3 className="text-base font-bold text-white">No Orders Found</h3>
+              <p className="text-xs font-mono text-slate-400 max-w-sm leading-relaxed">
+                {searchQuery
+                  ? `No orders match your search "${searchQuery}". Try a different keyword or reset filters.`
+                  : categoryFilter !== 'all'
+                  ? `No orders currently in the "${categoryFilter}" category.`
+                  : 'No delivery orders or dockets logged in the system yet.'}
+              </p>
+              <button
+                type="button"
+                onClick={onOpenNewDelivery}
+                className="mt-2 h-10 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs uppercase tracking-wider inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+              >
+                <Plus className="w-4 h-4 stroke-[2.5]" />
+                <span>Upload New Docket</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+      </div>
+    </div>
+  );
+};

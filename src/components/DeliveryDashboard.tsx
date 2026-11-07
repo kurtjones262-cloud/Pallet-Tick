@@ -24,6 +24,7 @@ import {
   FileText,
   AlertTriangle,
   FolderOpen,
+  ClipboardList,
 } from 'lucide-react';
 import { Delivery, DeliveryPart, ScanEvent, SupplierRuleId } from '../types/delivery';
 import { exportDeliveryPdf } from '../utils/pdfExport';
@@ -41,6 +42,7 @@ interface DeliveryDashboardProps {
   onOpenUnexpectedModal: () => void;
   onOpenTestSheet: () => void;
   onNavigateToChecklist: (palletFilter?: string) => void;
+  onNavigateToOrders?: () => void;
   onStartScanning: () => void;
   onOpenNewDelivery?: () => void;
   onOpenDeliveriesList?: () => void;
@@ -53,6 +55,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   onOpenUnexpectedModal,
   onOpenTestSheet,
   onNavigateToChecklist,
+  onNavigateToOrders,
   onStartScanning,
   onOpenNewDelivery,
   onOpenDeliveriesList,
@@ -838,17 +841,17 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
               <div className="text-[10px] font-mono text-slate-400 mt-0.5">High-speed scanner</div>
             </button>
 
-            {/* Quick Action 2: View Pallets */}
+            {/* Quick Action 2: View Orders */}
             <button
               type="button"
-              onClick={() => onNavigateToChecklist()}
+              onClick={() => (onNavigateToOrders ? onNavigateToOrders() : onNavigateToChecklist())}
               className="p-3.5 rounded-xl bg-[#0E1626] hover:bg-[#142036] border border-[#1E2D44] hover:border-cyan-500/50 text-left transition-all cursor-pointer group"
             >
               <div className="w-8 h-8 rounded-lg bg-blue-950/80 text-blue-400 border border-blue-500/30 flex items-center justify-center mb-2.5 group-hover:scale-105 transition-transform">
-                <Boxes className="w-4 h-4" />
+                <ClipboardList className="w-4 h-4" />
               </div>
-              <div className="font-bold text-xs text-white">View Pallets</div>
-              <div className="text-[10px] font-mono text-slate-400 mt-0.5">Pallet groupings &amp; bins</div>
+              <div className="font-bold text-xs text-white">View Orders</div>
+              <div className="text-[10px] font-mono text-slate-400 mt-0.5">Incomplete, started &amp; finished</div>
             </button>
 
             {/* Quick Action 3: Generate Reports */}

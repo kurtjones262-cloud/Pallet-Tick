@@ -17,9 +17,10 @@ import {
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { SplashScreen } from './components/SplashScreen';
+import { OrdersView } from './components/OrdersView';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard' | 'orders'>('dashboard');
   const [activeDelivery, setActiveDelivery] = useState<Delivery | null>(null);
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
   const [externalPendingQuantity, setExternalPendingQuantity] =
@@ -110,7 +111,7 @@ export function App() {
     }
   };
 
-  const handleSelectTab = (tab: 'scanner' | 'checklist' | 'dashboard') => {
+  const handleSelectTab = (tab: 'scanner' | 'checklist' | 'dashboard' | 'orders') => {
     if (tab !== 'checklist') {
       setChecklistPalletFilter('all');
     }
@@ -157,10 +158,24 @@ export function App() {
               setChecklistPalletFilter(pallet || 'all');
               setActiveTab('checklist');
             }}
+            onNavigateToOrders={() => setActiveTab('orders')}
             onStartScanning={() => setActiveTab('scanner')}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
             onOpenSettings={() => setIsSettingsOpen(true)}
+          />
+        )}
+
+        {activeTab === 'orders' && (
+          <OrdersView
+            activeDelivery={activeDelivery}
+            onSelectDelivery={handleUpdateDelivery}
+            onNavigateToChecklist={(pallet) => {
+              setChecklistPalletFilter(pallet || 'all');
+              setActiveTab('checklist');
+            }}
+            onStartScanning={() => setActiveTab('scanner')}
+            onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
           />
         )}
 

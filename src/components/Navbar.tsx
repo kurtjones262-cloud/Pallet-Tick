@@ -3,7 +3,7 @@ import {
   QrCode,
   ListChecks,
   LayoutGrid,
-  Boxes,
+  ClipboardList,
   FileText,
   Settings,
   ChevronDown,
@@ -12,8 +12,8 @@ import { Delivery } from '../types/delivery';
 import { exportDeliveryPdf } from '../utils/pdfExport';
 
 interface NavbarProps {
-  activeTab: 'scanner' | 'checklist' | 'dashboard';
-  setActiveTab: (tab: 'scanner' | 'checklist' | 'dashboard') => void;
+  activeTab: 'scanner' | 'checklist' | 'dashboard' | 'orders';
+  setActiveTab: (tab: 'scanner' | 'checklist' | 'dashboard' | 'orders') => void;
   activeDelivery: Delivery | null;
   onUpdateDelivery?: (updated: Delivery) => void;
   onOpenNewDelivery?: () => void;
@@ -119,7 +119,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* =========================================================================
        * BOTTOM NAVIGATION: Clean 5-Section Mobile & Tablet Layout
-       * [ Home · Pallets · (SCAN - Elevated Center) · Reports · Settings ]
+       * [ Home · Orders · (SCAN - Elevated Center) · Reports · Settings ]
        * ========================================================================= */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0F1A]/95 backdrop-blur-md border-t border-[#1E2D44] pb-safe shadow-[0_-4px_20px_rgba(0,0,0,0.5)]">
         <div className="max-w-2xl mx-auto grid grid-cols-5 h-14 items-center px-1">
@@ -140,19 +140,19 @@ export const Navbar: React.FC<NavbarProps> = ({
             </span>
           </button>
 
-          {/* 2. Pallets */}
+          {/* 2. Orders */}
           <button
             type="button"
-            onClick={() => setActiveTab('checklist')}
+            onClick={() => setActiveTab('orders')}
             className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer py-1 ${
-              activeTab === 'checklist'
+              activeTab === 'orders'
                 ? 'text-cyan-400'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            <Boxes className="w-4 h-4 stroke-[1.9]" />
+            <ClipboardList className="w-4 h-4 stroke-[1.9]" />
             <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
-              Pallets
+              Orders
             </span>
           </button>
 

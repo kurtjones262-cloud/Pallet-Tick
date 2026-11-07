@@ -1,6 +1,7 @@
 import { jsPDF } from 'jspdf';
 import { Delivery } from '../types/delivery';
 import { getPartVerificationState, getDeliverySupplierRule } from './storage';
+import { PALLETTICK_LOGO_BASE64 } from './logoBase64';
 
 export function createDeliveryPdfDoc(delivery: Delivery): jsPDF {
   const doc = new jsPDF({
@@ -26,16 +27,23 @@ export function createDeliveryPdfDoc(delivery: Delivery): jsPDF {
   doc.setFillColor(18, 22, 30);
   doc.rect(0, 0, 210, 38, 'F');
 
+  // Official PalletTick Logo
+  try {
+    doc.addImage(PALLETTICK_LOGO_BASE64, 'PNG', 12, 6, 26, 26);
+  } catch (err) {
+    console.warn('Could not embed PalletTick logo in PDF:', err);
+  }
+
   // Title
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(19);
+  doc.setFontSize(20);
   doc.setTextColor(255, 255, 255);
-  doc.text('PartTrack', 14, 17);
+  doc.text('PalletTick', 42, 18);
 
-  doc.setFontSize(9.5);
+  doc.setFontSize(8.5);
   doc.setFont('helvetica', 'normal');
   doc.setTextColor(156, 163, 175);
-  doc.text('COLOUR-CODED PARTS RECEIVING & VERIFICATION REPORT', 14, 24);
+  doc.text('COLOUR-CODED PARTS RECEIVING & VERIFICATION REPORT', 42, 25);
 
   // Status Badge in Header
   const badgeColor =
@@ -324,7 +332,7 @@ export function createDeliveryPdfDoc(delivery: Delivery): jsPDF {
     doc.setFont('helvetica', 'normal');
     doc.setTextColor(156, 163, 175);
     doc.text(
-      `PartTrack Verification Report • Docket ${delivery.docketNumber} (${delivery.supplier}) • Generated ${new Date().toLocaleString()} • Page ${p} of ${pageCount}`,
+      `PalletTick Verification Report • Docket ${delivery.docketNumber} (${delivery.supplier}) • Generated ${new Date().toLocaleString()} • Page ${p} of ${pageCount}`,
       105,
       290,
       { align: 'center' }
@@ -337,7 +345,7 @@ export function createDeliveryPdfDoc(delivery: Delivery): jsPDF {
 export function exportDeliveryPdf(delivery: Delivery): void {
   const doc = createDeliveryPdfDoc(delivery);
   doc.save(
-    `PartTrack_Report_${delivery.docketNumber}_${new Date().toISOString().slice(0, 10)}.pdf`
+    `PalletTick_Report_${delivery.docketNumber}_${new Date().toISOString().slice(0, 10)}.pdf`
   );
 }
 
@@ -432,7 +440,7 @@ export function exportDeliveryCsv(delivery: Delivery): void {
   link.setAttribute('href', url);
   link.setAttribute(
     'download',
-    `PartTrack_Docket_${delivery.docketNumber}_${new Date().toISOString().slice(0, 10)}.csv`
+    `PalletTick_Docket_${delivery.docketNumber}_${new Date().toISOString().slice(0, 10)}.csv`
   );
   document.body.appendChild(link);
   link.click();

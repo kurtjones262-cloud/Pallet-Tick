@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: PartTrack Serverless API
+ * Cloudflare Worker: PalletTick Serverless API
  *
  * Secure server-side endpoint for Gemini multimodal delivery docket & invoice extraction.
  * Reads the secret GEMINI_API_KEY from the Cloudflare Worker environment.
@@ -373,7 +373,7 @@ export default {
       return new Response(
         JSON.stringify({
           status: 'ok',
-          app: 'PartTrack',
+          app: 'PalletTick',
           runtime: 'cloudflare-worker',
           geminiConfigured: Boolean(env.GEMINI_API_KEY),
           timestamp: new Date().toISOString(),

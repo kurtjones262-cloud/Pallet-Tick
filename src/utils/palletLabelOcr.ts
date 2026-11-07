@@ -42,7 +42,7 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
         ? window.location.origin
         : '';
 
-    console.info('[PartTrack OCR] Initializing bundled offline Tesseract LSTM worker...');
+    console.info('[PalletTick OCR] Initializing bundled offline Tesseract LSTM worker...');
 
     // Purge any stale/corrupted tesseract keyval-store IndexedDB cache from earlier sessions
     if (typeof window !== 'undefined' && 'indexedDB' in window) {
@@ -70,14 +70,14 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
         cacheMethod: 'none',
         logger: loggerFn,
         errorHandler: (err: any) => {
-          console.warn('[PartTrack OCR] Worker internal warning:', err);
+          console.warn('[PalletTick OCR] Worker internal warning:', err);
         },
       });
-      console.info('[PartTrack OCR] Bundled offline LSTM worker initialized and ready.');
+      console.info('[PalletTick OCR] Bundled offline LSTM worker initialized and ready.');
       return worker;
     } catch (firstErr) {
       console.warn(
-        '[PartTrack OCR] Primary non-blob worker init failed, retrying with blob URL fallback:',
+        '[PalletTick OCR] Primary non-blob worker init failed, retrying with blob URL fallback:',
         firstErr
       );
       const fallbackWorker = await createWorker('eng', OEM.LSTM_ONLY, {
@@ -88,11 +88,11 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
         cacheMethod: 'none',
         logger: loggerFn,
       });
-      console.info('[PartTrack OCR] Fallback offline LSTM worker initialized.');
+      console.info('[PalletTick OCR] Fallback offline LSTM worker initialized.');
       return fallbackWorker;
     }
   })().catch((err) => {
-    console.error('[PartTrack OCR] Worker initialization failed:', err);
+    console.error('[PalletTick OCR] Worker initialization failed:', err);
     warmOcrWorkerPromise = null;
     throw err;
   });
@@ -106,7 +106,7 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
 export function prewarmPalletLabelOcrEngine(): void {
   if (typeof window === 'undefined') return;
   getOrInitWarmOnDeviceWorker().catch((err) => {
-    console.warn('[PartTrack OCR] Prewarm note (will retry on capture):', err);
+    console.warn('[PalletTick OCR] Prewarm note (will retry on capture):', err);
   });
 }
 
@@ -340,7 +340,7 @@ export async function recognizePalletLabelOffline(
     if (mlKitResult !== null) {
       const parsed = parsePalletLabelOcrText(mlKitResult.text, docketParts, mlKitResult.confidence);
       console.info(
-        `[PartTrack OCR] Native ML Kit finished in ${Math.round(performance.now() - startTime)}ms:`,
+        `[PalletTick OCR] Native ML Kit finished in ${Math.round(performance.now() - startTime)}ms:`,
         { partNumber: parsed.partNumber, quantity: parsed.quantity, description: parsed.description }
       );
       return {
@@ -403,7 +403,7 @@ export async function recognizePalletLabelOffline(
     }
 
     console.info(
-      `[PartTrack OCR] On-device OCR finished in ${Math.round(performance.now() - startTime)}ms:`,
+      `[PalletTick OCR] On-device OCR finished in ${Math.round(performance.now() - startTime)}ms:`,
       {
         partNumber: parsed.partNumber || '(none)',
         description: parsed.description || '(none)',
@@ -466,7 +466,7 @@ async function tryNativeMlKitTextRecognition(
       }
     }
   } catch (err) {
-    console.warn('[PartTrack OCR] Native ML Kit bridge fallback to bundled offline OCR:', err);
+    console.warn('[PalletTick OCR] Native ML Kit bridge fallback to bundled offline OCR:', err);
   }
 
   return null;

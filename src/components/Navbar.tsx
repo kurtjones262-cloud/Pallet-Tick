@@ -80,11 +80,16 @@ export const Navbar: React.FC<NavbarProps> = ({
           <div className="flex items-center gap-1.5 min-w-0">
             <button
               onClick={() => setActiveTab('dashboard')}
-              className="flex items-center gap-1.5 shrink-0 cursor-pointer text-left"
+              className="flex items-center gap-1.5 shrink-0 cursor-pointer text-left group"
+              title="PalletTick Home"
             >
-              <span className="w-2 h-2 bg-[#059669] inline-block shrink-0" />
+              <img
+                src="/pallettrack-icon.png"
+                alt="PalletTick"
+                className="w-5 h-5 rounded-[4px] object-cover shadow-2xs group-hover:scale-105 transition-transform"
+              />
               <span className="font-bold text-[13px] tracking-tight text-[#18181B]">
-                PartTrack
+                PalletTick
               </span>
             </button>
 

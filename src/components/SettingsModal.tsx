@@ -70,7 +70,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setIsDownloadingSource(true);
     const link = document.createElement('a');
     link.href = '/api/export-project-zip';
-    link.download = 'parttrack-app-source.zip';
+    link.download = 'pallettick-app-source.zip';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -101,7 +101,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b border-[#E4E3DE] flex items-center justify-between">
-          <h3 className="font-semibold text-sm text-[#18181B]">Settings</h3>
+          <div className="flex items-center gap-2">
+            <img
+              src="/pallettrack-icon.png"
+              alt="PalletTick"
+              className="w-5 h-5 rounded-[4px] object-cover shadow-2xs"
+            />
+            <h3 className="font-semibold text-sm text-[#18181B]">PalletTick Settings</h3>
+          </div>
           <button
             onClick={onClose}
             className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"

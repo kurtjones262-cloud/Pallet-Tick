@@ -16,6 +16,7 @@ import {
   getStoredSettings,
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
+import { SplashScreen } from './components/SplashScreen';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard'>('dashboard');
@@ -31,13 +32,31 @@ export function App() {
   const [isUnexpectedOpen, setIsUnexpectedOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  // Startup splash screen initialisation state
+  const [isAppReady, setIsAppReady] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [showSplash, setShowSplash] = useState(true);
+
   const reloadDelivery = useCallback(() => {
     const current = getActiveDelivery();
     setActiveDelivery(current);
   }, []);
 
+  const initAppWorkspace = useCallback(() => {
+    try {
+      setInitError(null);
+      // Essential initialisation: load delivery data and stored state
+      const current = getActiveDelivery();
+      setActiveDelivery(current);
+      setIsAppReady(true);
+    } catch (err: any) {
+      console.error('PalletTick startup initialisation error:', err);
+      setInitError(err?.message || 'Could not initialise PalletTick storage.');
+    }
+  }, []);
+
   useEffect(() => {
-    reloadDelivery();
+    initAppWorkspace();
 
     const handleDeliveriesUpdate = () => reloadDelivery();
     const handleActiveChange = () => reloadDelivery();
@@ -49,7 +68,7 @@ export function App() {
       window.removeEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
     };
-  }, [reloadDelivery]);
+  }, [initAppWorkspace, reloadDelivery]);
 
   const handleUpdateDelivery = (updated: Delivery) => {
     setActiveDelivery(updated);
@@ -104,6 +123,16 @@ export function App() {
         activeTab === 'scanner' ? 'h-dvh overflow-hidden' : 'min-h-dvh'
       } bg-[#F6F5F2] text-[#18181B] flex flex-col font-sans selection:bg-emerald-600/15 selection:text-emerald-950`}
     >
+      {/* Startup Splash Screen */}
+      {showSplash && (
+        <SplashScreen
+          isReady={isAppReady}
+          error={initError}
+          onRetry={initAppWorkspace}
+          onTransitionComplete={() => setShowSplash(false)}
+        />
+      )}
+
       {/* Top Bar & Fixed Bottom Navigation */}
       <Navbar
         activeTab={activeTab}
@@ -141,6 +170,7 @@ export function App() {
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             externalPendingQuantity={externalPendingQuantity}
             onClearExternalPendingQuantity={() => setExternalPendingQuantity(null)}
+            onClose={() => setActiveTab('dashboard')}
           />
         )}
 

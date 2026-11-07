@@ -654,7 +654,7 @@ app.use("/tesseract", express.static(path.resolve(__dirname, "node_modules/tesse
 app.get("/api/health", (_req, res) => {
   res.status(200).json({
     status: "ok",
-    app: "PartTrack",
+    app: "PalletTick",
     runtime: "node-express",
     offlineOcrReady: true,
     engine: "tesseract.js-wasm-local",
@@ -699,7 +699,7 @@ app.get("/api/export-project-zip", async (_req, res) => {
       compressionOptions: { level: 6 }
     });
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="parttrack-app-source.zip"');
+    res.setHeader("Content-Disposition", 'attachment; filename="pallettick-app-source.zip"');
     res.send(zipBuffer);
   } catch (err) {
     console.error("Error generating project zip:", err);
@@ -797,7 +797,7 @@ async function startServer() {
     });
   }
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`PartTrack server running on http://localhost:${PORT}`);
+    console.log(`PalletTick server running on http://localhost:${PORT}`);
   });
 }
 startServer();

@@ -111,14 +111,14 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
     const emptyRule = SUPPLIER_RULES[preferredRuleId] || SUPPLIER_RULES.laser_central;
     return (
       <div className="flex-1 w-full max-w-md mx-auto px-6 py-16 flex flex-col items-center justify-center text-center">
-        <div className="w-10 h-10 rounded-[4px] bg-white border border-[#E4E3DE] flex items-center justify-center mb-3.5 text-zinc-400">
-          {emptyRule.id === 'gci' ? (
-            <QrCode className="w-5 h-5 stroke-[1.8] text-[#059669]" />
-          ) : (
-            <Barcode className="w-5 h-5 stroke-[1.8] text-[#059669]" />
-          )}
+        <div className="w-16 h-16 rounded-[14px] overflow-hidden shadow-sm mb-3.5 border border-zinc-200/80 bg-black">
+          <img
+            src="/pallettrack-icon.png"
+            alt="PalletTick"
+            className="w-full h-full object-cover"
+          />
         </div>
-        <h2 className="text-sm font-semibold text-[#18181B]">No Active Delivery</h2>
+        <h2 className="text-sm font-bold text-[#18181B]">Welcome to PalletTick</h2>
         <p className="text-xs text-zinc-500 mt-1 max-w-xs leading-relaxed">
           Select a supplier below, then photograph a delivery docket or upload a PDF or image to start receiving parts.
         </p>

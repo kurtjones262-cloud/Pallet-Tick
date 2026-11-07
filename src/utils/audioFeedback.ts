@@ -1,5 +1,5 @@
 /**
- * Audio & Haptic Feedback Engine for PartTrack
+ * Audio & Haptic Feedback Engine for PalletTick
  * Uses browser Web Audio API synthesizer for zero-latency, high-volume industrial beeps
  */
 

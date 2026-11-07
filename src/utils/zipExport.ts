@@ -60,7 +60,7 @@ export async function exportDeliveryZip(
   try {
     const pdfDoc = createDeliveryPdfDoc(delivery);
     const pdfArrayBuffer = pdfDoc.output('arraybuffer');
-    zip.file(`PartTrack_Report_${sanitizedDocket}.pdf`, pdfArrayBuffer);
+    zip.file(`PalletTick_Report_${sanitizedDocket}.pdf`, pdfArrayBuffer);
   } catch (err) {
     console.error('Failed to bundle PDF in zip:', err);
   }
@@ -82,7 +82,7 @@ export async function exportDeliveryZip(
   const receivedCount = delivery.parts.filter((p) => p.status === 'received').length;
   const totalCount = delivery.parts.length;
   const manifest = {
-    app: 'PartTrack',
+    app: 'PalletTick',
     version: '1.0',
     exportTimestamp: new Date().toISOString(),
     delivery: {
@@ -144,7 +144,7 @@ export async function exportDeliveryZip(
     compressionOptions: { level: 6 },
   });
 
-  const zipFilename = `PartTrack_Docket_${sanitizedDocket}_${dateStr}.zip`;
+  const zipFilename = `PalletTick_Docket_${sanitizedDocket}_${dateStr}.zip`;
   triggerDownload(zipBlob, zipFilename);
   onProgress?.('Download complete!');
 }
@@ -242,6 +242,6 @@ export async function exportAllDeliveriesBackupZip(
     compressionOptions: { level: 6 },
   });
 
-  triggerDownload(zipBlob, `PartTrack_Master_Backup_${dateStr}.zip`);
+  triggerDownload(zipBlob, `PalletTick_Master_Backup_${dateStr}.zip`);
   onProgress?.('Master backup downloaded successfully!');
 }

@@ -1,5 +1,5 @@
 /**
- * PartTrack - Domain Data Models
+ * PalletTick - Domain Data Models
  * Laser-cut steel parts receiving, docket extraction, continuous barcode/QR scanning
  */
 

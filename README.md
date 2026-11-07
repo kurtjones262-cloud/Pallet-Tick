@@ -1,6 +1,6 @@
-# PartTrack — Industrial Parts Receiving & Delivery Verification (Android APK)
+# PalletTick — Industrial Parts Receiving & Delivery Verification (Android APK)
 
-PartTrack is a standalone, offline-first mobile application designed specifically for workshop environments receiving deliveries of laser-cut steel parts, fabrications, and palletized materials.
+PalletTick is a standalone, offline-first mobile application designed specifically for workshop environments receiving deliveries of laser-cut steel parts, fabrications, and palletized materials.
 
 ---
 
@@ -20,7 +20,7 @@ PartTrack is a standalone, offline-first mobile application designed specificall
 
 ## Android Project Configuration
 
-- **App Name**: `PartTrack`
+- **App Name**: `PalletTick`
 - **Application ID / Package**: `com.parttrack.app`
 - **Minimum SDK**: Android 7.0 (API Level 24)
 - **Target SDK**: Android 15 / 16 (API Level 36)
@@ -73,7 +73,7 @@ android/app/build/outputs/apk/debug/app-debug.apk
 5. If prompted:
    - Allow **"Install unknown apps"** for **My Files** in `Settings > Security and privacy > Install unknown apps`.
 6. Tap **Install**.
-7. Launch **PartTrack** from your home screen or app drawer!
+7. Launch **PalletTick** from your home screen or app drawer!
 
 #### Method B: ADB (USB Debugging)
 If your phone is connected to your computer via USB with Developer Options & USB Debugging enabled:
@@ -111,7 +111,7 @@ To create an optimized, signed release APK:
 ---
 
 ## Testing Offline Functionality
-1. Open PartTrack on your phone.
+1. Open PalletTick on your phone.
 2. Put the phone into **Airplane Mode** (disable Wi-Fi and Cellular Data).
 3. Create a delivery and photograph a docket—the on-device OCR engine processes the document without internet access.
 4. Scan parts or simulate barcodes—all matches, duplicates, and discrepancies update instantly.

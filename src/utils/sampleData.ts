@@ -57,6 +57,7 @@ export function generate200PartDelivery(): Delivery {
     const scannedAtTime = isPreReceived
       ? new Date(Date.now() - (18 - i) * 65000).toISOString()
       : undefined;
+    const reqQty = i % 3 === 0 ? 4 : i % 5 === 0 ? 2 : 1;
 
     parts.push({
       id: `part_${i + 1}`,
@@ -66,6 +67,9 @@ export function generate200PartDelivery(): Delivery {
       description: `${template.desc} (Size ${120 + (i % 8) * 20}x${80 + (i % 5) * 25}mm)`,
       material: template.mat,
       thickness: template.thk,
+      quantity: reqQty,
+      receivedQuantity: isPreReceived ? reqQty : undefined,
+      verificationStatus: isPreReceived ? 'verified' : 'unscanned',
       palletNumber: pallet,
       status: isPreReceived ? 'received' : 'outstanding',
       scannedAt: scannedAtTime,
@@ -79,14 +83,15 @@ export function generate200PartDelivery(): Delivery {
   return {
     id: deliveryId,
     docketNumber: 'DK-89420-STEEL',
-    supplier: 'ShapeCut Precision Laser Services',
+    supplier: 'Laser Central',
+    supplierProfile: 'laser_central',
     deliveryDate: new Date().toISOString().slice(0, 10),
     createdAt: new Date(Date.now() - 3600000 * 2).toISOString(),
     updatedAt: new Date().toISOString(),
     carrier: 'Direct Workshop Linehaul Freight',
     orderNumber: 'PO-66810-STRUCT',
     palletCount: 6,
-    notes: '200 Laser-cut components tagged with QR (part number) & Barcode (item number). Verify 6 heavy wooden pallets.',
+    notes: '200 Laser-cut components tagged with Laser Central Barcode (######-No) & QR (part number). Verify 6 heavy wooden pallets.',
     status: 'receiving',
     docketAttachments: [
       {
@@ -152,6 +157,7 @@ export function generate45PartDelivery(): Delivery {
     const pallet = i < 24 ? 'Pallet 1 of 2' : 'Pallet 2 of 2';
     const partNum = `M-BRKT-${100 + (i % 9)}`;
     const itemNum = `${i + 1}`;
+    const reqQty = i % 2 === 0 ? 4 : 1;
 
     parts.push({
       id: `mining_part_${i + 1}`,
@@ -161,6 +167,9 @@ export function generate45PartDelivery(): Delivery {
       description: `Mining Chute Wear Liner Bracket ${150 + (i % 4) * 30}mm`,
       material: 'Hardox 450 Wear Plate',
       thickness: '12.0mm',
+      quantity: reqQty,
+      receivedQuantity: i < 5 ? reqQty : undefined,
+      verificationStatus: i < 5 ? 'verified' : 'unscanned',
       palletNumber: pallet,
       status: i < 5 ? 'received' : 'outstanding',
       scannedAt: i < 5 ? new Date(Date.now() - (5 - i) * 120000).toISOString() : undefined,
@@ -173,7 +182,8 @@ export function generate45PartDelivery(): Delivery {
   return {
     id: 'del_45_parts_mining',
     docketNumber: 'DK-4409-MINING',
-    supplier: 'Laser Central Fabricators',
+    supplier: 'Laser Central',
+    supplierProfile: 'laser_central',
     deliveryDate: new Date().toISOString().slice(0, 10),
     createdAt: new Date(Date.now() - 7200000).toISOString(),
     updatedAt: new Date().toISOString(),
@@ -195,21 +205,21 @@ export function generate45PartDelivery(): Delivery {
 export function generate15PartDelivery(): Delivery {
   const parts: DeliveryPart[] = [];
   const names = [
-    { p: 'FLG-150-PN16', i: 'BAR-3301', d: 'DN150 PN16 Table E Flange Blank', th: '16mm' },
-    { p: 'FLG-200-PN16', i: 'BAR-3302', d: 'DN200 PN16 Table E Flange Blank', th: '16mm' },
-    { p: 'FLG-250-PN16', i: 'BAR-3303', d: 'DN250 PN16 Table E Flange Blank', th: '20mm' },
-    { p: 'PLT-GUSSET-8', i: 'BAR-3304', d: '8mm Stainless 316 Gusset Bracket', th: '8mm' },
-    { p: 'PLT-GUSSET-8', i: 'BAR-3305', d: '8mm Stainless 316 Gusset Bracket', th: '8mm' },
-    { p: 'PLT-GUSSET-8', i: 'BAR-3306', d: '8mm Stainless 316 Gusset Bracket', th: '8mm' },
-    { p: 'LUG-PROOF-2T', i: 'BAR-3307', d: '2 Tonne Certified Lifting Eye Lug', th: '25mm' },
-    { p: 'LUG-PROOF-2T', i: 'BAR-3308', d: '2 Tonne Certified Lifting Eye Lug', th: '25mm' },
-    { p: 'BS-BASE-300', i: 'BAR-3309', d: 'Column Baseplate 300x300 with 4x24mm Holes', th: '20mm' },
-    { p: 'BS-BASE-300', i: 'BAR-3310', d: 'Column Baseplate 300x300 with 4x24mm Holes', th: '20mm' },
-    { p: 'SHM-2MM-PACK', i: 'BAR-3311', d: 'Precision Motor Levelling Shim 100x100', th: '2mm' },
-    { p: 'SHM-2MM-PACK', i: 'BAR-3312', d: 'Precision Motor Levelling Shim 100x100', th: '2mm' },
-    { p: 'SHM-5MM-PACK', i: 'BAR-3313', d: 'Precision Motor Levelling Shim 100x100', th: '5mm' },
-    { p: 'SHM-5MM-PACK', i: 'BAR-3314', d: 'Precision Motor Levelling Shim 100x100', th: '5mm' },
-    { p: 'CAP-POST-75', i: 'BAR-3315', d: '75x75 SHS Pyramid Post Cap', th: '3mm' },
+    { p: 'FLG-150-PN16', i: 'BAR-3301', d: 'DN150 PN16 Table E Flange Blank', th: '16mm', q: 1 },
+    { p: 'FLG-200-PN16', i: 'BAR-3302', d: 'DN200 PN16 Table E Flange Blank', th: '16mm', q: 4 },
+    { p: 'FLG-250-PN16', i: 'BAR-3303', d: 'DN250 PN16 Table E Flange Blank', th: '20mm', q: 2 },
+    { p: 'PLT-GUSSET-8', i: 'BAR-3304', d: '8mm Stainless 316 Gusset Bracket', th: '8mm', q: 6 },
+    { p: 'PLT-GUSSET-10', i: 'BAR-3305', d: '10mm Stainless 316 Gusset Bracket', th: '10mm', q: 1 },
+    { p: 'PLT-GUSSET-12', i: 'BAR-3306', d: '12mm Stainless 316 Gusset Bracket', th: '12mm', q: 4 },
+    { p: 'LUG-PROOF-2T', i: 'BAR-3307', d: '2 Tonne Certified Lifting Eye Lug', th: '25mm', q: 2 },
+    { p: 'LUG-PROOF-5T', i: 'BAR-3308', d: '5 Tonne Certified Lifting Eye Lug', th: '25mm', q: 1 },
+    { p: 'BS-BASE-300', i: 'BAR-3309', d: 'Column Baseplate 300x300 with 4x24mm Holes', th: '20mm', q: 4 },
+    { p: 'BS-BASE-400', i: 'BAR-3310', d: 'Column Baseplate 400x400 with 4x24mm Holes', th: '20mm', q: 1 },
+    { p: 'SHM-2MM-PACK', i: 'BAR-3311', d: 'Precision Motor Levelling Shim 100x100', th: '2mm', q: 8 },
+    { p: 'SHM-3MM-PACK', i: 'BAR-3312', d: 'Precision Motor Levelling Shim 100x100', th: '3mm', q: 1 },
+    { p: 'SHM-5MM-PACK', i: 'BAR-3313', d: 'Precision Motor Levelling Shim 100x100', th: '5mm', q: 4 },
+    { p: 'SHM-6MM-PACK', i: 'BAR-3314', d: 'Precision Motor Levelling Shim 100x100', th: '6mm', q: 2 },
+    { p: 'CAP-POST-75', i: 'BAR-3315', d: '75x75 SHS Pyramid Post Cap', th: '3mm', q: 1 },
   ];
 
   names.forEach((item, idx) => {
@@ -221,6 +231,8 @@ export function generate15PartDelivery(): Delivery {
       description: item.d,
       material: '350 Steel / 316 SS',
       thickness: item.th,
+      quantity: item.q,
+      verificationStatus: 'unscanned',
       palletNumber: 'Pallet 1 of 1',
       status: 'outstanding',
       ocrConfidence: 'high',
@@ -230,7 +242,8 @@ export function generate15PartDelivery(): Delivery {
   return {
     id: 'del_15_parts_proto',
     docketNumber: 'DK-102-FAST',
-    supplier: 'Precision Cut Pro',
+    supplier: 'GCI',
+    supplierProfile: 'gci',
     deliveryDate: new Date().toISOString().slice(0, 10),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),

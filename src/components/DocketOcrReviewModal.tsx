@@ -11,10 +11,18 @@ import {
   ChevronRight,
   Sparkles,
   WifiOff,
+  Barcode,
+  QrCode,
+  FileText,
 } from 'lucide-react';
-import { Delivery, DeliveryPart, DocketAttachment } from '../types/delivery';
+import { Delivery, DeliveryPart, DocketAttachment, SupplierRuleId } from '../types/delivery';
 import { ExtractedDocketResult, ExtractedDocketItem } from '../server/docketOcr';
-import { updateDelivery, setActiveDeliveryId, saveDocketImages } from '../utils/storage';
+import {
+  updateDelivery,
+  setActiveDeliveryId,
+  saveDocketImages,
+  SUPPLIER_RULES,
+} from '../utils/storage';
 
 interface AttachedPage {
   pageNumber: number;
@@ -24,6 +32,7 @@ interface AttachedPage {
 
 interface DocketOcrReviewModalProps {
   extractedData: ExtractedDocketResult;
+  initialSupplierRule?: SupplierRuleId;
   attachedPages?: AttachedPage[];
   onClose: () => void;
   onDeliveryCreated: (delivery: Delivery) => void;
@@ -31,12 +40,22 @@ interface DocketOcrReviewModalProps {
 
 export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   extractedData,
+  initialSupplierRule = 'laser_central',
   attachedPages = [],
   onClose,
   onDeliveryCreated,
 }) => {
+  const [supplierRule, setSupplierRule] = useState<SupplierRuleId>(
+    /\bgci\b/i.test(extractedData.supplier || '') ? 'gci' : initialSupplierRule
+  );
   const [docketNumber, setDocketNumber] = useState(extractedData.docketNumber || 'DK-0001');
-  const [supplier, setSupplier] = useState(extractedData.supplier || 'Laser Cutting Supplier');
+  const [supplier, setSupplier] = useState(
+    extractedData.supplier &&
+      extractedData.supplier !== 'Laser Cutting Supplier' &&
+      extractedData.supplier !== 'Steel Processing Supplier'
+      ? extractedData.supplier
+      : SUPPLIER_RULES[initialSupplierRule].name
+  );
   const [deliveryDate, setDeliveryDate] = useState(
     extractedData.deliveryDate || new Date().toISOString().slice(0, 10)
   );
@@ -51,6 +70,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
 
   const [showPhotoViewer, setShowPhotoViewer] = useState(false);
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
+
+  const handleSelectSupplierRule = (ruleId: SupplierRuleId) => {
+    setSupplierRule(ruleId);
+    setSupplier(SUPPLIER_RULES[ruleId].name);
+  };
 
   const handleItemChange = (index: number, field: keyof ExtractedDocketItem, value: any) => {
     setItems((prev) => {
@@ -138,7 +162,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     const newDelivery: Delivery = {
       id: deliveryId,
       docketNumber: docketNumber.trim().toUpperCase(),
-      supplier: supplier.trim(),
+      supplier: supplier.trim() || SUPPLIER_RULES[supplierRule].name,
+      supplierProfile: supplierRule,
       deliveryDate,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -170,7 +195,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         {/* Header */}
         <div className="px-4 py-3 border-b border-[#E4E3DE] bg-white flex items-center justify-between gap-3 shrink-0">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h3 className="font-bold text-sm text-[#18181B]">
                 Compiled Docket Parts List ({items.length} Distinct Part Lines · {totalExpandedParts} Total Pieces)
               </h3>
@@ -178,6 +203,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                 <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
                   <Sparkles className="w-2.5 h-2.5" />
                   <span>Compiled by Gemini AI</span>
+                </span>
+              ) : extractedData.extractionMethod === 'pdf-text' ? (
+                <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
+                  <FileText className="w-2.5 h-2.5" />
+                  <span>Extracted from PDF</span>
                 </span>
               ) : (
                 <span className="font-mono text-[10px] font-semibold text-zinc-700 bg-zinc-100 border border-zinc-300 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
@@ -187,9 +217,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               )}
             </div>
             <p className="text-[11px] text-zinc-500 mt-0.5">
-              {extractedData.extractionMethod === 'ai-vision'
-                ? 'Gemini AI analyzed your docket photo and compiled each individual part and all of its details below.'
-                : 'Each individual part and all of its extracted details are compiled below. Document barcodes and headers were excluded.'}
+              Review the compiled parts list and confirm the supplier scanning rule before opening the scanner.
             </p>
           </div>
 
@@ -204,7 +232,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                 }`}
               >
                 {showPhotoViewer ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                <span>{showPhotoViewer ? 'Hide photo' : 'View docket photo'}</span>
+                <span>{showPhotoViewer ? 'Hide docket' : 'View docket'}</span>
               </button>
             )}
 
@@ -222,68 +250,76 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           {/* Left / Main Section: Metadata & Compiled Parts Table */}
           <div className="flex-1 flex flex-col overflow-y-auto">
             {/* Header Metadata Form */}
-            <div className="p-3.5 bg-white border-b border-[#E4E3DE] grid grid-cols-2 sm:grid-cols-5 gap-2.5 text-xs">
-              <div>
-                <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
-                  Docket / Ref #
-                </label>
-                <input
-                  type="text"
-                  value={docketNumber}
-                  onChange={(e) => setDocketNumber(e.target.value)}
-                  className="w-full h-8 px-2.5 font-mono text-xs font-bold bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
-                />
-              </div>
+            <div className="p-3.5 bg-white border-b border-[#E4E3DE] space-y-2.5 text-xs">
 
-              <div>
-                <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
-                  Supplier
-                </label>
-                <input
-                  type="text"
-                  value={supplier}
-                  onChange={(e) => setSupplier(e.target.value)}
-                  className="w-full h-8 px-2.5 text-xs font-semibold bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
-                />
-              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+                <div>
+                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                    Docket / Ref #
+                  </label>
+                  <input
+                    type="text"
+                    value={docketNumber}
+                    onChange={(e) => setDocketNumber(e.target.value)}
+                    className="w-full h-8 px-2.5 font-mono text-xs font-bold bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
+                  />
+                </div>
 
-              <div>
-                <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
-                  PO / Order #
-                </label>
-                <input
-                  type="text"
-                  value={orderNumber}
-                  onChange={(e) => setOrderNumber(e.target.value)}
-                  placeholder="Optional"
-                  className="w-full h-8 px-2.5 font-mono text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
-                />
-              </div>
+                <div>
+                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                    Supplier
+                  </label>
+                  <select
+                    value={supplierRule}
+                    onChange={(e) =>
+                      handleSelectSupplierRule(e.target.value as SupplierRuleId)
+                    }
+                    className="w-full h-8 px-2.5 text-xs font-semibold bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none cursor-pointer"
+                  >
+                    <option value="laser_central">Laser Central</option>
+                    <option value="gci">GCI</option>
+                    <option value="ocr_label">OCR Label Scanner</option>
+                  </select>
+                </div>
 
-              <div>
-                <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
-                  Delivery Date
-                </label>
-                <input
-                  type="date"
-                  value={deliveryDate}
-                  onChange={(e) => setDeliveryDate(e.target.value)}
-                  className="w-full h-8 px-2.5 text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
-                />
-              </div>
+                <div>
+                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                    PO / Order #
+                  </label>
+                  <input
+                    type="text"
+                    value={orderNumber}
+                    onChange={(e) => setOrderNumber(e.target.value)}
+                    placeholder="Optional"
+                    className="w-full h-8 px-2.5 font-mono text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
+                  />
+                </div>
 
-              <div>
-                <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
-                  Pallets / Packs
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  max="50"
-                  value={palletCount}
-                  onChange={(e) => setPalletCount(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                  className="w-full h-8 px-2.5 text-xs font-mono bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
-                />
+                <div>
+                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                    Delivery Date
+                  </label>
+                  <input
+                    type="date"
+                    value={deliveryDate}
+                    onChange={(e) => setDeliveryDate(e.target.value)}
+                    className="w-full h-8 px-2.5 text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                    Pallets / Packs
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="50"
+                    value={palletCount}
+                    onChange={(e) => setPalletCount(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                    className="w-full h-8 px-2.5 text-xs font-mono bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
+                  />
+                </div>
               </div>
             </div>
 
@@ -606,7 +642,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
             >
               <Check className="w-3.5 h-3.5 stroke-[2.5]" />
               <span>
-                Import Compiled List ({expandQuantities ? totalExpandedParts : items.length} Parts)
+                Confirm &amp; Open Scanner ({expandQuantities ? totalExpandedParts : items.length} Parts)
               </span>
             </button>
           </div>

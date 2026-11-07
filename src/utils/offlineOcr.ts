@@ -206,17 +206,48 @@ async function preparePageSlicesForGemini(
  *   while capturing 100% of rows, e.g. 199/199).
  * - Falls back to on-device Tesseract.js OCR only when offline or when forceOffline is enabled.
  */
+export interface PageTextHint {
+  selectableLines?: RawOcrLine[];
+  rawText?: string;
+  hasSelectableText?: boolean;
+}
+
+/**
+ * Smart Delivery Docket, PDF & Tax Invoice Parts Compiler:
+ * - Supports both uploaded images and PDF documents (selectable text PDFs + scanned PDFs).
+ * - When a PDF contains selectable text, extracts the text directly and uses it (both for instant
+ *   offline compilation and to enrich Gemini AI structured extraction when online).
+ * - Where a PDF contains scanned pages without selectable text, automatically uses OCR
+ *   (Gemini AI Vision when online, or on-device Tesseract.js OCR when offline).
+ */
 export async function performSmartDocketExtraction(
   images: Array<string | File>,
   onProgress?: (update: OcrProgressUpdate) => void,
-  forceOffline: boolean = false
+  forceOffline: boolean = false,
+  pageTextHints?: PageTextHint[]
 ): Promise<OfflineDocketExtractionOutput> {
   const totalPages = images.length;
   if (totalPages === 0) {
-    throw new Error('No docket photos provided for extraction.');
+    throw new Error('No docket pages provided for extraction.');
   }
 
   const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+
+  // Check if any pages have direct selectable PDF text
+  const directPdfPageResults: Array<ReturnType<typeof parseIndustrialDocketText> | null> =
+    images.map((_, idx) => {
+      const hint = pageTextHints?.[idx];
+      if (hint?.hasSelectableText && hint.selectableLines && hint.selectableLines.length > 0) {
+        const parsed = parseIndustrialDocketText(hint.selectableLines, idx + 1);
+        if (parsed.items.length > 0) {
+          return parsed;
+        }
+      }
+      return null;
+    });
+
+  const allPagesHaveParsedPdfText =
+    directPdfPageResults.length > 0 && directPdfPageResults.every((r) => r !== null);
 
   if (isOnline && !forceOffline) {
     onProgress?.({
@@ -226,8 +257,8 @@ export async function performSmartDocketExtraction(
       percent: 15,
       statusText:
         totalPages > 1
-          ? `Preparing high-res dual-zoom slices for ${totalPages} pages...`
-          : 'Preparing high-res dual-zoom slices for Gemini AI...',
+          ? `Preparing ${totalPages} document pages for extraction...`
+          : 'Preparing document for parts extraction...',
     });
 
     const preparedList = await Promise.all(
@@ -245,6 +276,7 @@ export async function performSmartDocketExtraction(
           fullDataUrl: prepared.fullDataUrl,
           upperDataUrl: prepared.upperDataUrl,
           lowerDataUrl: prepared.lowerDataUrl,
+          pdfSelectableText: pageTextHints?.[idx]?.rawText || undefined,
         },
       })
     );
@@ -260,8 +292,8 @@ export async function performSmartDocketExtraction(
         percent: simulatedPercent,
         statusText:
           totalPages > 1
-            ? `Gemini AI extracting all parts across ${totalPages} pages & verifying 100% sequence...`
-            : 'Gemini AI extracting all parts & verifying 100% sequence...',
+            ? `Extracting all parts across ${totalPages} pages & verifying 100% sequence...`
+            : 'Extracting all parts & verifying 100% sequence...',
       });
 
       progressTimer = setInterval(() => {
@@ -279,15 +311,13 @@ export async function performSmartDocketExtraction(
             simulatedPercent >= 82
               ? 'Verifying 100% sequence completeness (checking for any missing No. rows)...'
               : totalPages > 1
-              ? `Gemini AI scanning Page ${estPage} of ${totalPages}...`
-              : 'Gemini AI compiling individual parts & details...',
+              ? `Scanning Page ${estPage} of ${totalPages}...`
+              : 'Compiling individual parts & details...',
         });
       }, 900);
 
       const extractApiUrl = resolveApiUrl('/api/extract-docket');
 
-      // Send all page slices in a SINGLE coordinated server call so the server controls
-      // concurrency and performs global 1..MaxNo gap recovery in just 2-4 total API requests!
       const response = await fetch(extractApiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -306,18 +336,30 @@ export async function performSmartDocketExtraction(
       if (!response.ok) {
         const errBody = await response.json().catch(() => ({}));
         throw new Error(
-          errBody?.error || `Gemini AI extraction returned status ${response.status}`
+          errBody?.error || `AI extraction returned status ${response.status}`
         );
       }
 
       const extractedResult: ExtractedDocketResult = await response.json();
+
+      // If AI returned 0 items on a PDF that had direct selectable text items, use the direct PDF text result
+      if (extractedResult.items.length === 0 && allPagesHaveParsedPdfText) {
+        const combinedPdf = combineMultiPageDocketResults(
+          directPdfPageResults.filter(Boolean) as Array<ReturnType<typeof parseIndustrialDocketText>>
+        );
+        combinedPdf.extractionMethod = 'pdf-text';
+        return {
+          extractedData: combinedPdf,
+          processedPages: colorPages,
+        };
+      }
 
       onProgress?.({
         currentPage: totalPages,
         totalPages,
         stage: 'complete',
         percent: 100,
-        statusText: `Gemini AI compiled ${extractedResult.items.length} parts across ${totalPages} ${
+        statusText: `Compiled ${extractedResult.items.length} parts across ${totalPages} ${
           totalPages === 1 ? 'page' : 'pages'
         }.`,
       });
@@ -331,31 +373,51 @@ export async function performSmartDocketExtraction(
         clearInterval(progressTimer);
         progressTimer = null;
       }
-      // Only fall back to offline OCR if network is actually unreachable
+      // If all pages came from a PDF with selectable text that parsed cleanly, return that immediately!
+      if (allPagesHaveParsedPdfText) {
+        const combinedPdf = combineMultiPageDocketResults(
+          directPdfPageResults.filter(Boolean) as Array<ReturnType<typeof parseIndustrialDocketText>>
+        );
+        combinedPdf.extractionMethod = 'pdf-text';
+        onProgress?.({
+          currentPage: totalPages,
+          totalPages,
+          stage: 'complete',
+          percent: 100,
+          statusText: `Extracted ${combinedPdf.items.length} parts directly from PDF text.`,
+        });
+        return {
+          extractedData: combinedPdf,
+          processedPages: colorPages,
+        };
+      }
+      // Fall back to offline OCR if network is unreachable or if PDF pages need OCR
       const stillOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
-      if (!stillOnline) {
-        console.info('Device went offline; switching to on-device offline OCR:', err);
-        return performOfflineDocketOcr(images, onProgress);
+      if (!stillOnline || pageTextHints?.some((h) => h !== undefined)) {
+        console.info('Switching to on-device PDF/OCR extraction:', err);
+        return performOfflineDocketOcr(images, onProgress, pageTextHints);
       }
       throw err;
     }
   }
 
-  // Explicit 100% Offline On-Device Tesseract OCR
-  return performOfflineDocketOcr(images, onProgress);
+  // Explicit Offline / On-Device Extraction (uses direct PDF text where selectable, and Tesseract OCR on scanned pages)
+  return performOfflineDocketOcr(images, onProgress, pageTextHints);
 }
 
 /**
- * Runs completely on-device, offline OCR across one or more photographed docket pages.
- * Zero internet connection or API keys required.
+ * Runs completely on-device extraction across one or more docket pages:
+ * - If a page is from a PDF with selectable text, extracts parts directly from the PDF text.
+ * - If a page is an image or a scanned PDF page without selectable text, runs on-device Tesseract OCR.
  */
 export async function performOfflineDocketOcr(
   images: Array<string | File>,
-  onProgress?: (update: OcrProgressUpdate) => void
+  onProgress?: (update: OcrProgressUpdate) => void,
+  pageTextHints?: PageTextHint[]
 ): Promise<OfflineDocketExtractionOutput> {
   const totalPages = images.length;
   if (totalPages === 0) {
-    throw new Error('No docket photos provided for OCR processing.');
+    throw new Error('No docket photos or PDF pages provided for processing.');
   }
 
   const processedPages: OfflineDocketExtractionOutput['processedPages'] = [];
@@ -366,7 +428,7 @@ export async function performOfflineDocketOcr(
       totalPages,
       stage: 'preprocessing',
       percent: 8 + Math.round((pageIdx / totalPages) * 15),
-      statusText: `Normalizing page ${pageNum} table contrast...`,
+      statusText: `Preparing page ${pageNum} of ${totalPages}...`,
     });
     const preprocessed = await preprocessDocketImage(images[pageIdx]);
     processedPages.push({
@@ -378,12 +440,13 @@ export async function performOfflineDocketOcr(
     });
   }
 
-  return performOfflineDocketOcrWithPreprocessed(processedPages, onProgress);
+  return performOfflineDocketOcrWithPreprocessed(processedPages, onProgress, pageTextHints);
 }
 
 async function performOfflineDocketOcrWithPreprocessed(
   processedPages: OfflineDocketExtractionOutput['processedPages'],
-  onProgress?: (update: OcrProgressUpdate) => void
+  onProgress?: (update: OcrProgressUpdate) => void,
+  pageTextHints?: PageTextHint[]
 ): Promise<OfflineDocketExtractionOutput> {
   const totalPages = processedPages.length;
 
@@ -392,11 +455,12 @@ async function performOfflineDocketOcrWithPreprocessed(
     totalPages,
     stage: 'preparing',
     percent: 22,
-    statusText: 'Initializing offline OCR engine...',
+    statusText: 'Preparing document extraction engine...',
   });
 
   let worker: any = null;
   const parsedPageResults: Array<ReturnType<typeof parseIndustrialDocketText>> = [];
+  let usedPdfTextCount = 0;
 
   try {
     const origin =
@@ -404,47 +468,73 @@ async function performOfflineDocketOcrWithPreprocessed(
         ? window.location.origin
         : '';
 
-    // Purge any stale/corrupted tesseract keyval-store IndexedDB cache from earlier sessions
-    if (typeof window !== 'undefined' && 'indexedDB' in window) {
-      try {
-        window.indexedDB.deleteDatabase('keyval-store');
-      } catch {
-        // Ignore IndexedDB cleanup errors
+    const ensureTesseractWorker = async () => {
+      if (worker) return worker;
+
+      // Purge any stale/corrupted tesseract keyval-store IndexedDB cache from earlier sessions
+      if (typeof window !== 'undefined' && 'indexedDB' in window) {
+        try {
+          window.indexedDB.deleteDatabase('keyval-store');
+        } catch {
+          // Ignore IndexedDB cleanup errors
+        }
       }
-    }
 
-    const loggerFn = (m: any) => {
-      if (m.status === 'recognizing text') {
-        const ocrProgress = Math.round((m.progress || 0) * 100);
-        onProgress?.({
-          currentPage: parsedPageResults.length + 1,
-          totalPages,
-          stage: 'recognizing',
-          percent: Math.min(92, 25 + Math.round(ocrProgress * 0.65)),
-          statusText: `Reading docket parts table: ${ocrProgress}%`,
-        });
-      }
+      const loggerFn = (m: any) => {
+        if (m.status === 'recognizing text') {
+          const ocrProgress = Math.round((m.progress || 0) * 100);
+          onProgress?.({
+            currentPage: parsedPageResults.length + 1,
+            totalPages,
+            stage: 'recognizing',
+            percent: Math.min(92, 25 + Math.round(ocrProgress * 0.65)),
+            statusText: `Reading docket parts table: ${ocrProgress}%`,
+          });
+        }
+      };
+
+      const errorHandlerFn = (err: any) => {
+        console.warn('Tesseract worker internal error:', err);
+      };
+
+      worker = await createWorker('eng', OEM.LSTM_ONLY, {
+        workerPath: '/tesseract/worker.min.js',
+        workerBlobURL: false,
+        corePath: `${origin}/tesseract/core`,
+        langPath: `${origin}/tesseract/lang-data`,
+        gzip: true,
+        cacheMethod: 'none',
+        logger: loggerFn,
+        errorHandler: errorHandlerFn,
+      });
+
+      return worker;
     };
-
-    const errorHandlerFn = (err: any) => {
-      console.warn('Tesseract worker internal error:', err);
-    };
-
-    worker = await createWorker('eng', OEM.LSTM_ONLY, {
-      workerPath: '/tesseract/worker.min.js',
-      workerBlobURL: false,
-      corePath: `${origin}/tesseract/core`,
-      langPath: `${origin}/tesseract/lang-data`,
-      gzip: true,
-      cacheMethod: 'none',
-      logger: loggerFn,
-      errorHandler: errorHandlerFn,
-    });
 
     for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
       const pageNum = pageIdx + 1;
       const pageData = processedPages[pageIdx];
+      const hint = pageTextHints?.[pageIdx];
 
+      // 1. If this page is from a PDF with selectable text, try direct PDF text extraction first
+      if (hint?.hasSelectableText && hint.selectableLines && hint.selectableLines.length > 0) {
+        onProgress?.({
+          currentPage: pageNum,
+          totalPages,
+          stage: 'parsing',
+          percent: 30 + Math.round((pageIdx / totalPages) * 55),
+          statusText: `Extracting selectable text from PDF page ${pageNum} of ${totalPages}...`,
+        });
+
+        const pdfParsed = parseIndustrialDocketText(hint.selectableLines, pageNum);
+        if (pdfParsed.items.length > 0) {
+          usedPdfTextCount++;
+          parsedPageResults.push(pdfParsed);
+          continue;
+        }
+      }
+
+      // 2. Otherwise (image upload or scanned PDF page without selectable text), run OCR
       onProgress?.({
         currentPage: pageNum,
         totalPages,
@@ -453,7 +543,8 @@ async function performOfflineDocketOcrWithPreprocessed(
         statusText: `Running on-device OCR on page ${pageNum} of ${totalPages}...`,
       });
 
-      const ocrResult = await worker.recognize(
+      const activeWorker = await ensureTesseractWorker();
+      const ocrResult = await activeWorker.recognize(
         pageData.preprocessedDataUrl,
         {},
         { blocks: true, text: true }
@@ -523,6 +614,9 @@ async function performOfflineDocketOcrWithPreprocessed(
     }
 
     const combinedExtracted = combineMultiPageDocketResults(parsedPageResults);
+    if (usedPdfTextCount === totalPages) {
+      combinedExtracted.extractionMethod = 'pdf-text';
+    }
 
     onProgress?.({
       currentPage: totalPages,

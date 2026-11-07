@@ -22,6 +22,7 @@ export interface PageSlicePayload {
   fullDataUrl: string;
   upperDataUrl?: string;
   lowerDataUrl?: string;
+  pdfSelectableText?: string;
 }
 
 export interface ExtractedDocketResult {
@@ -36,7 +37,7 @@ export interface ExtractedDocketResult {
   rawTextSummary?: string;
   confidenceScore: number; // 0 - 100
   needsManualReview: boolean;
-  extractionMethod?: 'ai-vision' | 'offline-ocr';
+  extractionMethod?: 'ai-vision' | 'offline-ocr' | 'pdf-text';
   aiModelUsed?: string;
   pagesScanned?: number;
   hasPrintedNoColumn?: boolean;
@@ -243,11 +244,16 @@ async function extractPageBatchInOneCall(
       parts.push({ inlineData: { mimeType: full.mimeType, data: full.base64Data } });
       pageDescriptions.push(`Page ${pNum}`);
     }
+    if (payload.pdfSelectableText && payload.pdfSelectableText.trim()) {
+      parts.push({
+        text: `[DIRECT SELECTABLE TEXT EXTRACTED FROM PDF PAGE ${pNum}]:\n${payload.pdfSelectableText.slice(0, 18000)}`,
+      });
+    }
   }
 
   const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Your job is to transcribe EVERY single physical part row literally visible across the provided page image(s) into the JSON 'items' array without skipping or merging any rows.
-STRICT ANTI-HALLUCINATION RULE: Only extract rows and text that are literally visible in the provided image(s). Never invent, guess, or fabricate parts, codes, descriptions, materials, thicknesses, dimensions, or quantities. If an image is blank or contains no physical part rows, return an empty items array [].`;
+Your job is to transcribe EVERY single physical part row literally visible across the provided page image(s) and/or extracted PDF text into the JSON 'items' array without skipping or merging any rows.
+STRICT ANTI-HALLUCINATION RULE: Only extract rows and text that are literally present in the provided document. Never invent, guess, or fabricate parts, codes, descriptions, materials, thicknesses, dimensions, or quantities. If a document is blank or contains no physical part rows, return an empty items array [].`;
 
   const promptText = `Examine ${pageDescriptions.join(' and ')} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in the table in top-to-bottom order. If the image is blank or has no part rows, return items: [].
 

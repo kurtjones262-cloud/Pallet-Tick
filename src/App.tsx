@@ -8,7 +8,7 @@ import { DeliveriesListModal } from './components/DeliveriesListModal';
 import { TestBarcodesModal } from './components/TestBarcodesModal';
 import { UnexpectedPartsModal } from './components/UnexpectedPartsModal';
 import { SettingsModal } from './components/SettingsModal';
-import { Delivery } from './types/delivery';
+import { Delivery, PendingQuantityConfirmation } from './types/delivery';
 import {
   getActiveDelivery,
   updateDelivery,
@@ -21,6 +21,8 @@ export function App() {
   const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard'>('dashboard');
   const [activeDelivery, setActiveDelivery] = useState<Delivery | null>(null);
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
+  const [externalPendingQuantity, setExternalPendingQuantity] =
+    useState<PendingQuantityConfirmation | null>(null);
 
   // Modals state
   const [isNewDeliveryOpen, setIsNewDeliveryOpen] = useState(false);
@@ -57,9 +59,22 @@ export function App() {
   const handleSimulateScan = (code: string) => {
     if (!activeDelivery) return;
     const { updatedDelivery, result } = processScannedCode(activeDelivery, code);
-    handleUpdateDelivery(updatedDelivery);
-
     const settings = getStoredSettings();
+
+    if (result.status === 'requires_quantity' && result.pendingQuantityConfirmation) {
+      playAudio.success(settings.soundEnabled);
+      triggerHaptic('success', settings.vibrationEnabled);
+      speakAlert(
+        `Enter quantity for ${result.pendingQuantityConfirmation.part.partNumber}`,
+        settings.speechEnabled
+      );
+      setIsTestSheetOpen(false);
+      setExternalPendingQuantity(result.pendingQuantityConfirmation);
+      setActiveTab('scanner');
+      return;
+    }
+
+    handleUpdateDelivery(updatedDelivery);
 
     if (result.status === 'matched') {
       playAudio.success(settings.soundEnabled);
@@ -94,6 +109,7 @@ export function App() {
         activeTab={activeTab}
         setActiveTab={handleSelectTab}
         activeDelivery={activeDelivery}
+        onUpdateDelivery={handleUpdateDelivery}
         onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
         onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
         onOpenTestSheet={() => setIsTestSheetOpen(true)}
@@ -123,6 +139,8 @@ export function App() {
             onUpdateDelivery={handleUpdateDelivery}
             onOpenTestSheet={() => setIsTestSheetOpen(true)}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+            externalPendingQuantity={externalPendingQuantity}
+            onClearExternalPendingQuantity={() => setExternalPendingQuantity(null)}
           />
         )}
 
@@ -143,7 +161,8 @@ export function App() {
           onClose={() => setIsNewDeliveryOpen(false)}
           onDeliveryCreated={(newDel) => {
             setActiveDelivery(newDel);
-            setActiveTab('dashboard');
+            // Automatically navigate to the scanner screen once the compiled parts list is confirmed!
+            setActiveTab('scanner');
           }}
         />
       )}

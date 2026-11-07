@@ -15,10 +15,18 @@ import {
   Archive,
   Loader2,
 } from 'lucide-react';
-import { Delivery } from '../types/delivery';
+import { Delivery, SupplierRuleId } from '../types/delivery';
 import { exportDeliveryPdf, exportDeliveryCsv } from '../utils/pdfExport';
 import { exportDeliveryZip } from '../utils/zipExport';
-import { updateDelivery } from '../utils/storage';
+import {
+  updateDelivery,
+  getDeliverySupplierRule,
+  setDeliverySupplierRule,
+  getPreferredSupplierRuleId,
+  setPreferredSupplierRuleId,
+  SUPPLIER_RULES,
+  getPartVerificationState,
+} from '../utils/storage';
 import { DocketPhotosModal } from './DocketPhotosModal';
 
 interface DeliveryDashboardProps {
@@ -45,7 +53,18 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   const [isDocketPhotosOpen, setIsDocketPhotosOpen] = useState(false);
   const [isExportingZip, setIsExportingZip] = useState(false);
   const [zipStatusText, setZipStatusText] = useState('');
+  const [preferredRuleId, setPreferredRuleId] = useState<SupplierRuleId>(() =>
+    getPreferredSupplierRuleId()
+  );
   const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleRuleChanged = () => {
+      setPreferredRuleId(getPreferredSupplierRuleId());
+    };
+    window.addEventListener('parttrack_supplier_rule_changed', handleRuleChanged);
+    return () => window.removeEventListener('parttrack_supplier_rule_changed', handleRuleChanged);
+  }, []);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -89,22 +108,52 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   }, [parts]);
 
   if (!delivery) {
+    const emptyRule = SUPPLIER_RULES[preferredRuleId] || SUPPLIER_RULES.laser_central;
     return (
-      <div className="flex-1 w-full max-w-md mx-auto px-6 py-20 flex flex-col items-center justify-center text-center">
+      <div className="flex-1 w-full max-w-md mx-auto px-6 py-16 flex flex-col items-center justify-center text-center">
         <div className="w-10 h-10 rounded-[4px] bg-white border border-[#E4E3DE] flex items-center justify-center mb-3.5 text-zinc-400">
-          <QrCode className="w-5 h-5 stroke-[1.8]" />
+          {emptyRule.id === 'gci' ? (
+            <QrCode className="w-5 h-5 stroke-[1.8] text-[#059669]" />
+          ) : (
+            <Barcode className="w-5 h-5 stroke-[1.8] text-[#059669]" />
+          )}
         </div>
         <h2 className="text-sm font-semibold text-[#18181B]">No Active Delivery</h2>
         <p className="text-xs text-zinc-500 mt-1 max-w-xs leading-relaxed">
-          The app is completely fresh. Photograph a paper delivery docket or upload an image to start receiving parts.
+          Select a supplier below, then photograph a delivery docket or upload a PDF or image to start receiving parts.
         </p>
+
+        {/* Supplier Dropdown Menu when no delivery is loaded yet */}
+        <div className="w-full max-w-xs mt-5 p-3 rounded-[4px] bg-white border border-[#E4E3DE] text-left">
+          <label
+            htmlFor="empty-dashboard-supplier-select"
+            className="block text-[10px] font-mono uppercase tracking-wider text-zinc-500 font-semibold mb-1.5"
+          >
+            Supplier
+          </label>
+          <select
+            id="empty-dashboard-supplier-select"
+            value={emptyRule.id}
+            onChange={(e) => {
+              const nextRule = e.target.value as SupplierRuleId;
+              setPreferredSupplierRuleId(nextRule);
+              setPreferredRuleId(nextRule);
+            }}
+            className="w-full h-9 px-2.5 bg-[#F6F5F2] border border-[#E4E3DE] rounded-[4px] text-xs font-semibold text-[#18181B] focus:outline-none focus:border-[#059669] cursor-pointer"
+          >
+            <option value="laser_central">Laser Central</option>
+            <option value="gci">GCI</option>
+            <option value="ocr_label">OCR Label Scanner</option>
+          </select>
+        </div>
+
         {onOpenNewDelivery && (
           <button
             onClick={onOpenNewDelivery}
-            className="mt-5 h-10 px-4 bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs tracking-wide rounded-[4px] inline-flex items-center gap-2 cursor-pointer transition-colors"
+            className="mt-4 h-10 px-4 bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs tracking-wide rounded-[4px] inline-flex items-center gap-2 cursor-pointer transition-colors"
           >
             <Plus className="w-4 h-4 stroke-[2]" />
-            <span>New Delivery Docket</span>
+            <span>New Delivery Docket ({emptyRule.name})</span>
           </button>
         )}
       </div>
@@ -113,10 +162,23 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
 
   const total = parts.length;
   const received = parts.filter((p) => p.status === 'received').length;
+  const verifiedGreen = parts.filter(
+    (p) => getPartVerificationState(p).state === 'verified'
+  ).length;
+  const mismatchOrange = parts.filter(
+    (p) => getPartVerificationState(p).state === 'quantity_mismatch'
+  ).length;
   const remaining = total - received;
   const unexpectedCount = delivery.unexpectedParts.length;
   const percentage = total > 0 ? Math.round((received / total) * 100) : 0;
   const isCompleted = delivery.status === 'completed' || (total > 0 && received === total);
+  const activeSupplierRule = getDeliverySupplierRule(delivery);
+
+  const handleSelectSupplier = (ruleId: SupplierRuleId) => {
+    const updated = setDeliverySupplierRule(delivery, ruleId);
+    setPreferredRuleId(ruleId);
+    onUpdateDelivery(updated);
+  };
 
   const handleMarkComplete = () => {
     setActionsMenuOpen(false);
@@ -243,7 +305,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
         <div className="px-4 pt-4 pb-2">
           <h2 className="text-sm font-semibold text-[#18181B]">Scan Activity</h2>
           <p className="text-xs text-zinc-500 mt-0.5">
-            Chronological log of QR, barcode, and manual verifications.
+            Chronological log of Barcode, QR, OCR Pallet Label, and manual verifications.
           </p>
         </div>
 
@@ -256,51 +318,85 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
             {delivery.scanHistory.map((ev) => (
               <div
                 key={ev.id}
-                className="px-4 py-2.5 flex items-center justify-between gap-3 text-xs"
+                className="px-4 py-2.5 flex flex-col gap-1 text-xs"
               >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  {ev.codeType === 'qr' ? (
-                    <QrCode className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                  ) : (
-                    <Barcode className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                  )}
-                  <div className="min-w-0">
-                    <div className="flex items-baseline gap-2">
-                      <span className="font-mono font-bold text-[#18181B] truncate">
-                        {ev.partNumber || ev.code}
-                      </span>
-                      {ev.itemNumber && (
-                        <span className="font-mono text-[11px] text-zinc-400 truncate">
-                          {ev.itemNumber}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    {ev.codeType === 'qr' ? (
+                      <QrCode className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                    ) : ev.codeType === 'ocr_label' ? (
+                      <FileText className="w-3.5 h-3.5 text-[#059669] shrink-0" />
+                    ) : (
+                      <Barcode className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                    )}
+                    <div className="min-w-0">
+                      <div className="flex items-baseline gap-2 flex-wrap">
+                        <span className="font-mono font-bold text-[#18181B] truncate">
+                          {ev.partNumber || ev.code}
                         </span>
+                        {ev.itemNumber && (
+                          <span className="font-mono text-[11px] text-zinc-400 truncate">
+                            No. {ev.itemNumber}
+                          </span>
+                        )}
+                        {ev.codeType === 'ocr_label' && (
+                          <span className="px-1.5 py-0.2 rounded-[2px] bg-emerald-50 border border-emerald-200 font-mono text-[10px] font-semibold text-[#059669]">
+                            OCR Label{ev.addedQuantity ? ` (+${ev.addedQuantity})` : ''}
+                          </span>
+                        )}
+                      </div>
+                      {ev.recognizedDescription && (
+                        <p className="text-[11px] text-zinc-500 truncate mt-0.5">
+                          {ev.recognizedDescription}
+                        </p>
                       )}
                     </div>
                   </div>
+
+                  <div className="flex items-center gap-3 shrink-0 font-mono text-[11px]">
+                    <span
+                      className={
+                        ev.status === 'match_success' || ev.status === 'manual_ticked'
+                          ? 'text-[#059669]'
+                          : ev.status === 'quantity_mismatch' ||
+                            ev.status === 'duplicate_warning'
+                          ? 'text-amber-600'
+                          : ev.status === 'undo_performed'
+                          ? 'text-zinc-500'
+                          : 'text-red-600'
+                      }
+                    >
+                      {ev.status === 'match_success' || ev.status === 'manual_ticked'
+                        ? ev.requiredQuantity && ev.requiredQuantity > 1
+                          ? `Verified (${ev.receivedQuantity}/${ev.requiredQuantity})`
+                          : 'Verified'
+                        : ev.status === 'quantity_mismatch'
+                        ? `Qty ${ev.receivedQuantity}/${ev.requiredQuantity}`
+                        : ev.status === 'duplicate_warning'
+                        ? 'Duplicate'
+                        : ev.status === 'undo_performed'
+                        ? 'Undone'
+                        : 'Unexpected'}
+                    </span>
+                    <span className="text-zinc-400 tabular-nums">
+                      {new Date(ev.timestamp).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
+                  </div>
                 </div>
 
-                <div className="flex items-center gap-3 shrink-0 font-mono text-[11px]">
-                  <span
-                    className={
-                      ev.status === 'match_success'
-                        ? 'text-[#059669]'
-                        : ev.status === 'duplicate_warning'
-                        ? 'text-amber-600'
-                        : 'text-red-600'
-                    }
-                  >
-                    {ev.status === 'match_success'
-                      ? 'Verified'
-                      : ev.status === 'duplicate_warning'
-                      ? 'Duplicate'
-                      : 'Unexpected'}
-                  </span>
-                  <span className="text-zinc-400 tabular-nums">
-                    {new Date(ev.timestamp).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })}
-                  </span>
-                </div>
+                {ev.rawOcrText && (
+                  <details className="pl-6 text-[10px] text-zinc-500">
+                    <summary className="cursor-pointer hover:text-zinc-800 font-mono">
+                      View raw OCR text
+                    </summary>
+                    <pre className="mt-1 p-2 rounded bg-[#F6F5F2] border border-[#E4E3DE] font-mono text-[10px] text-zinc-700 whitespace-pre-wrap">
+                      {ev.rawOcrText}
+                    </pre>
+                  </details>
+                )}
               </div>
             ))}
           </div>
@@ -328,7 +424,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
       {/* 1. Compact Supplier & Delivery Reference Section */}
       <section className="px-4 py-3.5 border-b border-[#E4E3DE] flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h1 className="text-sm font-semibold text-[#18181B] truncate">
               {delivery.supplier}
             </h1>
@@ -363,7 +459,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
           </button>
 
           {actionsMenuOpen && (
-            <div className="absolute right-0 mt-1 w-48 bg-white border border-[#E4E3DE] shadow-lg rounded py-1 z-30 text-xs">
+            <div className="absolute right-0 mt-1 w-52 bg-white border border-[#E4E3DE] shadow-lg rounded py-1 z-30 text-xs">
               <button
                 onClick={() => {
                   setActionsMenuOpen(false);
@@ -371,8 +467,8 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
                 }}
                 className="w-full px-3 py-2 text-left text-[#18181B] hover:bg-zinc-50 flex items-center gap-2 cursor-pointer"
               >
-                <Printer className="w-3.5 h-3.5 text-zinc-400" />
-                <span>Export PDF report</span>
+                <Printer className="w-3.5 h-3.5 text-[#059669]" />
+                <span>Export colour-coded PDF</span>
               </button>
 
               <button
@@ -459,7 +555,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
       </section>
 
       {/* 2. Prominent, Open-Air Receiving Progress */}
-      <section className="px-4 pt-8 pb-7">
+      <section className="px-4 pt-7 pb-6">
         <div className="flex items-baseline gap-2">
           <span className="text-5xl sm:text-6xl font-bold tracking-tight text-[#18181B] font-mono-numbers leading-none">
             {received}
@@ -486,9 +582,19 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
           />
         </div>
 
-        {/* Remaining · Unexpected Summary Line */}
-        <div className="mt-3 flex items-center gap-1.5 text-xs text-zinc-600 font-mono tabular-nums">
-          <span>{remaining} remaining</span>
+        {/* Colour-coded Status Summary Line */}
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums">
+          <span className="text-[#059669] font-semibold">{verifiedGreen} verified</span>
+          <span className="text-zinc-300">·</span>
+          {mismatchOrange > 0 && (
+            <>
+              <span className="text-amber-600 font-semibold">
+                {mismatchOrange} qty mismatch
+              </span>
+              <span className="text-zinc-300">·</span>
+            </>
+          )}
+          <span className="text-zinc-600">{remaining} unscanned</span>
           <span className="text-zinc-300">·</span>
           {unexpectedCount > 0 ? (
             <button
@@ -502,15 +608,52 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
           )}
         </div>
 
-        {/* 3. Primary Action: SCAN PARTS */}
-        <div className="mt-7">
+        {/* Supplier Dropdown Menu Before Scanning */}
+        <div className="mt-5 p-3 rounded-[4px] bg-white border border-[#E4E3DE]">
+          <div className="flex items-center justify-between gap-2 mb-1.5">
+            <label
+              htmlFor="dashboard-supplier-select"
+              className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 font-semibold"
+            >
+              Supplier
+            </label>
+          </div>
+          <select
+            id="dashboard-supplier-select"
+            value={activeSupplierRule.id}
+            onChange={(e) => handleSelectSupplier(e.target.value as SupplierRuleId)}
+            className="w-full h-9 px-3 bg-[#F6F5F2] border border-[#E4E3DE] rounded-[4px] text-xs font-semibold text-[#18181B] focus:outline-none focus:border-[#059669] cursor-pointer"
+          >
+            <option value="laser_central">Laser Central</option>
+            <option value="gci">GCI</option>
+            <option value="ocr_label">OCR Label Scanner</option>
+          </select>
+        </div>
+
+        {/* 3. Primary Actions: SCAN PARTS + UPLOAD INVOICE / DOCKET */}
+        <div className="mt-4 space-y-2">
           <button
             onClick={onStartScanning}
             className="w-full h-11 px-4 bg-[#059669] hover:bg-[#047857] active:bg-[#065F46] text-white font-semibold text-xs tracking-[0.08em] uppercase rounded-[4px] flex items-center justify-center gap-2 transition-colors cursor-pointer"
           >
-            <QrCode className="w-4 h-4 stroke-[2]" />
-            <span>SCAN PARTS</span>
+            {activeSupplierRule.id === 'gci' ? (
+              <QrCode className="w-4 h-4 stroke-[2]" />
+            ) : (
+              <Barcode className="w-4 h-4 stroke-[2]" />
+            )}
+            <span>SCAN PARTS ({activeSupplierRule.name.toUpperCase()})</span>
           </button>
+
+          {onOpenNewDelivery && (
+            <button
+              type="button"
+              onClick={onOpenNewDelivery}
+              className="w-full h-10 px-4 bg-white hover:bg-emerald-50/50 border border-[#E4E3DE] hover:border-[#059669] text-[#18181B] font-semibold text-xs tracking-[0.04em] rounded-[4px] flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-2xs"
+            >
+              <Plus className="w-4 h-4 text-[#059669] stroke-[2.2]" />
+              <span>Upload Invoice / Docket (Camera · Gallery · Files)</span>
+            </button>
+          )}
         </div>
       </section>
 

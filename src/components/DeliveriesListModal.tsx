@@ -161,7 +161,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
             <div className="py-14 px-6 text-center">
               <p className="text-xs font-semibold text-[#18181B]">No deliveries on file</p>
               <p className="text-[11px] text-zinc-400 mt-1 max-w-xs mx-auto leading-relaxed">
-                Tap "New docket" above to photograph a paper packing slip, upload an image, or load a sample.
+                Tap "New docket" above to photograph a paper packing slip, or upload an image or PDF.
               </p>
             </div>
           ) : (

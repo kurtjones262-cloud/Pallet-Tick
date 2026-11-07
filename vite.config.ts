@@ -56,8 +56,8 @@ export default defineConfig(() => {
           clientsClaim: true,
           skipWaiting: true,
           maximumFileSizeToCacheInBytes: 25 * 1024 * 1024, // 25MB for Tesseract wasm and traineddata
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,wasm,gz,traineddata}'],
-          globIgnores: ['**/assets/aistudio/**'],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globIgnores: ['**/assets/aistudio/**', '**/tesseract/**'],
           navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//, /\.zip$/i],
           runtimeCaching: [
@@ -111,9 +111,12 @@ export default defineConfig(() => {
         },
       }),
     ],
+    optimizeDeps: {
+      entries: ['index.html', 'src/**/*.{ts,tsx}'],
+    },
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {

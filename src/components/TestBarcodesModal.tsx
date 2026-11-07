@@ -7,6 +7,7 @@ import {
   Printer,
   X,
   AlertTriangle,
+  FileText,
 } from 'lucide-react';
 import { Delivery } from '../types/delivery';
 import { generateCode128Svg, generateQrSvg } from '../utils/codeRenderer';
@@ -55,9 +56,9 @@ export const TestBarcodesModal: React.FC<TestBarcodesModalProps> = ({
               <Sparkles className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="font-bold text-sm text-gray-900">QR & Barcode Test Sheet</h3>
+              <h3 className="font-bold text-sm text-gray-900">QR, Barcode &amp; Pallet Label Test Sheet</h3>
               <p className="text-xs text-gray-500">
-                Aim phone camera at these codes or tap &quot;Scan&quot; to test the verification pipeline
+                Aim phone camera at these codes or tap &quot;Scan&quot; / &quot;OCR Label&quot; to test verification
               </p>
             </div>
           </div>
@@ -145,7 +146,7 @@ export const TestBarcodesModal: React.FC<TestBarcodesModalProps> = ({
                         </span>
                       </div>
                       <span className="font-mono text-[11px] text-gray-500 block truncate mt-0.5">
-                        Barcode: {partBarcodeValue} (Docket No. {docketNo})
+                        Barcode: {partBarcodeValue} · Expected Qty: {Math.max(1, part.quantity ?? 1)}
                       </span>
                     </div>
 
@@ -184,7 +185,7 @@ export const TestBarcodesModal: React.FC<TestBarcodesModalProps> = ({
                   </div>
 
                   {/* Simulation Buttons */}
-                  <div className="flex items-center justify-end gap-1.5 pt-1.5 border-t border-gray-100 print:hidden">
+                  <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1.5 border-t border-gray-100 print:hidden">
                     <button
                       onClick={() => {
                         onSimulateScan(part.partNumber);
@@ -194,7 +195,7 @@ export const TestBarcodesModal: React.FC<TestBarcodesModalProps> = ({
                       title="Simulate QR scan"
                     >
                       <QrCode className="w-3 h-3" />
-                      <span>Scan QR</span>
+                      <span>QR</span>
                     </button>
 
                     <button
@@ -206,7 +207,23 @@ export const TestBarcodesModal: React.FC<TestBarcodesModalProps> = ({
                       title={`Simulate Barcode scan (${partBarcodeValue} -> No. ${docketNo})`}
                     >
                       <Barcode className="w-3 h-3" />
-                      <span>Scan {partBarcodeValue}</span>
+                      <span>{partBarcodeValue}</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        onClose();
+                        window.dispatchEvent(
+                          new CustomEvent('parttrack_simulate_ocr_label', {
+                            detail: { partId: part.id },
+                          })
+                        );
+                      }}
+                      className="px-2 py-1 rounded bg-amber-50 hover:bg-amber-100 text-amber-800 text-[11px] font-medium border border-amber-200 flex items-center gap-1 cursor-pointer"
+                      title="Simulate Offline OCR Pallet Label scan for this part"
+                    >
+                      <FileText className="w-3 h-3" />
+                      <span>OCR Label</span>
                     </button>
                   </div>
                 </div>

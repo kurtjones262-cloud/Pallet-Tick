@@ -6,15 +6,23 @@ import {
   extractDocketWithGeminiVision,
   extractPartCodeWithGeminiVision,
   recoverMissingDocketItems,
-} from './src/server/docketOcr';
+} from './src/server/docketOcr.ts';
 
-dotenv.config();
+dotenv.config({ quiet: true });
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Support high-resolution delivery docket photo uploads up to 35MB
 app.use(express.json({ limit: '35mb' }));
@@ -221,7 +229,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`PartTrack server running on http://localhost:${PORT}`);
   });
 }

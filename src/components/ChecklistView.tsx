@@ -4,9 +4,14 @@ import {
   Check,
   X,
   Plus,
+  Minus,
+  Printer,
+  RotateCcw,
+  AlertTriangle,
 } from 'lucide-react';
 import { Delivery, DeliveryPart } from '../types/delivery';
-import { setPartStatus } from '../utils/storage';
+import { setPartStatus, getPartVerificationState } from '../utils/storage';
+import { exportDeliveryPdf } from '../utils/pdfExport';
 import { playAudio, triggerHaptic } from '../utils/audioFeedback';
 
 interface ChecklistViewProps {
@@ -28,12 +33,24 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<'all' | 'outstanding' | 'received' | 'unexpected'>('all');
   const [palletFilter, setPalletFilter] = useState<string>(initialPalletFilter || 'all');
   const [selectedPart, setSelectedPart] = useState<DeliveryPart | null>(null);
+  const [detailQtyInput, setDetailQtyInput] = useState<string>('1');
 
   useEffect(() => {
     if (initialPalletFilter) {
       setPalletFilter(initialPalletFilter);
     }
   }, [initialPalletFilter]);
+
+  useEffect(() => {
+    if (selectedPart) {
+      const vState = getPartVerificationState(selectedPart);
+      setDetailQtyInput(
+        String(
+          selectedPart.status === 'received' ? vState.receivedQty : vState.requiredQty
+        )
+      );
+    }
+  }, [selectedPart]);
 
   const parts = delivery?.parts || [];
   const unexpectedParts = delivery?.unexpectedParts || [];
@@ -73,16 +90,42 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   const outstandingCount = totalCount - receivedCount;
   const unexpectedCount = unexpectedParts.length;
 
-  const handleToggleStatus = (part: DeliveryPart, e: React.MouseEvent) => {
+  const handleToggleStatus = (
+    part: DeliveryPart,
+    e: React.MouseEvent,
+    customQty?: number,
+    forceStatus?: 'received' | 'outstanding'
+  ) => {
     e.stopPropagation();
     if (!delivery) return;
 
-    const newStatus = part.status === 'received' ? 'outstanding' : 'received';
-    const updated = setPartStatus(delivery.id, part.id, newStatus, 'manual');
+    // If clicking quick-checkbox on a part with required quantity > 1 without an explicit status/qty,
+    // open the detail modal so the user can enter or edit the actual quantity!
+    const reqQty = Math.max(1, part.quantity ?? 1);
+    if (reqQty > 1 && customQty === undefined && !forceStatus) {
+      setSelectedPart(part);
+      return;
+    }
+
+    const newStatus = forceStatus ?? (part.status === 'received' ? 'outstanding' : 'received');
+    const updated = setPartStatus(
+      delivery.id,
+      part.id,
+      newStatus,
+      'manual',
+      undefined,
+      newStatus === 'received' ? customQty : undefined
+    );
 
     if (newStatus === 'received') {
-      playAudio.success();
-      triggerHaptic('success');
+      const entered = customQty ?? reqQty;
+      if (entered === reqQty) {
+        playAudio.success();
+        triggerHaptic('success');
+      } else {
+        playAudio.duplicate();
+        triggerHaptic('duplicate');
+      }
     } else {
       playAudio.undo();
       triggerHaptic('undo');
@@ -90,14 +133,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
 
     if (updated) {
       onUpdateDelivery(updated);
-      if (selectedPart && selectedPart.id === part.id) {
-        setSelectedPart({
-          ...selectedPart,
-          status: newStatus,
-          scannedAt: newStatus === 'received' ? new Date().toISOString() : undefined,
-          scannedVia: newStatus === 'received' ? 'manual' : undefined,
-        });
-      }
+      setSelectedPart(null);
     }
   };
 
@@ -125,7 +161,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
     <div className="flex-1 w-full max-w-2xl mx-auto pb-16 flex flex-col">
       {/* Sticky Compact Search & Filter Header */}
       <div className="sticky top-11 z-20 bg-[#F6F5F2]/95 backdrop-blur-md border-b border-[#E4E3DE]">
-        {/* Row 1: Compact Search + Pallet Selector */}
+        {/* Row 1: Compact Search + Pallet Selector + Export PDF */}
         <div className="px-4 pt-2.5 pb-2 flex items-center gap-2">
           <div className="relative flex-1">
             <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -163,6 +199,16 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
               ))}
             </select>
           )}
+
+          <button
+            type="button"
+            onClick={() => exportDeliveryPdf(delivery)}
+            className="h-8 px-2.5 bg-[#059669] hover:bg-[#047857] text-white rounded-[4px] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors shrink-0 shadow-2xs"
+            title="Export colour-coded PDF"
+          >
+            <Printer className="w-3.5 h-3.5" />
+            <span>Export PDF</span>
+          </button>
         </div>
 
         {/* Row 2: Minimalist Underline Filter Tabs */}
@@ -254,14 +300,20 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
         ) : (
           <div className="bg-white border-b border-[#E4E3DE] divide-y divide-[#E4E3DE]">
             {filteredParts.map((part) => {
+              const vState = getPartVerificationState(part);
               const isReceived = part.status === 'received';
+              const isMismatch = vState.state === 'quantity_mismatch';
 
               return (
                 <div
                   key={part.id}
                   onClick={() => setSelectedPart(part)}
                   className={`px-4 py-2 flex items-center gap-3 transition-colors cursor-pointer ${
-                    isReceived ? 'bg-[#F6F5F2]/40 hover:bg-zinc-50' : 'hover:bg-zinc-50'
+                    isMismatch
+                      ? 'bg-amber-50/60 hover:bg-amber-50'
+                      : isReceived
+                      ? 'bg-emerald-50/25 hover:bg-zinc-50'
+                      : 'hover:bg-zinc-50'
                   }`}
                 >
                   {/* Small Check Indicator with Ergonomic Hit Area */}
@@ -277,7 +329,9 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                   >
                     <span
                       className={`w-4 h-4 rounded-[3px] flex items-center justify-center transition-colors ${
-                        isReceived
+                        isMismatch
+                          ? 'bg-amber-500 border border-amber-500 text-white'
+                          : isReceived
                           ? 'bg-[#059669] border border-[#059669] text-white'
                           : 'bg-white border border-zinc-300 hover:border-[#059669]'
                       }`}
@@ -291,7 +345,9 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span
                         className={`px-1.5 py-0.5 rounded-[3px] font-mono text-[10px] font-bold shrink-0 ${
-                          isReceived
+                          isMismatch
+                            ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                            : isReceived
                             ? 'bg-emerald-50 text-[#059669] border border-emerald-200'
                             : 'bg-amber-50 text-amber-800 border border-amber-200'
                         }`}
@@ -301,10 +357,23 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                       </span>
                       <span
                         className={`font-mono text-[13px] font-bold tracking-tight truncate ${
-                          isReceived ? 'text-zinc-500' : 'text-[#18181B]'
+                          isReceived ? 'text-zinc-700' : 'text-[#18181B]'
                         }`}
                       >
                         {part.partNumber}
+                      </span>
+                      <span
+                        className={`px-1.5 py-0.2 rounded-[2px] font-mono text-[10px] font-semibold ${
+                          isMismatch
+                            ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                            : isReceived
+                            ? 'bg-emerald-50 text-[#059669] border border-emerald-200'
+                            : 'bg-zinc-100 text-zinc-700 border border-zinc-200'
+                        }`}
+                      >
+                        {isReceived
+                          ? `Qty ${vState.receivedQty}/${vState.requiredQty}`
+                          : `Req Qty: ${vState.requiredQty}`}
                       </span>
                       {(part.material || part.thickness || part.dimensions) && (
                         <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-[2px] bg-[#F6F5F2] border border-[#E4E3DE] text-zinc-600 truncate">
@@ -336,10 +405,15 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
 
                   {/* Compact Unboxed Status */}
                   <div className="shrink-0 text-right font-mono text-[11px]">
-                    {isReceived ? (
-                      <span className="text-[#059669] font-medium">Received</span>
+                    {isMismatch ? (
+                      <span className="text-amber-600 font-semibold flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3" />
+                        <span>Mismatch ({vState.receivedQty}/{vState.requiredQty})</span>
+                      </span>
+                    ) : isReceived ? (
+                      <span className="text-[#059669] font-medium">Verified</span>
                     ) : (
-                      <span className="text-zinc-400">Outstanding</span>
+                      <span className="text-red-600/80">Not Scanned</span>
                     )}
                   </div>
                 </div>
@@ -365,7 +439,8 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                   {selectedPart.partNumber}
                 </span>
                 <span className="font-mono text-xs text-zinc-500">
-                  Item {selectedPart.itemNumber}
+                  Docket No. {selectedPart.itemNumber} · Required Qty:{' '}
+                  {Math.max(1, selectedPart.quantity ?? 1)}
                 </span>
               </div>
               <button
@@ -384,21 +459,29 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                 </span>
               </div>
               <div className="flex justify-between py-1">
-                <span className="text-zinc-500">Material & Thickness</span>
+                <span className="text-zinc-500">Material &amp; Thickness</span>
                 <span className="font-mono text-[#18181B]">
                   {[selectedPart.material, selectedPart.thickness].filter(Boolean).join(' · ') || '—'}
                 </span>
               </div>
-              {selectedPart.dimensions && (
+              <div className="flex justify-between py-1">
+                <span className="text-zinc-500">Required Quantity</span>
+                <span className="font-mono font-bold text-[#18181B]">
+                  {Math.max(1, selectedPart.quantity ?? 1)}
+                </span>
+              </div>
+              {selectedPart.status === 'received' && (
                 <div className="flex justify-between py-1">
-                  <span className="text-zinc-500">Dimensions / Size</span>
-                  <span className="font-mono text-[#18181B]">{selectedPart.dimensions}</span>
-                </div>
-              )}
-              {selectedPart.weight && (
-                <div className="flex justify-between py-1">
-                  <span className="text-zinc-500">Weight</span>
-                  <span className="font-mono text-[#18181B]">{selectedPart.weight}</span>
+                  <span className="text-zinc-500">Scanned / Received Quantity</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      getPartVerificationState(selectedPart).state === 'quantity_mismatch'
+                        ? 'text-amber-600'
+                        : 'text-[#059669]'
+                    }`}
+                  >
+                    {getPartVerificationState(selectedPart).receivedQty}
+                  </span>
                 </div>
               )}
               <div className="flex justify-between py-1">
@@ -407,41 +490,117 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                   {selectedPart.palletNumber || '—'}
                 </span>
               </div>
-              {selectedPart.notes && (
-                <div className="flex justify-between py-1 gap-4">
-                  <span className="text-zinc-500 shrink-0">Notes</span>
-                  <span className="text-[#18181B] text-right">{selectedPart.notes}</span>
-                </div>
-              )}
               <div className="flex justify-between py-1">
                 <span className="text-zinc-500">Status</span>
                 <span
-                  className={`font-mono font-medium ${
-                    selectedPart.status === 'received' ? 'text-[#059669]' : 'text-zinc-600'
+                  className={`font-mono font-semibold ${
+                    getPartVerificationState(selectedPart).state === 'quantity_mismatch'
+                      ? 'text-amber-600'
+                      : selectedPart.status === 'received'
+                      ? 'text-[#059669]'
+                      : 'text-red-600'
                   }`}
                 >
-                  {selectedPart.status === 'received'
-                    ? `Received${selectedPart.scannedVia ? ` (${selectedPart.scannedVia.toUpperCase()})` : ''}`
-                    : 'Outstanding'}
+                  {getPartVerificationState(selectedPart).state === 'quantity_mismatch'
+                    ? `Quantity Mismatch (${getPartVerificationState(selectedPart).receivedQty}/${getPartVerificationState(selectedPart).requiredQty})`
+                    : selectedPart.status === 'received'
+                    ? `Verified (${getPartVerificationState(selectedPart).receivedQty}/${getPartVerificationState(selectedPart).requiredQty})`
+                    : 'Not Scanned'}
                 </span>
               </div>
+
+              {Math.max(1, selectedPart.quantity ?? 1) > 1 && (
+                <div className="pt-2.5 border-t border-[#E4E3DE]">
+                  <label className="block text-xs font-semibold text-[#18181B] mb-1.5">
+                    {selectedPart.status === 'received'
+                      ? `Edit Received Quantity (Required: ${Math.max(1, selectedPart.quantity ?? 1)}):`
+                      : `Enter Actual Quantity Received (Required: ${Math.max(1, selectedPart.quantity ?? 1)}):`}
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const curr = parseInt(detailQtyInput, 10) || 0;
+                        setDetailQtyInput(String(Math.max(0, curr - 1)));
+                      }}
+                      className="w-10 h-10 rounded-[4px] bg-white hover:bg-zinc-100 border border-[#E4E3DE] text-[#18181B] flex items-center justify-center cursor-pointer shrink-0"
+                      aria-label="Decrease quantity"
+                    >
+                      <Minus className="w-4 h-4" />
+                    </button>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min="0"
+                      value={detailQtyInput}
+                      onChange={(e) => setDetailQtyInput(e.target.value)}
+                      className="flex-1 h-10 px-3 bg-white border border-[#E4E3DE] focus:border-[#059669] rounded-[4px] font-mono text-base font-bold text-[#18181B] text-center outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const curr = parseInt(detailQtyInput, 10) || 0;
+                        setDetailQtyInput(String(curr + 1));
+                      }}
+                      className="w-10 h-10 rounded-[4px] bg-white hover:bg-zinc-100 border border-[#E4E3DE] text-[#18181B] flex items-center justify-center cursor-pointer shrink-0"
+                      aria-label="Increase quantity"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="pt-3 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={(e) => handleToggleStatus(selectedPart, e)}
-                className={`flex-1 h-10 px-4 rounded-[4px] font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                  selectedPart.status === 'received'
-                    ? 'bg-white border border-[#E4E3DE] text-[#18181B] hover:bg-zinc-50'
-                    : 'bg-[#059669] hover:bg-[#047857] text-white'
-                }`}
-              >
-                <Check className="w-3.5 h-3.5 stroke-[2.5]" />
-                <span>
-                  {selectedPart.status === 'received' ? 'Mark as Outstanding' : 'Mark as Received'}
-                </span>
-              </button>
+              {Math.max(1, selectedPart.quantity ?? 1) > 1 ? (
+                <>
+                  {selectedPart.status === 'received' && (
+                    <button
+                      type="button"
+                      onClick={(e) =>
+                        handleToggleStatus(selectedPart, e, undefined, 'outstanding')
+                      }
+                      className="h-10 px-3 rounded-[4px] bg-white border border-[#E4E3DE] hover:bg-zinc-50 text-zinc-700 font-medium text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer shrink-0"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Mark Outstanding</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      const parsed = Math.max(0, parseInt(detailQtyInput, 10) || 0);
+                      handleToggleStatus(selectedPart, e, parsed, 'received');
+                    }}
+                    className="flex-1 h-10 px-4 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <span>
+                      {selectedPart.status === 'received'
+                        ? 'Save Quantity'
+                        : 'Confirm & Receive'}
+                    </span>
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => handleToggleStatus(selectedPart, e)}
+                  className={`flex-1 h-10 px-4 rounded-[4px] font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    selectedPart.status === 'received'
+                      ? 'bg-white border border-[#E4E3DE] text-[#18181B] hover:bg-zinc-50'
+                      : 'bg-[#059669] hover:bg-[#047857] text-white'
+                  }`}
+                >
+                  <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                  <span>
+                    {selectedPart.status === 'received'
+                      ? 'Mark as Outstanding'
+                      : 'Confirm & Mark as Received'}
+                  </span>
+                </button>
+              )}
             </div>
           </div>
         </div>

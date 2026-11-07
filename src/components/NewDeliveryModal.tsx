@@ -376,12 +376,12 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 e.target.value = '';
               }}
             />
+            {/* 2. GALLERY: Explicit image MIME types WITHOUT multiple attribute, ensuring Android & iOS open the native Photo Gallery / Photos app instead of Files */}
             <input
               id="invoice-upload-gallery-input"
               ref={galleryInputRef}
               type="file"
-              accept="image/*"
-              multiple
+              accept="image/jpeg,image/png,image/webp,image/jpg,image/heic,image/*"
               disabled={isLoadingFiles}
               className="sr-only"
               onChange={async (e) => {
@@ -499,11 +499,12 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                       <span className="font-semibold text-[#18181B]">3. Files</span> to browse PDFs, images, and documents.
                     </p>
 
-                    {/* Three Clear Mobile Upload Options using native <label> triggers: 1. CAMERA, 2. GALLERY, 3. FILES */}
+                    {/* Three Clear Mobile Upload Options: 1. CAMERA, 2. GALLERY, 3. FILES */}
                     <div className="grid grid-cols-3 gap-2 mb-2.5">
                       {/* Option 1: CAMERA */}
-                      <label
-                        htmlFor="invoice-upload-camera-input"
+                      <button
+                        type="button"
+                        onClick={() => cameraInputRef.current?.click()}
                         className={`p-3 rounded-[5px] bg-[#059669] hover:bg-[#047857] text-white flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
@@ -519,11 +520,12 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             Capture new photo
                           </span>
                         </div>
-                      </label>
+                      </button>
 
                       {/* Option 2: GALLERY */}
-                      <label
-                        htmlFor="invoice-upload-gallery-input"
+                      <button
+                        type="button"
+                        onClick={() => galleryInputRef.current?.click()}
                         className={`p-3 rounded-[5px] bg-emerald-50/70 hover:bg-emerald-100/70 border-2 border-[#059669] text-[#18181B] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
@@ -536,14 +538,15 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             2. Gallery
                           </span>
                           <span className="block text-[10px] text-zinc-600 leading-tight mt-0.5">
-                            Select 1 or more photos
+                            Choose from photo gallery
                           </span>
                         </div>
-                      </label>
+                      </button>
 
                       {/* Option 3: FILES */}
-                      <label
-                        htmlFor="invoice-upload-files-input"
+                      <button
+                        type="button"
+                        onClick={() => filesInputRef.current?.click()}
                         className={`p-3 rounded-[5px] bg-white hover:bg-zinc-50 border border-[#E4E3DE] hover:border-[#059669] text-[#18181B] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-2xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
@@ -556,10 +559,10 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             3. Files
                           </span>
                           <span className="block text-[10px] text-zinc-500 leading-tight mt-0.5">
-                            Select 1 or more files
+                            PDFs, docs &amp; multi-files
                           </span>
                         </div>
-                      </label>
+                      </button>
                     </div>
 
                     {isLoadingFiles && (

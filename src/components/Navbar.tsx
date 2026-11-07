@@ -1,28 +1,21 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import {
   QrCode,
   ListChecks,
   LayoutGrid,
-  Plus,
   Settings,
   ChevronDown,
 } from 'lucide-react';
-import { Delivery, SupplierRuleId } from '../types/delivery';
-import {
-  getDeliverySupplierRule,
-  setDeliverySupplierRule,
-  getPreferredSupplierRuleId,
-  setPreferredSupplierRuleId,
-} from '../utils/storage';
+import { Delivery } from '../types/delivery';
 
 interface NavbarProps {
   activeTab: 'scanner' | 'checklist' | 'dashboard';
   setActiveTab: (tab: 'scanner' | 'checklist' | 'dashboard') => void;
   activeDelivery: Delivery | null;
   onUpdateDelivery?: (updated: Delivery) => void;
-  onOpenNewDelivery: () => void;
+  onOpenNewDelivery?: () => void;
   onOpenDeliveriesList: () => void;
-  onOpenTestSheet: () => void;
+  onOpenTestSheet?: () => void;
   onOpenSettings: () => void;
 }
 
@@ -30,50 +23,16 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
   activeDelivery,
-  onUpdateDelivery,
-  onOpenNewDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
 }) => {
-  const [preferredRule, setPreferredRule] = useState<SupplierRuleId>(() =>
-    getPreferredSupplierRuleId()
-  );
-
-  useEffect(() => {
-    const handleRuleChange = () => {
-      setPreferredRule(getPreferredSupplierRuleId());
-    };
-    window.addEventListener('parttrack_supplier_rule_changed', handleRuleChange);
-    return () => {
-      window.removeEventListener('parttrack_supplier_rule_changed', handleRuleChange);
-    };
-  }, []);
-
-  const currentSupplierRule = activeDelivery
-    ? getDeliverySupplierRule(activeDelivery)
-    : getDeliverySupplierRule(null);
-
-  const activeRuleId: SupplierRuleId = activeDelivery
-    ? currentSupplierRule.id
-    : preferredRule;
-
-  const handleSupplierChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const nextRule = e.target.value as SupplierRuleId;
-    setPreferredRule(nextRule);
-    setPreferredSupplierRuleId(nextRule);
-    if (activeDelivery) {
-      const updated = setDeliverySupplierRule(activeDelivery, nextRule);
-      onUpdateDelivery?.(updated);
-    }
-  };
-
   const total = activeDelivery?.parts.length || 0;
   const received = activeDelivery?.parts.filter((p) => p.status === 'received').length || 0;
   const remaining = total - received;
 
   return (
     <>
-      {/* Top Bar: Minimal Native App Header with Supplier Dropdown */}
+      {/* Top Bar: Minimal Native App Header */}
       <header className="sticky top-0 z-30 bg-[#F6F5F2]/95 backdrop-blur-md border-b border-[#E4E3DE] pt-safe">
         <div className="max-w-2xl mx-auto px-3 sm:px-4 h-11 flex items-center justify-between gap-2">
           {/* Left: Brand + Delivery Selector */}
@@ -114,36 +73,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             )}
           </div>
 
-          {/* Right: Supplier Dropdown + New Delivery + Settings */}
+          {/* Right: Settings */}
           <div className="flex items-center gap-1.5 shrink-0">
-            <div className="relative flex items-center">
-              <label htmlFor="navbar-supplier-select" className="sr-only">
-                Select Supplier
-              </label>
-              <select
-                id="navbar-supplier-select"
-                aria-label="Supplier"
-                value={activeRuleId}
-                onChange={handleSupplierChange}
-                className="h-7 pl-2 pr-6 rounded-[4px] bg-white border border-[#E4E3DE] hover:border-[#059669] focus:border-[#059669] text-[11px] font-semibold text-[#18181B] outline-none cursor-pointer appearance-none shadow-2xs transition-colors"
-                title="Switch Supplier / Scan Mode"
-              >
-                <option value="laser_central">Laser Central</option>
-                <option value="gci">GCI</option>
-                <option value="ocr_label">OCR Label Scanner</option>
-              </select>
-              <ChevronDown className="w-3 h-3 text-zinc-500 pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" />
-            </div>
-
-            <button
-              onClick={onOpenNewDelivery}
-              className="h-7 px-2.5 inline-flex items-center gap-1 text-[11px] font-semibold bg-[#059669] hover:bg-[#047857] text-white rounded-[4px] transition-colors cursor-pointer whitespace-nowrap shadow-2xs"
-              title="Upload Invoice / Delivery Docket (Camera, Gallery or Files)"
-            >
-              <Plus className="w-3.5 h-3.5 stroke-[2.2]" />
-              <span>Upload Invoice</span>
-            </button>
-
             <button
               onClick={onOpenSettings}
               className="w-7 h-7 inline-flex items-center justify-center text-zinc-500 hover:text-[#18181B] hover:bg-black/[0.04] rounded transition-colors cursor-pointer"

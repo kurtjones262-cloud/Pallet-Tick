@@ -471,65 +471,6 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
                 <span>Export colour-coded PDF</span>
               </button>
 
-              <button
-                onClick={() => {
-                  setActionsMenuOpen(false);
-                  exportDeliveryCsv(delivery);
-                }}
-                className="w-full px-3 py-2 text-left text-[#18181B] hover:bg-zinc-50 flex items-center gap-2 cursor-pointer"
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5 text-zinc-400" />
-                <span>Export CSV data</span>
-              </button>
-
-              <button
-                onClick={async () => {
-                  setActionsMenuOpen(false);
-                  setIsExportingZip(true);
-                  try {
-                    await exportDeliveryZip(delivery, (status) => setZipStatusText(status));
-                  } catch (err) {
-                    console.error('Failed to export zip:', err);
-                  } finally {
-                    setTimeout(() => {
-                      setIsExportingZip(false);
-                      setZipStatusText('');
-                    }, 1200);
-                  }
-                }}
-                disabled={isExportingZip}
-                className="w-full px-3 py-2 text-left text-[#18181B] hover:bg-zinc-50 flex items-center gap-2 cursor-pointer"
-              >
-                {isExportingZip ? (
-                  <Loader2 className="w-3.5 h-3.5 text-[#059669] animate-spin" />
-                ) : (
-                  <Archive className="w-3.5 h-3.5 text-zinc-400" />
-                )}
-                <span>Export package (.zip)</span>
-              </button>
-
-              <button
-                onClick={() => {
-                  setActionsMenuOpen(false);
-                  onOpenTestSheet();
-                }}
-                className="w-full px-3 py-2 text-left text-[#18181B] hover:bg-zinc-50 flex items-center gap-2 cursor-pointer"
-              >
-                <QrCode className="w-3.5 h-3.5 text-zinc-400" />
-                <span>Test barcode sheet</span>
-              </button>
-
-              <button
-                onClick={() => {
-                  setActionsMenuOpen(false);
-                  setIsDocketPhotosOpen(true);
-                }}
-                className="w-full px-3 py-2 text-left text-[#18181B] hover:bg-zinc-50 flex items-center gap-2 cursor-pointer"
-              >
-                <FileText className="w-3.5 h-3.5 text-zinc-400" />
-                <span>Original docket photo(s)</span>
-              </button>
-
               <div className="my-1 border-t border-[#E4E3DE]" />
 
               {isCompleted ? (

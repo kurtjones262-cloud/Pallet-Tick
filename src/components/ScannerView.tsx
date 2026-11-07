@@ -9,26 +9,13 @@ import {
   Check,
   QrCode,
   Barcode,
-  Sparkles,
-  ExternalLink,
   RefreshCw,
-  ZoomIn,
-  ZoomOut,
-  Plus,
-  Minus,
   FileText,
-  Usb,
-  Activity,
-  Image as ImageIcon,
   FolderOpen,
+  Images,
   ArrowLeft,
-  Sliders,
-  Volume2,
-  VolumeX,
-  Smartphone,
-  Eye,
   AlertTriangle,
-  Info,
+  Tag,
 } from 'lucide-react';
 import {
   Delivery,
@@ -41,53 +28,40 @@ import {
   ScanMethod,
 } from '../types/delivery';
 import {
-  processScannedCode,
   confirmScannedPartQuantity,
-  confirmOcrPalletLabelScan,
-  recordUnmatchedOcrPalletLabel,
   parseBarcodeDocketNo,
-  getPartVerificationState,
   getDeliverySupplierRule,
   setDeliverySupplierRule,
   getPreferredSupplierRuleId,
   setPreferredSupplierRuleId,
   SUPPLIER_RULES,
   getStoredSettings,
-  saveStoredSettings,
   updateDelivery,
 } from '../utils/storage';
 import {
   recognizePalletLabelOffline,
-  generateSamplePalletLabelDataUrl,
   evaluatePalletLabelMatch,
   prewarmPalletLabelOcrEngine,
   computeVideoFrameSignature,
   computeFrameSignatureDifference,
-  PalletLabelExtractionResult,
 } from '../utils/palletLabelOcr';
 import {
   ScanConfirmationModal,
   ActiveScanData,
   ConfirmedScanPayload,
 } from './ScanConfirmationModal';
-import { exportDeliveryPdf } from '../utils/pdfExport';
-import { playAudio, triggerHaptic, speakAlert } from '../utils/audioFeedback';
+import { playAudio, triggerHaptic } from '../utils/audioFeedback';
 
 export type ScanInputSource = 'camera_barcode_qr' | 'external_hid' | 'photo_snap' | 'manual';
 
 const SELECTED_CAMERA_STORAGE_KEY = 'pallettick_selected_camera_id_v2';
 
-interface DiagnosticLogEntry {
-  id: string;
-  timestamp: string;
-  category: 'camera' | 'barcode_qr' | 'ocr' | 'external_hid' | 'error';
-  message: string;
-}
+type DiagnosticCategory = 'camera' | 'barcode_qr' | 'ocr' | 'external_hid' | 'error';
 
 interface ScannerViewProps {
   delivery: Delivery | null;
   onUpdateDelivery: (updated: Delivery) => void;
-  onOpenTestSheet: () => void;
+  onOpenTestSheet?: () => void;
   onOpenNewDelivery?: () => void;
   externalPendingQuantity?: PendingQuantityConfirmation | null;
   onClearExternalPendingQuantity?: () => void;
@@ -97,8 +71,6 @@ interface ScannerViewProps {
 export const ScannerView: React.FC<ScannerViewProps> = ({
   delivery,
   onUpdateDelivery,
-  onOpenTestSheet,
-  onOpenNewDelivery,
   externalPendingQuantity,
   onClearExternalPendingQuantity,
   onClose,
@@ -148,21 +120,50 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     timestamp: number;
   } | null>(null);
 
-  // Modals & Drawers
+  // Modals
   const [isCameraSelectModalOpen, setIsCameraSelectModalOpen] = useState<boolean>(false);
-  const [isPreferencesModalOpen, setIsPreferencesModalOpen] = useState<boolean>(false);
+  const [isSupplierModalOpen, setIsSupplierModalOpen] = useState<boolean>(false);
   const [isManualModalOpen, setIsManualModalOpen] = useState<boolean>(false);
   const [manualCodeInput, setManualCodeInput] = useState<string>('');
-  const [diagnosticLogs, setDiagnosticLogs] = useState<DiagnosticLogEntry[]>([]);
-  const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState<boolean>(false);
 
   // App Settings (sound, vibration, speech)
-  const [appSettings, setAppSettings] = useState(() => getStoredSettings());
+  const [appSettings] = useState(() => getStoredSettings());
 
-  // Supplier Rule State
+  // Preferred Supplier Rule ID state (syncs across session and when no delivery is active)
+  const [preferredRuleId, setPreferredRuleId] = useState<SupplierRuleId>(() =>
+    getPreferredSupplierRuleId()
+  );
+
+  useEffect(() => {
+    const handleRuleChange = () => {
+      setPreferredRuleId(getPreferredSupplierRuleId());
+    };
+    window.addEventListener('parttrack_supplier_rule_changed', handleRuleChange);
+    return () => {
+      window.removeEventListener('parttrack_supplier_rule_changed', handleRuleChange);
+    };
+  }, []);
+
+  // Active Supplier Rule State
   const activeSupplierRule = useMemo(() => {
-    return delivery ? getDeliverySupplierRule(delivery) : SUPPLIER_RULES.laser_central;
-  }, [delivery]);
+    if (delivery) {
+      return getDeliverySupplierRule(delivery);
+    }
+    return SUPPLIER_RULES[preferredRuleId] || SUPPLIER_RULES.laser_central;
+  }, [delivery, preferredRuleId]);
+
+  const handleSelectSupplierRule = useCallback(
+    (ruleId: SupplierRuleId) => {
+      setPreferredRuleId(ruleId);
+      setPreferredSupplierRuleId(ruleId);
+      if (delivery) {
+        const updated = setDeliverySupplierRule(delivery, ruleId);
+        onUpdateDelivery(updated);
+      }
+      setIsSupplierModalOpen(false);
+    },
+    [delivery, onUpdateDelivery]
+  );
 
   // References for continuous camera scanner instance & timers
   const scannerRef = useRef<Html5Qrcode | null>(null);
@@ -213,23 +214,13 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   onUpdateDeliveryRef.current = onUpdateDelivery;
 
   const appendDiagnosticLog = useCallback(
-    (category: DiagnosticLogEntry['category'], message: string) => {
-      const timeStr = new Date().toLocaleTimeString();
+    (category: DiagnosticCategory, message: string) => {
       const prefix = `[PalletTick ${category.toUpperCase()}]`;
       if (category === 'error') {
         console.warn(prefix, message);
       } else {
         console.info(prefix, message);
       }
-      setDiagnosticLogs((prev) => [
-        {
-          id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          timestamp: timeStr,
-          category,
-          message,
-        },
-        ...prev.slice(0, 59),
-      ]);
     },
     []
   );
@@ -1304,9 +1295,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       <input
         ref={galleryFileInputRef}
         type="file"
-        accept="image/*"
+        accept="image/jpeg,image/png,image/webp,image/jpg,image/heic,image/*"
         className="hidden"
-        onChange={(e) => handleFilePicked(e.target.files)}
+        onChange={(e) => {
+          handleFilePicked(e.target.files);
+          e.target.value = '';
+        }}
       />
 
       {/* Hidden offscreen container for static image decodes */}
@@ -1380,7 +1374,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             {/* Instruction Tagline below reticle */}
             <div className="mt-4 px-3 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-center">
               <span className="font-mono text-[10px] font-bold tracking-wider text-cyan-300 uppercase">
-                Align barcode, QR code or pallet label
+                {activeSupplierRule.name} · Align barcode, QR code or pallet label
               </span>
             </div>
 
@@ -1467,50 +1461,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             )}
           </div>
 
-          {/* Right: Live Scanning Status Indicator + Preferences + Diagnostics */}
+          {/* Right: Live Scanning Status Indicator */}
           <div className="flex items-center gap-1.5 shrink-0">
-            {/* Live Auto-Scan Status Pill */}
-            <div className="px-2 py-1 rounded-full bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_10px_rgba(6,182,212,0.25)]">
+            <div className="px-2.5 py-1 rounded-full bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_10px_rgba(6,182,212,0.25)]">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span>LIVE SCAN</span>
             </div>
-
-            {/* Test Sheet / Quick Codes */}
-            <button
-              type="button"
-              onClick={onOpenTestSheet}
-              className="h-8 px-2 rounded-lg bg-black/60 hover:bg-zinc-800 border border-white/15 text-zinc-300 hover:text-white font-mono text-[11px] flex items-center gap-1 cursor-pointer transition-colors"
-              title="Test barcodes & QR codes"
-            >
-              <QrCode className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="hidden md:inline">Test Codes</span>
-            </button>
-
-            {/* Settings Menu Button */}
-            <button
-              type="button"
-              onClick={() => setIsPreferencesModalOpen(true)}
-              className="w-8 h-8 rounded-lg bg-black/60 hover:bg-zinc-800 border border-white/15 text-zinc-300 hover:text-white flex items-center justify-center cursor-pointer transition-colors"
-              title="Scanning preferences"
-              aria-label="Scanning preferences"
-            >
-              <Sliders className="w-4 h-4" />
-            </button>
-
-            {/* Diagnostics Drawer Button */}
-            <button
-              type="button"
-              onClick={() => setIsDiagnosticsOpen((prev) => !prev)}
-              className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-colors border ${
-                isDiagnosticsOpen
-                  ? 'bg-cyan-500 text-black border-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.5)]'
-                  : 'bg-black/60 hover:bg-zinc-800 border-white/15 text-zinc-400 hover:text-white'
-              }`}
-              title="Diagnostics log"
-              aria-label="Diagnostics log"
-            >
-              <Activity className="w-4 h-4" />
-            </button>
           </div>
         </div>
 
@@ -1519,15 +1475,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         {/* ============================================================ */}
         <div
           onClick={(e) => e.stopPropagation()}
-          className="absolute bottom-4 inset-x-3 z-30 flex justify-center pointer-events-auto"
+          className="absolute bottom-4 inset-x-2.5 z-30 flex justify-center pointer-events-auto"
         >
-          <div className="w-full max-w-sm px-3 py-2 rounded-2xl bg-black/85 backdrop-blur-xl border border-white/15 shadow-[0_10px_35px_rgba(0,0,0,0.8)] flex items-center justify-between gap-1">
+          <div className="w-full max-w-md px-2.5 py-2 rounded-2xl bg-black/85 backdrop-blur-xl border border-white/15 shadow-[0_10px_35px_rgba(0,0,0,0.8)] flex items-center justify-between gap-1">
             {/* 1. Flashlight Toggle */}
             <button
               type="button"
               onClick={toggleTorch}
               disabled={!hasTorch}
-              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-all cursor-pointer ${
+              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-all cursor-pointer shrink-0 ${
                 torchOn
                   ? 'bg-amber-400 text-black shadow-[0_0_15px_rgba(251,191,36,0.6)]'
                   : hasTorch
@@ -1550,7 +1506,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 enumerateAllVideoInputs();
                 setIsCameraSelectModalOpen(true);
               }}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer"
+              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
               title="Switch camera device"
               aria-label="Switch camera"
             >
@@ -1578,7 +1534,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={() => setIsManualModalOpen(true)}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer"
+              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
               title="Type part number or code manually"
               aria-label="Manual code entry"
             >
@@ -1586,16 +1542,32 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               <span className="text-[8px] font-mono mt-0.5 font-bold uppercase">TYPE</span>
             </button>
 
-            {/* 5. Gallery / File Upload */}
+            {/* 5. Gallery Photo Upload */}
             <button
               type="button"
               onClick={() => galleryFileInputRef.current?.click()}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer"
-              title="Upload photo from gallery or files"
-              aria-label="Upload photo"
+              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
+              title="Import photo from gallery"
+              aria-label="Import photo from gallery"
             >
-              <FolderOpen className="w-4 h-4 stroke-[2.2]" />
+              <Images className="w-4 h-4 stroke-[2.2]" />
               <span className="text-[8px] font-mono mt-0.5 font-bold uppercase">PHOTO</span>
+            </button>
+
+            {/* 6. Supplier Label Format Selector */}
+            <button
+              type="button"
+              onClick={() => setIsSupplierModalOpen(true)}
+              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0 ${
+                isSupplierModalOpen
+                  ? 'bg-cyan-500 text-black shadow-[0_0_15px_rgba(6,182,212,0.5)]'
+                  : 'bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white'
+              }`}
+              title={`Supplier Format: ${activeSupplierRule.name}`}
+              aria-label="Select supplier label format"
+            >
+              <Tag className="w-4 h-4 stroke-[2.2]" />
+              <span className="text-[8px] font-mono mt-0.5 font-bold uppercase">SUPPLIER</span>
             </button>
           </div>
         </div>
@@ -1682,96 +1654,94 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       )}
 
       {/* ============================================================ */}
-      {/* SCANNING PREFERENCES / SETTINGS MODAL                        */}
+      {/* SUPPLIER LABEL FORMAT SELECTOR MODAL                         */}
       {/* ============================================================ */}
-      {isPreferencesModalOpen && (
+      {isSupplierModalOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-150"
-          onClick={() => setIsPreferencesModalOpen(false)}
+          onClick={() => setIsSupplierModalOpen(false)}
         >
           <div
-            className="w-full max-w-sm bg-[#0B0F17] border border-zinc-800 rounded-2xl shadow-2xl p-5 text-white"
+            className="w-full max-w-sm bg-[#0B0F17] border border-cyan-500/40 rounded-2xl shadow-2xl p-5 text-white"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <Sliders className="w-5 h-5 text-cyan-400" />
-                <h3 className="font-bold text-sm">Scanning Preferences</h3>
+                <Tag className="w-5 h-5 text-cyan-400" />
+                <h3 className="font-bold text-sm">Supplier Label Format</h3>
               </div>
               <button
                 type="button"
-                onClick={() => setIsPreferencesModalOpen(false)}
+                onClick={() => setIsSupplierModalOpen(false)}
                 className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
+                aria-label="Close supplier format selector"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-3 text-xs">
-              {/* Sound Audio Feedback */}
-              <label className="flex items-center justify-between p-3 rounded-xl bg-zinc-900/70 border border-zinc-800 cursor-pointer">
-                <div className="flex items-center gap-2.5">
-                  <Volume2 className="w-4 h-4 text-cyan-400" />
-                  <div>
-                    <span className="font-medium block text-zinc-200">Audio Chimes</span>
-                    <span className="text-[10px] text-zinc-500">Play sound on successful match</span>
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={appSettings.soundEnabled}
-                  onChange={(e) => {
-                    const next = { ...appSettings, soundEnabled: e.target.checked };
-                    setAppSettings(next);
-                    saveStoredSettings(next);
-                  }}
-                  className="w-4 h-4 rounded text-cyan-500 focus:ring-cyan-400"
-                />
-              </label>
+            <div className="mb-3 px-3 py-2 rounded-xl bg-zinc-900/80 border border-zinc-800 flex items-center justify-between text-xs">
+              <span className="text-zinc-400">Active Format:</span>
+              <span className="font-mono font-bold text-cyan-400">{activeSupplierRule.name}</span>
+            </div>
 
-              {/* Vibration Haptic Feedback */}
-              <label className="flex items-center justify-between p-3 rounded-xl bg-zinc-900/70 border border-zinc-800 cursor-pointer">
-                <div className="flex items-center gap-2.5">
-                  <Smartphone className="w-4 h-4 text-cyan-400" />
-                  <div>
-                    <span className="font-medium block text-zinc-200">Vibration Feedback</span>
-                    <span className="text-[10px] text-zinc-500">Haptic pulse on scan</span>
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={appSettings.vibrationEnabled}
-                  onChange={(e) => {
-                    const next = { ...appSettings, vibrationEnabled: e.target.checked };
-                    setAppSettings(next);
-                    saveStoredSettings(next);
-                  }}
-                  className="w-4 h-4 rounded text-cyan-500 focus:ring-cyan-400"
-                />
-              </label>
-
-              {/* Supplier Rule Selection */}
-              <div className="p-3 rounded-xl bg-zinc-900/70 border border-zinc-800">
-                <label className="font-medium block text-zinc-200 mb-1.5">
-                  Supplier Label Format
-                </label>
-                <select
-                  value={activeSupplierRule.id}
-                  onChange={(e) => {
-                    const ruleId = e.target.value as SupplierRuleId;
-                    if (delivery) {
-                      const updated = setDeliverySupplierRule(delivery, ruleId);
-                      onUpdateDelivery(updated);
-                    }
-                    setPreferredSupplierRuleId(ruleId);
-                  }}
-                  className="w-full h-9 px-2.5 rounded-lg bg-[#070A0F] border border-zinc-700 text-white font-mono text-xs outline-none focus:border-cyan-400 cursor-pointer"
-                >
-                  <option value="laser_central">Laser Central (Part # QR &amp; Dash Barcode)</option>
-                  <option value="gci">GCI (Part # &amp; Item #)</option>
-                  <option value="ocr_label">OCR Pallet Label Mode</option>
-                </select>
-              </div>
+            <div className="space-y-2">
+              {(
+                [
+                  {
+                    id: 'laser_central' as SupplierRuleId,
+                    name: 'Laser Central',
+                    subtitle: '1D Dash Barcodes (######-No) & Part # QR Codes',
+                    icon: Barcode,
+                  },
+                  {
+                    id: 'gci' as SupplierRuleId,
+                    name: 'GCI',
+                    subtitle: '2D QR Codes & Part / Item Number Labels',
+                    icon: QrCode,
+                  },
+                  {
+                    id: 'ocr_label' as SupplierRuleId,
+                    name: 'OCR Label Scanner',
+                    subtitle: 'Printed Text Pallet Labels (Part #, Desc & Qty)',
+                    icon: FileText,
+                  },
+                ] as const
+              ).map((option) => {
+                const isSelected = activeSupplierRule.id === option.id;
+                const OptionIcon = option.icon;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => handleSelectSupplierRule(option.id)}
+                    className={`w-full p-3 rounded-xl border text-left flex items-center justify-between gap-3 cursor-pointer transition-all ${
+                      isSelected
+                        ? 'bg-cyan-950/60 border-cyan-400 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                        : 'bg-zinc-900/60 hover:bg-zinc-800 border-zinc-800 text-zinc-300'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      <div
+                        className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                          isSelected
+                            ? 'bg-cyan-400/20 text-cyan-300 border border-cyan-400/40'
+                            : 'bg-zinc-800 text-zinc-400'
+                        }`}
+                      >
+                        <OptionIcon className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-mono text-xs font-bold truncate">{option.name}</div>
+                        <div className="text-[10px] text-zinc-400 truncate mt-0.5">
+                          {option.subtitle}
+                        </div>
+                      </div>
+                    </div>
+                    {isSelected && <Check className="w-4 h-4 text-cyan-400 shrink-0" />}
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1835,52 +1805,6 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 </button>
               </div>
             </form>
-          </div>
-        </div>
-      )}
-
-      {/* ============================================================ */}
-      {/* DIAGNOSTIC LOGS DRAWER                                       */}
-      {/* ============================================================ */}
-      {isDiagnosticsOpen && (
-        <div className="fixed inset-x-0 bottom-12 z-40 bg-[#0B0F17]/98 border-t border-cyan-500/30 max-h-64 flex flex-col text-white shadow-2xl animate-in slide-in-from-bottom duration-200">
-          <div className="px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/60">
-            <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-cyan-400" />
-              <span className="font-mono text-xs font-bold uppercase tracking-wider">
-                Scanner Hardware Logs ({diagnosticLogs.length})
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setIsDiagnosticsOpen(false)}
-              className="p-1 text-zinc-400 hover:text-white cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-3 font-mono text-[10px] space-y-1">
-            {diagnosticLogs.length === 0 ? (
-              <div className="text-zinc-500 italic">No diagnostic events recorded yet.</div>
-            ) : (
-              diagnosticLogs.map((log) => (
-                <div key={log.id} className="text-zinc-300 flex items-start gap-2">
-                  <span className="text-zinc-500 shrink-0">{log.timestamp}</span>
-                  <span
-                    className={`font-bold shrink-0 ${
-                      log.category === 'error'
-                        ? 'text-red-400'
-                        : log.category === 'ocr'
-                        ? 'text-amber-400'
-                        : 'text-cyan-400'
-                    }`}
-                  >
-                    [{log.category.toUpperCase()}]
-                  </span>
-                  <span className="break-all">{log.message}</span>
-                </div>
-              ))
-            )}
           </div>
         </div>
       )}

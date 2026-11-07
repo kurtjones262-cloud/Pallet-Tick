@@ -1,21 +1,16 @@
 import React, { useState } from 'react';
 import {
-  RotateCcw,
   X,
   Trash2,
   Archive,
-  Download,
   Loader2,
 } from 'lucide-react';
 import { AppSettings } from '../types/delivery';
 import {
   getStoredSettings,
   saveStoredSettings,
-  saveStoredDeliveries,
-  setActiveDeliveryId,
   clearAllDeliveries,
 } from '../utils/storage';
-import { generate200PartDelivery } from '../utils/sampleData';
 import { playAudio, triggerHaptic } from '../utils/audioFeedback';
 import { exportAllDeliveriesBackupZip } from '../utils/zipExport';
 
@@ -29,9 +24,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSettingsSaved,
 }) => {
   const [settings, setSettings] = useState<AppSettings>(getStoredSettings());
-  const [resetDone, setResetDone] = useState(false);
   const [isBackingUpZip, setIsBackingUpZip] = useState(false);
-  const [isDownloadingSource, setIsDownloadingSource] = useState(false);
 
   const handleToggle = (field: keyof AppSettings) => {
     const next = { ...settings, [field]: !settings[field] };
@@ -63,31 +56,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       console.error('Backup zip failed:', err);
     } finally {
       setIsBackingUpZip(false);
-    }
-  };
-
-  const handleDownloadSourceZip = () => {
-    setIsDownloadingSource(true);
-    const link = document.createElement('a');
-    link.href = '/api/export-project-zip';
-    link.download = 'pallettick-app-source.zip';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => setIsDownloadingSource(false), 1500);
-  };
-
-  const handleLoadSampleData = () => {
-    if (confirm('Load 200-part laser cutting delivery (6 pallets) for testing?')) {
-      const sample = [generate200PartDelivery()];
-      saveStoredDeliveries(sample);
-      setActiveDeliveryId(sample[0].id);
-      setResetDone(true);
-      setTimeout(() => {
-        setResetDone(false);
-        onSettingsSaved();
-        onClose();
-      }, 300);
     }
   };
 
@@ -212,19 +180,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <span>{isBackingUpZip ? 'Packaging backup...' : 'Backup all deliveries (.zip)'}</span>
           </button>
 
-          <button
-            onClick={handleDownloadSourceZip}
-            disabled={isDownloadingSource}
-            className="w-full h-9 px-3 rounded-[4px] border border-[#E4E3DE] bg-white hover:bg-zinc-50 text-xs font-medium text-zinc-700 flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-          >
-            {isDownloadingSource ? (
-              <Loader2 className="w-3.5 h-3.5 text-[#059669] animate-spin" />
-            ) : (
-              <Download className="w-3.5 h-3.5 text-zinc-500" />
-            )}
-            <span>{isDownloadingSource ? 'Compressing source...' : 'Download app source code (.zip)'}</span>
-          </button>
-
           <div className="pt-2 border-t border-[#E4E3DE]" />
 
           <button
@@ -233,15 +188,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           >
             <Trash2 className="w-3.5 h-3.5" />
             <span>Clear all deliveries (Fresh app)</span>
-          </button>
-
-          <button
-            onClick={handleLoadSampleData}
-            disabled={resetDone}
-            className="w-full h-9 px-3 rounded-[4px] border border-[#E4E3DE] bg-white hover:bg-zinc-50 text-xs font-medium text-zinc-600 flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>{resetDone ? 'Loading...' : 'Load 200-part demo docket'}</span>
           </button>
         </div>
       </div>

@@ -11,18 +11,21 @@ import {
   ChevronUp,
   QrCode,
   ListChecks,
-  Printer,
+  FileText,
   Calendar,
   Boxes,
   Truck,
   Check,
+  RotateCcw,
   AlertTriangle,
   ArrowUpRight,
 } from 'lucide-react';
+import confetti from 'canvas-confetti';
 import { Delivery, DeliveryPart } from '../types/delivery';
 import {
   getStoredDeliveries,
   setActiveDeliveryId,
+  updateDelivery,
   deleteDelivery,
   getPartVerificationState,
 } from '../utils/storage';
@@ -166,6 +169,32 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           onSelectDelivery(remaining[0]);
         }
       }
+    }
+  };
+
+  // Toggle order completion status at any time (complete or reopen to continue scanning)
+  const handleToggleComplete = (order: Delivery, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const isNowComplete = order.status !== 'completed';
+    const updated: Delivery = {
+      ...order,
+      status: isNowComplete ? 'completed' : 'receiving',
+      updatedAt: new Date().toISOString(),
+    };
+    updateDelivery(updated);
+    refreshDeliveries();
+    if (activeDelivery?.id === order.id) {
+      onSelectDelivery(updated);
+    }
+    if (isNowComplete) {
+      try {
+        confetti({
+          particleCount: 50,
+          spread: 60,
+          origin: { y: 0.6 },
+          colors: ['#00A8FF', '#00D2FF', '#10B981', '#ffffff'],
+        });
+      } catch {}
     }
   };
 
@@ -349,8 +378,8 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         </div>
                       </div>
 
-                      {/* Right: Status Pill & Delete Order */}
-                      <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                      {/* Right: Status Pill, Complete/Reopen, PDF Export, Delete Order, Parts Toggle */}
+                      <div className="flex items-center gap-2 self-start sm:self-auto shrink-0 flex-wrap">
                         {/* Status Pill */}
                         {category === 'finished' ? (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/40">
@@ -368,6 +397,47 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                             INCOMPLETE
                           </span>
                         )}
+
+                        {/* Complete / Reopen Button (Can be completed at any time even with outstanding parts, or reopened later to edit/continue scanning) */}
+                        {d.status === 'completed' ? (
+                          <button
+                            type="button"
+                            onClick={(e) => handleToggleComplete(d, e)}
+                            className="h-8 px-2.5 rounded-lg bg-amber-950/50 hover:bg-amber-900/70 border border-amber-500/40 text-xs font-mono font-bold text-amber-300 hover:text-amber-200 inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                            title="Reopen order to edit or continue scanning"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Reopen</span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(e) => handleToggleComplete(d, e)}
+                            className="h-8 px-2.5 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-500/40 text-xs font-mono font-bold text-emerald-400 hover:text-emerald-300 inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                            title={
+                              remaining > 0
+                                ? `Complete order now (${remaining} parts outstanding)`
+                                : 'Complete order'
+                            }
+                          >
+                            <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                            <span>Complete</span>
+                          </button>
+                        )}
+
+                        {/* PDF Export Button (Displayed directly in the orders screen next to every order before opening parts) */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            exportDeliveryPdf(d);
+                          }}
+                          className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] hover:border-cyan-500/50 text-xs font-mono font-bold text-cyan-400 hover:text-cyan-300 inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                          title={`Export PDF report for Docket #${d.docketNumber}`}
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>PDF</span>
+                        </button>
 
                         {/* Delete Order Button */}
                         <button
@@ -443,7 +513,18 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           <button
                             type="button"
                             onClick={() => {
-                              handleSelectOrder(d);
+                              if (d.status === 'completed') {
+                                const updated: Delivery = {
+                                  ...d,
+                                  status: 'receiving',
+                                  updatedAt: new Date().toISOString(),
+                                };
+                                updateDelivery(updated);
+                                refreshDeliveries();
+                                onSelectDelivery(updated);
+                              } else {
+                                handleSelectOrder(d);
+                              }
                               onStartScanning();
                             }}
                             className="h-8 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs font-mono tracking-wider uppercase inline-flex items-center gap-1.5 cursor-pointer shadow-sm"
@@ -462,15 +543,6 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           >
                             <ListChecks className="w-3.5 h-3.5 text-cyan-400" />
                             <span>Full Checklist</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => exportDeliveryPdf(d)}
-                            className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono text-slate-300 inline-flex items-center gap-1 cursor-pointer"
-                            title="Export colour-coded PDF report"
-                          >
-                            <Printer className="w-3.5 h-3.5" />
                           </button>
                         </div>
                       </div>

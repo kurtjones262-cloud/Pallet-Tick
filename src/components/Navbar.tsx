@@ -1,15 +1,12 @@
 import React from 'react';
 import {
   QrCode,
-  ListChecks,
   LayoutGrid,
   ClipboardList,
-  FileText,
   Settings,
   ChevronDown,
 } from 'lucide-react';
 import { Delivery } from '../types/delivery';
-import { exportDeliveryPdf } from '../utils/pdfExport';
 
 interface NavbarProps {
   activeTab: 'scanner' | 'checklist' | 'dashboard' | 'orders';
@@ -20,7 +17,6 @@ interface NavbarProps {
   onOpenDeliveriesList: () => void;
   onOpenTestSheet?: () => void;
   onOpenSettings: () => void;
-  onExportPdf?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -29,21 +25,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
-  onExportPdf,
 }) => {
   const total = activeDelivery?.parts.length || 0;
   const received = activeDelivery?.parts.filter((p) => p.status === 'received').length || 0;
-  const remaining = total - received;
-
-  const handleReportsClick = () => {
-    if (onExportPdf) {
-      onExportPdf();
-    } else if (activeDelivery) {
-      exportDeliveryPdf(activeDelivery);
-    } else {
-      onOpenDeliveriesList();
-    }
-  };
 
   return (
     <>
@@ -118,11 +102,11 @@ export const Navbar: React.FC<NavbarProps> = ({
       </header>
 
       {/* =========================================================================
-       * BOTTOM NAVIGATION: Clean 5-Section Mobile & Tablet Layout
-       * [ Home · Orders · (SCAN - Elevated Center) · Reports · Settings ]
+       * BOTTOM NAVIGATION: Clean 4-Tab Mobile & Tablet Layout
+       * [ Home · Orders · Scan · Settings ]
        * ========================================================================= */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0F1A]/95 backdrop-blur-md border-t border-[#1E2D44] pb-safe shadow-[0_-4px_20px_rgba(0,0,0,0.5)]">
-        <div className="max-w-2xl mx-auto grid grid-cols-5 h-14 items-center px-1">
+        <div className="max-w-md mx-auto grid grid-cols-4 h-14 items-center px-1">
 
           {/* 1. Home */}
           <button
@@ -156,33 +140,33 @@ export const Navbar: React.FC<NavbarProps> = ({
             </span>
           </button>
 
-          {/* 3. Scan (Center Visually Prominent Elevated Button) */}
-          <div className="flex items-center justify-center -mt-5">
-            <button
-              type="button"
-              onClick={() => setActiveTab('scanner')}
-              className="w-13 h-13 rounded-2xl bg-gradient-to-tr from-cyan-400 via-cyan-500 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-black flex flex-col items-center justify-center shadow-[0_0_22px_rgba(0,168,255,0.45)] border-2 border-[#070A0F] active:scale-95 transition-all cursor-pointer group"
-              title="Launch High-Speed Scanner"
-              aria-label="Scan parts"
-            >
-              <QrCode className="w-6 h-6 stroke-[2.4] group-hover:scale-105 transition-transform" />
-            </button>
-          </div>
-
-          {/* 4. Reports */}
+          {/* 3. Scan */}
           <button
             type="button"
-            onClick={handleReportsClick}
-            className="flex flex-col items-center justify-center gap-1 text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer py-1"
-            title="Generate & Export PDF Report"
+            onClick={() => setActiveTab('scanner')}
+            className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer py-1 ${
+              activeTab === 'scanner'
+                ? 'text-cyan-400'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+            title="Launch High-Speed Scanner"
+            aria-label="Scan parts"
           >
-            <FileText className="w-4 h-4 stroke-[1.9]" />
+            <div
+              className={`w-8 h-7 rounded-lg flex items-center justify-center transition-all ${
+                activeTab === 'scanner'
+                  ? 'bg-cyan-500 text-black shadow-[0_0_12px_rgba(0,168,255,0.5)]'
+                  : 'bg-cyan-950/70 border border-cyan-500/40 text-cyan-400'
+              }`}
+            >
+              <QrCode className="w-4 h-4 stroke-[2.2]" />
+            </div>
             <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
-              Reports
+              Scan
             </span>
           </button>
 
-          {/* 5. Settings */}
+          {/* 4. Settings */}
           <button
             type="button"
             onClick={onOpenSettings}

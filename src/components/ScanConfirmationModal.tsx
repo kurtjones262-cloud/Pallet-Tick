@@ -73,6 +73,16 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
 
   const quantityInputRef = useRef<HTMLInputElement | null>(null);
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onDiscard();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onDiscard]);
+
   const parsedQty = useMemo(() => {
     const val = parseInt(quantityInput.trim(), 10);
     return !Number.isNaN(val) && val > 0 ? val : 0;
@@ -518,37 +528,36 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
 
         {/* Bottom Actions Bar (Mobile Sticky & Touch-Optimised) */}
         <div className="p-4 bg-[#0D131F] border-t border-zinc-800/80 flex flex-col gap-2 shrink-0">
-          {/* Primary Action Button: SAVE & SCAN NEXT (Continuous Scanning Workflow) */}
+          {/* Primary Action Button: CONFIRM & SCAN NEXT (Continuous Scanning Workflow) */}
           <button
             type="button"
             onClick={handleSaveAndScanNextClick}
             className="w-full h-12 rounded-xl bg-gradient-to-r from-cyan-500 via-cyan-400 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-black font-bold text-sm tracking-wide flex items-center justify-center gap-2 cursor-pointer shadow-[0_0_20px_rgba(6,182,212,0.4)] active:scale-[0.98] transition-all"
           >
             <Check className="w-5 h-5 stroke-[3]" />
-            <span>SAVE &amp; SCAN NEXT</span>
+            <span>CONFIRM &amp; SCAN NEXT</span>
             <ArrowRight className="w-4 h-4 ml-1 stroke-[2.5]" />
           </button>
 
-          {/* Secondary Actions Row: CONFIRM & SAVE and DISCARD */}
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={handleConfirmAndSaveClick}
-              className="h-10 px-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 hover:text-white font-semibold text-xs flex items-center justify-center gap-1.5 cursor-pointer border border-zinc-700 transition-colors"
-            >
-              <Check className="w-4 h-4 text-emerald-400" />
-              <span>CONFIRM &amp; SAVE</span>
-            </button>
+          {/* Confirm Button */}
+          <button
+            type="button"
+            onClick={handleConfirmAndSaveClick}
+            className="w-full h-11 px-4 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-100 hover:text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer border border-zinc-700 transition-colors shadow-sm"
+          >
+            <Check className="w-4 h-4 text-emerald-400 stroke-[2.5]" />
+            <span>CONFIRM</span>
+          </button>
 
-            <button
-              type="button"
-              onClick={onDiscard}
-              className="h-10 px-3 rounded-xl bg-red-950/30 hover:bg-red-950/50 border border-red-500/30 text-red-300 font-semibold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-red-400" />
-              <span>DISCARD</span>
-            </button>
-          </div>
+          {/* Cancel Button Underneath Confirm */}
+          <button
+            type="button"
+            onClick={onDiscard}
+            className="w-full h-11 px-4 rounded-xl bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 hover:border-zinc-600 text-zinc-300 hover:text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
+          >
+            <X className="w-4 h-4 text-zinc-400" />
+            <span>CANCEL</span>
+          </button>
         </div>
       </div>
     </div>

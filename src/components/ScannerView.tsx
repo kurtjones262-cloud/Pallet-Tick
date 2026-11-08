@@ -163,6 +163,11 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     return SUPPLIER_RULES[preferredRuleId] || SUPPLIER_RULES.laser_central;
   }, [delivery, preferredRuleId]);
 
+  const activeSupplierRuleRef = useRef(activeSupplierRule);
+  activeSupplierRuleRef.current = activeSupplierRule;
+
+  const startScannerRef = useRef<((targetCameraId?: string) => Promise<void>) | null>(null);
+
   const handleSelectSupplierRule = useCallback(
     (ruleId: SupplierRuleId) => {
       setPreferredRuleId(ruleId);
@@ -172,6 +177,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         onUpdateDelivery(updated);
       }
       setIsSupplierModalOpen(false);
+      // Re-configure scanner formats when switching between OCR Label mode and barcode/QR modes
+      setTimeout(() => {
+        startScannerRef.current?.();
+      }, 60);
     },
     [delivery, onUpdateDelivery]
   );
@@ -488,10 +497,38 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
    * 3. Opens the dedicated ScanConfirmationModal.
    */
   const handleScannedCode = useCallback(
-    (codeText: string, inputSource: ScanInputSource = 'camera_barcode_qr') => {
+    (
+      codeText: string,
+      inputSource: ScanInputSource = 'camera_barcode_qr',
+      detectedFormat?: string
+    ) => {
       // Block scanning if confirmation modal is already open
       if (activeScanConfirmationRef.current !== null) {
         return;
+      }
+
+      // When in OCR label scan mode, do NOT automatically scan QR codes
+      const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
+      if (isOcrMode && inputSource === 'camera_barcode_qr') {
+        const fmt = (detectedFormat || '').toUpperCase();
+        if (
+          fmt === 'QR_CODE' ||
+          fmt === 'QRCODE' ||
+          fmt.includes('QR')
+        ) {
+          return;
+        }
+
+        const trimmed = codeText.trim();
+        // Guard against QR payloads (URL, mailto, complex json/multiline data)
+        if (
+          trimmed.startsWith('http://') ||
+          trimmed.startsWith('https://') ||
+          trimmed.startsWith('mailto:') ||
+          trimmed.startsWith('tel:')
+        ) {
+          return;
+        }
       }
 
       const currentDelivery = deliveryRef.current;
@@ -742,20 +779,33 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     }
 
     try {
-      const detector = new (window as any).BarcodeDetector({
-        formats: [
-          'qr_code',
-          'code_128',
-          'code_39',
-          'ean_13',
-          'ean_8',
-          'data_matrix',
-          'itf',
-          'upc_a',
-          'upc_e',
-          'codabar',
-        ],
-      });
+      const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
+      const formats = isOcrMode
+        ? [
+            'code_128',
+            'code_39',
+            'ean_13',
+            'ean_8',
+            'data_matrix',
+            'itf',
+            'upc_a',
+            'upc_e',
+            'codabar',
+          ]
+        : [
+            'qr_code',
+            'code_128',
+            'code_39',
+            'ean_13',
+            'ean_8',
+            'data_matrix',
+            'itf',
+            'upc_a',
+            'upc_e',
+            'codabar',
+          ];
+
+      const detector = new (window as any).BarcodeDetector({ formats });
 
       nativeDetectorIntervalRef.current = setInterval(async () => {
         if (
@@ -778,9 +828,18 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             isMountedRef.current &&
             activeScanConfirmationRef.current === null
           ) {
-            const rawVal = barcodes[0].rawValue || barcodes[0].raw_value || '';
+            const first = barcodes[0];
+            const fmt = (first.format || '').toLowerCase();
+            const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
+            if (
+              currentIsOcr &&
+              (fmt === 'qr_code' || fmt === 'qrcode' || fmt === 'qr')
+            ) {
+              return; // Do NOT scan QR codes in OCR label scan mode
+            }
+            const rawVal = first.rawValue || first.raw_value || '';
             if (rawVal) {
-              handleScannedCode(rawVal, 'camera_barcode_qr');
+              handleScannedCode(rawVal, 'camera_barcode_qr', fmt);
             }
           }
         } catch {}
@@ -936,19 +995,34 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           });
         }
 
+        const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
+        const formatsToSupport = isOcrMode
+          ? [
+              Html5QrcodeSupportedFormats.CODE_128,
+              Html5QrcodeSupportedFormats.CODE_39,
+              Html5QrcodeSupportedFormats.EAN_13,
+              Html5QrcodeSupportedFormats.EAN_8,
+              Html5QrcodeSupportedFormats.DATA_MATRIX,
+              Html5QrcodeSupportedFormats.ITF,
+              Html5QrcodeSupportedFormats.UPC_A,
+              Html5QrcodeSupportedFormats.UPC_E,
+              Html5QrcodeSupportedFormats.CODABAR,
+            ]
+          : [
+              Html5QrcodeSupportedFormats.QR_CODE,
+              Html5QrcodeSupportedFormats.CODE_128,
+              Html5QrcodeSupportedFormats.CODE_39,
+              Html5QrcodeSupportedFormats.EAN_13,
+              Html5QrcodeSupportedFormats.EAN_8,
+              Html5QrcodeSupportedFormats.DATA_MATRIX,
+              Html5QrcodeSupportedFormats.ITF,
+              Html5QrcodeSupportedFormats.UPC_A,
+              Html5QrcodeSupportedFormats.UPC_E,
+              Html5QrcodeSupportedFormats.CODABAR,
+            ];
+
         const scanner = new Html5Qrcode('camera-scanner-view', {
-          formatsToSupport: [
-            Html5QrcodeSupportedFormats.QR_CODE,
-            Html5QrcodeSupportedFormats.CODE_128,
-            Html5QrcodeSupportedFormats.CODE_39,
-            Html5QrcodeSupportedFormats.EAN_13,
-            Html5QrcodeSupportedFormats.EAN_8,
-            Html5QrcodeSupportedFormats.DATA_MATRIX,
-            Html5QrcodeSupportedFormats.ITF,
-            Html5QrcodeSupportedFormats.UPC_A,
-            Html5QrcodeSupportedFormats.UPC_E,
-            Html5QrcodeSupportedFormats.CODABAR,
-          ],
+          formatsToSupport,
           verbose: false,
         });
         scannerRef.current = scanner;
@@ -970,7 +1044,21 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             await scanner.start(
               { deviceId: { exact: camId } },
               scanConfig,
-              (decodedText) => handleScannedCode(decodedText, 'camera_barcode_qr'),
+              (decodedText, decodedResult) => {
+                const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
+                const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
+                const formatEnum = decodedResult?.result?.format?.format;
+                if (
+                  currentIsOcr &&
+                  (formatName === 'QR_CODE' ||
+                    formatName === 'QRCODE' ||
+                    formatEnum === Html5QrcodeSupportedFormats.QR_CODE ||
+                    formatName.includes('QR'))
+                ) {
+                  return; // Don't scan QR codes in OCR label scan mode
+                }
+                handleScannedCode(decodedText, 'camera_barcode_qr', formatName);
+              },
               () => {}
             );
             started = true;
@@ -991,7 +1079,21 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             await scanner.start(
               { facingMode: 'environment' },
               scanConfig,
-              (decodedText) => handleScannedCode(decodedText, 'camera_barcode_qr'),
+              (decodedText, decodedResult) => {
+                const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
+                const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
+                const formatEnum = decodedResult?.result?.format?.format;
+                if (
+                  currentIsOcr &&
+                  (formatName === 'QR_CODE' ||
+                    formatName === 'QRCODE' ||
+                    formatEnum === Html5QrcodeSupportedFormats.QR_CODE ||
+                    formatName.includes('QR'))
+                ) {
+                  return; // Don't scan QR codes in OCR label scan mode
+                }
+                handleScannedCode(decodedText, 'camera_barcode_qr', formatName);
+              },
               () => {}
             );
             started = true;
@@ -1044,6 +1146,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       startNativeBarcodeLoop,
     ]
   );
+  startScannerRef.current = startScanner;
 
   /**
    * Stop scanner safely
@@ -1403,7 +1506,9 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             {/* Instruction Tagline below reticle */}
             <div className="mt-4 px-3 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-center">
               <span className="font-mono text-[10px] font-bold tracking-wider text-cyan-300 uppercase">
-                {activeSupplierRule.name} · Align barcode, QR code or pallet label
+                {activeSupplierRule.id === 'ocr_label'
+                  ? 'OCR Label Mode · Reading printed label text (QR auto-scan disabled)'
+                  : `${activeSupplierRule.name} · Align barcode, QR code or pallet label`}
               </span>
             </div>
 

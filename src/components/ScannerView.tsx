@@ -65,6 +65,7 @@ interface ScannerViewProps {
   onOpenNewDelivery?: () => void;
   externalPendingQuantity?: PendingQuantityConfirmation | null;
   onClearExternalPendingQuantity?: () => void;
+  onScanConfirmationChange?: (isOpen: boolean) => void;
   onClose?: () => void;
 }
 
@@ -73,6 +74,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   onUpdateDelivery,
   externalPendingQuantity,
   onClearExternalPendingQuantity,
+  onScanConfirmationChange,
   onClose,
 }) => {
   // Live camera stream state
@@ -107,6 +109,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   // UNIFIED SCAN CONFIRMATION STATE (locks/pauses camera detection while open)
   const [activeScanConfirmation, setActiveScanConfirmation] = useState<ActiveScanData | null>(null);
+
+  // Notify parent container so global menu bars are hidden while confirming a scan
+  useEffect(() => {
+    onScanConfirmationChange?.(activeScanConfirmation !== null);
+    return () => {
+      onScanConfirmationChange?.(false);
+    };
+  }, [activeScanConfirmation, onScanConfirmationChange]);
 
   // Status and feedback states
   const [scanFeedback, setScanFeedback] = useState<ScanFeedback | null>(null);

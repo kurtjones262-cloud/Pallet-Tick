@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Check,
   X,
@@ -232,16 +233,18 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
     }
   }, [resolvedMatchedPart, parsedQty, scan.docketNumber, scan.rawCode, partNumber]);
 
-  return (
+  if (typeof document === 'undefined') return null;
+
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm p-0 sm:p-4 animate-in fade-in duration-200"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 backdrop-blur-md p-3 sm:p-4 pb-6 sm:pb-4 animate-in fade-in duration-200"
       onClick={(e) => {
-        // Prevent background clicks from closing unintentionally without user choosing Discard
+        // Prevent background clicks from closing unintentionally without user choosing Cancel
         e.stopPropagation();
       }}
     >
       <div
-        className="w-full max-w-lg bg-[#0B0F17] text-white rounded-t-2xl sm:rounded-2xl border border-cyan-500/30 shadow-[0_0_50px_rgba(0,168,255,0.2)] flex flex-col max-h-[92vh] sm:max-h-[88vh] overflow-hidden animate-in slide-in-from-bottom-6 sm:zoom-in-95 duration-200"
+        className="w-full max-w-lg bg-[#0B0F17] text-white rounded-2xl border border-cyan-500/30 shadow-[0_0_50px_rgba(0,168,255,0.3)] flex flex-col max-h-[90dvh] sm:max-h-[88dvh] overflow-hidden animate-in zoom-in-95 duration-200 my-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Top Header Bar: Scan Method + Docket Association + Discard Button */}
@@ -560,6 +563,7 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };

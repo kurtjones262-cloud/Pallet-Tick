@@ -25,6 +25,7 @@ export function App() {
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
   const [externalPendingQuantity, setExternalPendingQuantity] =
     useState<PendingQuantityConfirmation | null>(null);
+  const [isConfirmingScan, setIsConfirmingScan] = useState<boolean>(false);
 
   // Modals state
   const [isNewDeliveryOpen, setIsNewDeliveryOpen] = useState(false);
@@ -134,17 +135,19 @@ export function App() {
         />
       )}
 
-      {/* Top Bar & Fixed Bottom Navigation */}
-      <Navbar
-        activeTab={activeTab}
-        setActiveTab={handleSelectTab}
-        activeDelivery={activeDelivery}
-        onUpdateDelivery={handleUpdateDelivery}
-        onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
-        onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
-        onOpenTestSheet={() => setIsTestSheetOpen(true)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-      />
+      {/* Top Bar & Fixed Bottom Navigation (hidden when confirming scan) */}
+      {!isConfirmingScan && (
+        <Navbar
+          activeTab={activeTab}
+          setActiveTab={handleSelectTab}
+          activeDelivery={activeDelivery}
+          onUpdateDelivery={handleUpdateDelivery}
+          onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+          onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
+          onOpenTestSheet={() => setIsTestSheetOpen(true)}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+        />
+      )}
 
       {/* Main Content Area */}
       <main className="flex-1 min-h-0 flex flex-col">
@@ -187,6 +190,7 @@ export function App() {
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             externalPendingQuantity={externalPendingQuantity}
             onClearExternalPendingQuantity={() => setExternalPendingQuantity(null)}
+            onScanConfirmationChange={setIsConfirmingScan}
             onClose={() => setActiveTab('dashboard')}
           />
         )}

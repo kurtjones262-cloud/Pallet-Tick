@@ -5,6 +5,7 @@ import {
   ClipboardList,
   Settings,
   ChevronDown,
+  Search,
 } from 'lucide-react';
 import { Delivery } from '../types/delivery';
 
@@ -17,6 +18,7 @@ interface NavbarProps {
   onOpenDeliveriesList: () => void;
   onOpenTestSheet?: () => void;
   onOpenSettings: () => void;
+  onOpenSmartSearch?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -25,6 +27,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
+  onOpenSmartSearch,
 }) => {
   const total = activeDelivery?.parts.length || 0;
   const received = activeDelivery?.parts.filter((p) => p.status === 'received').length || 0;
@@ -87,6 +90,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <span>{total}</span>
                 <span className="text-slate-500 text-[10px] uppercase">rcvd</span>
               </div>
+            )}
+
+            {onOpenSmartSearch && (
+              <button
+                type="button"
+                onClick={onOpenSmartSearch}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-slate-300 hover:text-white bg-[#0E1626] hover:bg-[#152238] border border-[#1E2D44] hover:border-cyan-500/50 rounded-lg text-xs font-mono transition-colors cursor-pointer shadow-xs"
+                title="Smart Part Search (Ctrl+K)"
+                aria-label="Smart Part Search"
+              >
+                <Search className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="hidden sm:inline">Search</span>
+                <kbd className="hidden md:inline text-[9px] px-1 py-0.2 bg-black/40 border border-[#1E2D44] rounded text-slate-400 font-mono">
+                  ⌘K
+                </kbd>
+              </button>
             )}
 
             <button

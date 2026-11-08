@@ -13,6 +13,7 @@ import { Delivery, DeliveryPart } from '../types/delivery';
 import { setPartStatus, getPartVerificationState } from '../utils/storage';
 import { exportDeliveryPdf } from '../utils/pdfExport';
 import { playAudio, triggerHaptic } from '../utils/audioFeedback';
+import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
 
 interface ChecklistViewProps {
   delivery: Delivery | null;
@@ -64,26 +65,24 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
     return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }, [parts]);
 
-  // Filtered & searched parts
+  // Filtered & searched parts using Smart Substring & Keyword Search
   const filteredParts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-
-    return parts.filter((part) => {
+    // 1. Base filter by status & pallet selection
+    const baseParts = parts.filter((part) => {
       if (statusFilter === 'outstanding' && part.status !== 'outstanding') return false;
       if (statusFilter === 'received' && part.status !== 'received') return false;
       if (statusFilter === 'unexpected') return false;
-
       if (palletFilter !== 'all' && String(part.palletNumber) !== palletFilter) return false;
-
-      if (!q) return true;
-      return (
-        part.partNumber.toLowerCase().includes(q) ||
-        part.itemNumber.toLowerCase().includes(q) ||
-        part.description.toLowerCase().includes(q) ||
-        (part.material && part.material.toLowerCase().includes(q))
-      );
+      return true;
     });
-  }, [parts, statusFilter, palletFilter, searchQuery]);
+
+    if (!searchQuery.trim()) return baseParts;
+
+    return filterPartsSmart(baseParts, searchQuery, {
+      docketNumber: delivery?.docketNumber,
+      supplier: delivery?.supplier,
+    });
+  }, [parts, statusFilter, palletFilter, searchQuery, delivery?.docketNumber, delivery?.supplier]);
 
   const totalCount = parts.length;
   const receivedCount = parts.filter((p) => p.status === 'received').length;
@@ -169,7 +168,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search part #, item #, description..."
+              placeholder='Search by last 4 digits (e.g. 2048), part #, keyword...'
               className="w-full h-8 pl-8 pr-7 bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[4px] text-[#18181B] placeholder:text-zinc-400 text-xs outline-none transition-colors"
             />
             {searchQuery && (
@@ -291,11 +290,22 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
             </div>
           )
         ) : filteredParts.length === 0 ? (
-          <div className="px-4 py-12 text-center">
-            <p className="text-xs font-medium text-zinc-600">No matching parts</p>
-            <p className="text-[11px] text-zinc-400 mt-0.5">
-              {searchQuery ? `No results for "${searchQuery}"` : 'No items match the current filter.'}
+          <div className="px-4 py-12 text-center space-y-2">
+            <p className="text-xs font-semibold text-zinc-700">No matching parts found</p>
+            <p className="text-[11px] text-zinc-500 max-w-xs mx-auto">
+              {searchQuery
+                ? `No parts match "${searchQuery}". Try searching by the last 4 digits (e.g. 2048) or partial description.`
+                : 'No items match the current filter.'}
             </p>
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="text-xs font-mono text-[#059669] hover:underline font-semibold cursor-pointer pt-1"
+              >
+                Clear search filter
+              </button>
+            )}
           </div>
         ) : (
           <div className="bg-white border-b border-[#E4E3DE] divide-y divide-[#E4E3DE]">
@@ -360,7 +370,11 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                           isReceived ? 'text-zinc-700' : 'text-[#18181B]'
                         }`}
                       >
-                        {part.partNumber}
+                        <HighlightMatch
+                          text={part.partNumber}
+                          query={searchQuery}
+                          highlightClassName="bg-amber-200 text-amber-950 font-bold px-0.5 rounded"
+                        />
                       </span>
                       <span
                         className={`px-1.5 py-0.2 rounded-[2px] font-mono text-[10px] font-semibold ${
@@ -383,7 +397,13 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                     </div>
 
                     <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 truncate leading-snug mt-0.5">
-                      <span className="truncate">{part.description}</span>
+                      <span className="truncate">
+                        <HighlightMatch
+                          text={part.description}
+                          query={searchQuery}
+                          highlightClassName="bg-amber-200 text-amber-950 font-medium px-0.5 rounded"
+                        />
+                      </span>
                       {part.weight && (
                         <>
                           <span className="text-zinc-300 shrink-0">·</span>

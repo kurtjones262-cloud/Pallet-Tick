@@ -51,6 +51,7 @@ import {
   ConfirmedScanPayload,
 } from './ScanConfirmationModal';
 import { playAudio, triggerHaptic } from '../utils/audioFeedback';
+import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
 
 export type ScanInputSource = 'camera_barcode_qr' | 'external_hid' | 'photo_snap' | 'manual';
 
@@ -1226,6 +1227,24 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [handleScannedCode]);
 
   /**
+   * Smart search candidate suggestions for manual code entry (e.g. typing last 4 digits)
+   */
+  const manualCandidates = useMemo(() => {
+    const q = manualCodeInput.trim();
+    if (!q || !delivery?.parts) return [];
+    return filterPartsSmart(delivery.parts, q, {
+      docketNumber: delivery.docketNumber,
+      supplier: delivery.supplier,
+    }).slice(0, 5);
+  }, [delivery, manualCodeInput]);
+
+  const handleSelectCandidate = (partNumber: string) => {
+    setIsManualModalOpen(false);
+    setManualCodeInput('');
+    handleScannedCode(partNumber, 'manual');
+  };
+
+  /**
    * Handle manual code entry submit
    */
   const handleManualCodeSubmit = (e: React.FormEvent) => {
@@ -1786,16 +1805,46 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <form onSubmit={handleManualCodeSubmit} className="space-y-4">
               <div>
                 <label className="text-[11px] font-mono uppercase text-zinc-400 block mb-1.5 font-semibold">
-                  Enter Part # or Barcode String:
+                  Enter Part #, Last 4 Digits or Barcode:
                 </label>
                 <input
                   type="text"
                   autoFocus
                   value={manualCodeInput}
                   onChange={(e) => setManualCodeInput(e.target.value.toUpperCase())}
-                  placeholder="e.g. 10293 or PART-9002"
+                  placeholder="e.g. 2048, BRK, or PART-9002"
                   className="w-full h-11 px-3.5 rounded-xl bg-[#070A0F] border border-zinc-700 focus:border-cyan-400 text-white font-mono font-bold text-base outline-none uppercase shadow-inner"
                 />
+
+                {manualCandidates.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    <span className="text-[10px] font-mono uppercase text-cyan-400/80 block font-semibold">
+                      Matching parts in docket:
+                    </span>
+                    <div className="max-h-36 overflow-y-auto space-y-1 pr-1 divide-y divide-zinc-800/80">
+                      {manualCandidates.map((cand) => (
+                        <button
+                          key={cand.id}
+                          type="button"
+                          onClick={() => handleSelectCandidate(cand.partNumber)}
+                          className="w-full text-left p-2 rounded-lg bg-zinc-900/90 hover:bg-cyan-950/50 border border-zinc-800 hover:border-cyan-500/50 text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                        >
+                          <div className="min-w-0">
+                            <span className="font-mono font-bold text-white block truncate">
+                              <HighlightMatch text={cand.partNumber} query={manualCodeInput} />
+                            </span>
+                            <span className="text-[11px] text-zinc-400 truncate block">
+                              <HighlightMatch text={cand.description} query={manualCodeInput} />
+                            </span>
+                          </div>
+                          <span className="text-[10px] font-mono text-cyan-400 shrink-0 font-bold">
+                            Select ↵
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-2">

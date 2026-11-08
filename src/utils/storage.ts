@@ -9,7 +9,12 @@ import {
   SupplierRuleId,
   SupplierRuleDefinition,
 } from '../types/delivery';
-import { generate200PartDelivery, DEFAULT_APP_SETTINGS } from './sampleData';
+import {
+  generate200PartDelivery,
+  generate45PartDelivery,
+  generate15PartDelivery,
+  DEFAULT_APP_SETTINGS,
+} from './sampleData';
 import {
   saveDeliveryToIndexedDb,
   deleteDeliveryFromIndexedDb,
@@ -176,12 +181,20 @@ export function getStoredDeliveries(): Delivery[] {
   if (typeof window === 'undefined') return [];
   try {
     const raw = localStorage.getItem(DELIVERIES_KEY);
-    if (!raw) return [];
+    if (!raw) {
+      const initial = [generate200PartDelivery(), generate45PartDelivery(), generate15PartDelivery()];
+      saveStoredDeliveries(initial);
+      setActiveDeliveryId(initial[0].id);
+      return initial;
+    }
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
+    if (Array.isArray(parsed) && parsed.length > 0) {
       return parsed.map(normalizeDeliveryDocketNumbers);
     }
-    return [];
+    const initial = [generate200PartDelivery(), generate45PartDelivery(), generate15PartDelivery()];
+    saveStoredDeliveries(initial);
+    setActiveDeliveryId(initial[0].id);
+    return initial;
   } catch (e) {
     console.error('Failed to load deliveries from storage:', e);
     return [];

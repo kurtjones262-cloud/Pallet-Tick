@@ -48,9 +48,34 @@ export function generate200PartDelivery(): Delivery {
     const groupNum = Math.floor(i / 10) + 1;
     const palletIndex = Math.min(Math.floor((i / totalParts) * 6), 5);
     const pallet = pallets[palletIndex];
+    let partNumber = `${template.prefix}-${100 + groupNum * 5}`;
+    let itemNumber = `${i + 1}`;
+    let desc = `${template.desc} (Size ${120 + (i % 8) * 20}x${80 + (i % 5) * 25}mm)`;
+    let mat = template.mat;
+    let thk = template.thk;
 
-    const partNumber = `${template.prefix}-${100 + groupNum * 5}`;
-    const itemNumber = `${i + 1}`;
+    // First 4 parts match key business search test cases
+    if (i === 0) {
+      partNumber = 'LASER-BRK-2048';
+      desc = 'Stainless Mounting Bracket Right-Angle (Size 120x80mm)';
+      mat = '316 Stainless';
+      thk = '6.0mm';
+    } else if (i === 1) {
+      partNumber = 'SS-PLATE-10482';
+      desc = 'Stainless Steel Mounting Plate (Size 140x105mm)';
+      mat = '304 Stainless';
+      thk = '10.0mm';
+    } else if (i === 2) {
+      partNumber = 'PART-7782048';
+      desc = 'Heavy Duty Structural Mounting Bracket (Size 160x130mm)';
+      mat = '350 Grade Steel';
+      thk = '12.0mm';
+    } else if (i === 3) {
+      partNumber = 'BRACKET-52048';
+      desc = 'Stainless Mounting Bracket Plate (Size 180x155mm)';
+      mat = '316 Stainless';
+      thk = '8.0mm';
+    }
 
     // Mark the first 18 parts as already received to demonstrate live progress
     const isPreReceived = i < 18;
@@ -64,9 +89,9 @@ export function generate200PartDelivery(): Delivery {
       docketLineIndex: i + 1,
       partNumber,
       itemNumber,
-      description: `${template.desc} (Size ${120 + (i % 8) * 20}x${80 + (i % 5) * 25}mm)`,
-      material: template.mat,
-      thickness: template.thk,
+      description: desc,
+      material: mat,
+      thickness: thk,
       quantity: reqQty,
       receivedQuantity: isPreReceived ? reqQty : undefined,
       verificationStatus: isPreReceived ? 'verified' : 'unscanned',
@@ -205,6 +230,10 @@ export function generate45PartDelivery(): Delivery {
 export function generate15PartDelivery(): Delivery {
   const parts: DeliveryPart[] = [];
   const names = [
+    { p: 'LASER-BRK-2048', i: 'BAR-2048', d: 'Stainless Mounting Bracket Right-Angle', th: '6mm', q: 2 },
+    { p: 'SS-PLATE-10482', i: 'BAR-1048', d: 'Stainless Steel Mounting Plate', th: '10mm', q: 4 },
+    { p: 'PART-7782048', i: 'BAR-7782', d: 'Heavy Duty Structural Mounting Bracket', th: '12mm', q: 1 },
+    { p: 'BRACKET-52048', i: 'BAR-5204', d: 'Stainless Mounting Bracket Plate', th: '8mm', q: 6 },
     { p: 'FLG-150-PN16', i: 'BAR-3301', d: 'DN150 PN16 Table E Flange Blank', th: '16mm', q: 1 },
     { p: 'FLG-200-PN16', i: 'BAR-3302', d: 'DN200 PN16 Table E Flange Blank', th: '16mm', q: 4 },
     { p: 'FLG-250-PN16', i: 'BAR-3303', d: 'DN250 PN16 Table E Flange Blank', th: '20mm', q: 2 },

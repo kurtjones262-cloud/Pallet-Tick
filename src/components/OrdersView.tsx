@@ -19,6 +19,7 @@ import {
   RotateCcw,
   AlertTriangle,
   ArrowUpRight,
+  X,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { Delivery, DeliveryPart } from '../types/delivery';
@@ -30,6 +31,7 @@ import {
   getPartVerificationState,
 } from '../utils/storage';
 import { exportDeliveryPdf } from '../utils/pdfExport';
+import { matchPartWithQuery, HighlightMatch } from '../utils/partSearch';
 
 interface OrdersViewProps {
   activeDelivery: Delivery | null;
@@ -138,9 +140,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         const matchesOrder = (d.orderNumber || '').toLowerCase().includes(q);
         const matchesCarrier = (d.carrier || '').toLowerCase().includes(q);
         const matchesParts = (d.parts || []).some(
-          (p) =>
-            (p.partNumber || '').toLowerCase().includes(q) ||
-            (p.description || '').toLowerCase().includes(q)
+          (p) => matchPartWithQuery(p, q, { docketNumber: d.docketNumber, supplier: d.supplier, carrier: d.carrier }).isMatch
         );
         return matchesDocket || matchesSupplier || matchesOrder || matchesCarrier || matchesParts;
       }
@@ -257,9 +257,20 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by docket #, supplier, carrier, or part number..."
-              className="w-full h-11 pl-10 pr-4 rounded-xl bg-[#0E1626] border border-[#1E2D44] focus:border-cyan-500 focus:outline-none text-xs text-white placeholder-slate-500 font-sans shadow-sm transition-colors"
+              placeholder="Search by last 4 digits (e.g. 2048), part #, keyword, or docket #..."
+              className="w-full h-11 pl-10 pr-10 rounded-xl bg-[#0E1626] border border-[#1E2D44] focus:border-cyan-500 focus:outline-none text-xs text-white placeholder-slate-500 font-sans shadow-sm transition-colors"
             />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md bg-white/10 hover:bg-white/20 text-slate-300 flex items-center justify-center cursor-pointer text-xs"
+                title="Clear search"
+                aria-label="Clear search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
           {/* Category Filter Tabs: All, Incomplete, Started, Finished */}
@@ -606,7 +617,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                 <div className="min-w-0 space-y-0.5">
                                   <div className="flex items-center gap-2">
                                     <span className="font-mono font-bold text-xs text-white">
-                                      {part.partNumber}
+                                      <HighlightMatch text={part.partNumber} query={searchQuery} />
                                     </span>
                                     {part.palletNumber ? (
                                       <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#131E33] text-cyan-300 border border-cyan-500/30">
@@ -620,7 +631,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                     ) : null}
                                   </div>
                                   <p className="text-xs text-slate-400 truncate font-sans">
-                                    {part.description || 'Laser-cut item'}
+                                    <HighlightMatch text={part.description || 'Laser-cut item'} query={searchQuery} />
                                   </p>
                                 </div>
 

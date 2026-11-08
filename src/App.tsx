@@ -18,6 +18,7 @@ import {
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { SplashScreen } from './components/SplashScreen';
 import { OrdersView } from './components/OrdersView';
+import { SmartSearchModal } from './components/SmartSearchModal';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard' | 'orders'>('dashboard');
@@ -33,6 +34,7 @@ export function App() {
   const [isTestSheetOpen, setIsTestSheetOpen] = useState(false);
   const [isUnexpectedOpen, setIsUnexpectedOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSmartSearchOpen, setIsSmartSearchOpen] = useState(false);
 
   // Startup splash screen initialisation state
   const [isAppReady, setIsAppReady] = useState(false);
@@ -71,6 +73,18 @@ export function App() {
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
     };
   }, [initAppWorkspace, reloadDelivery]);
+
+  // Global Ctrl+K / Cmd+K to launch Smart Search
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsSmartSearchOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   const handleUpdateDelivery = (updated: Delivery) => {
     setActiveDelivery(updated);
@@ -146,6 +160,7 @@ export function App() {
           onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
           onOpenTestSheet={() => setIsTestSheetOpen(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          onOpenSmartSearch={() => setIsSmartSearchOpen(true)}
         />
       )}
 
@@ -166,6 +181,7 @@ export function App() {
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
             onOpenSettings={() => setIsSettingsOpen(true)}
+            onOpenSmartSearch={() => setIsSmartSearchOpen(true)}
           />
         )}
 
@@ -249,6 +265,20 @@ export function App() {
           onSettingsSaved={() => reloadDelivery()}
         />
       )}
+
+      <SmartSearchModal
+        isOpen={isSmartSearchOpen}
+        onClose={() => setIsSmartSearchOpen(false)}
+        activeDelivery={activeDelivery}
+        onSelectDelivery={handleUpdateDelivery}
+        onNavigateToChecklist={(pallet) => {
+          setChecklistPalletFilter(pallet || 'all');
+          setActiveTab('checklist');
+        }}
+        onStartScanning={() => {
+          setActiveTab('scanner');
+        }}
+      />
     </div>
   );
 }

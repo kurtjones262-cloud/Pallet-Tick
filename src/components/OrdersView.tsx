@@ -31,7 +31,13 @@ import {
   getPartVerificationState,
 } from '../utils/storage';
 import { exportDeliveryPdf } from '../utils/pdfExport';
-import { matchPartWithQuery, HighlightMatch } from '../utils/partSearch';
+import {
+  matchPartWithQuery,
+  filterPartsSmart,
+  searchAllDeliveriesParts,
+  HighlightMatch,
+  PartSearchResult,
+} from '../utils/partSearch';
 
 interface OrdersViewProps {
   activeDelivery: Delivery | null;
@@ -53,8 +59,23 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [deliveries, setDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
   const [categoryFilter, setCategoryFilter] = useState<OrderCategoryFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(() => activeDelivery?.id || null);
   const [partsFilter, setPartsFilter] = useState<'all' | 'outstanding' | 'received'>('all');
+
+  // Debounce search input for high performance live filtering
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(searchQuery.trim());
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Direct cross-docket part matches (matches last 4 digits, partial numbers, keywords anywhere)
+  const matchingParts = useMemo<PartSearchResult[]>(() => {
+    if (!debouncedQuery) return [];
+    return searchAllDeliveriesParts(deliveries, debouncedQuery);
+  }, [deliveries, debouncedQuery]);
 
   const refreshDeliveries = () => {
     setDeliveries(getStoredDeliveries());
@@ -124,30 +145,41 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   // Filtered orders list
   const filteredOrders = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = debouncedQuery.toLowerCase();
 
-    return categorizedOrders.filter((item) => {
-      // Category filter
-      if (categoryFilter !== 'all' && item.category !== categoryFilter) {
-        return false;
-      }
+    return categorizedOrders
+      .filter((item) => {
+        // Category filter
+        if (categoryFilter !== 'all' && item.category !== categoryFilter) {
+          return false;
+        }
 
-      // Search query filter
-      if (q) {
+        // Search query filter
+        if (q) {
+          const d = item.delivery;
+          const matchesDocket = (d.docketNumber || '').toLowerCase().includes(q);
+          const matchesSupplier = (d.supplier || '').toLowerCase().includes(q);
+          const matchesOrder = (d.orderNumber || '').toLowerCase().includes(q);
+          const matchesCarrier = (d.carrier || '').toLowerCase().includes(q);
+          const matchesParts = (d.parts || []).some(
+            (p) => matchPartWithQuery(p, q, { docketNumber: d.docketNumber, supplier: d.supplier, carrier: d.carrier }).isMatch
+          );
+          return matchesDocket || matchesSupplier || matchesOrder || matchesCarrier || matchesParts;
+        }
+
+        return true;
+      })
+      .map((item) => {
+        if (!debouncedQuery) {
+          return { ...item, matchingPartsCount: 0 };
+        }
         const d = item.delivery;
-        const matchesDocket = (d.docketNumber || '').toLowerCase().includes(q);
-        const matchesSupplier = (d.supplier || '').toLowerCase().includes(q);
-        const matchesOrder = (d.orderNumber || '').toLowerCase().includes(q);
-        const matchesCarrier = (d.carrier || '').toLowerCase().includes(q);
-        const matchesParts = (d.parts || []).some(
-          (p) => matchPartWithQuery(p, q, { docketNumber: d.docketNumber, supplier: d.supplier, carrier: d.carrier }).isMatch
-        );
-        return matchesDocket || matchesSupplier || matchesOrder || matchesCarrier || matchesParts;
-      }
-
-      return true;
-    });
-  }, [categorizedOrders, categoryFilter, searchQuery]);
+        const count = (d.parts || []).filter(
+          (p) => matchPartWithQuery(p, debouncedQuery, { docketNumber: d.docketNumber, supplier: d.supplier, carrier: d.carrier }).isMatch
+        ).length;
+        return { ...item, matchingPartsCount: count };
+      });
+  }, [categorizedOrders, categoryFilter, debouncedQuery]);
 
   // Handle deleting an order
   const handleDeleteOrder = (order: Delivery, e: React.MouseEvent) => {
@@ -254,6 +286,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           <div className="relative">
             <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
+              id="orders-smart-search-input"
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -330,11 +363,152 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         </div>
 
         {/* =========================================================================
-         * 3. ORDERS LIST
+         * 3. DIRECT MATCHING PARTS (From Smart Search: Last 4 digits, keywords, etc.)
+         * ========================================================================= */}
+        {debouncedQuery && matchingParts.length > 0 && (
+          <div className="space-y-2.5 p-4 rounded-2xl bg-[#090E17] border border-cyan-500/40 shadow-[0_0_25px_rgba(0,168,255,0.12)]">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Search className="w-4 h-4 text-cyan-400" />
+                <h2 className="text-sm font-bold text-white tracking-tight">
+                  Matching Parts
+                </h2>
+                <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-500/30">
+                  {matchingParts.length} {matchingParts.length === 1 ? 'part' : 'parts'}
+                </span>
+              </div>
+              <span className="text-[11px] font-mono text-slate-400">
+                Matched by last 4 digits, part #, or keywords
+              </span>
+            </div>
+
+            <div className="divide-y divide-[#1E2D44] border border-[#1E2D44] rounded-xl overflow-hidden bg-[#070A0F]">
+              {matchingParts.slice(0, 10).map((item) => {
+                const { part } = item;
+                const verState = getPartVerificationState(part);
+                const parentDelivery = deliveries.find((d) => d.id === item.deliveryId);
+
+                return (
+                  <div
+                    key={`${item.deliveryId}_${part.id}`}
+                    onClick={() => {
+                      if (parentDelivery) {
+                        handleSelectOrder(parentDelivery);
+                      }
+                    }}
+                    className="p-3 sm:p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors cursor-pointer"
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono font-bold text-sm text-white">
+                          <HighlightMatch text={part.partNumber} query={searchQuery} />
+                        </span>
+                        {item.docketNumber && (
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#131E33] text-cyan-300 border border-cyan-500/30">
+                            Docket #{item.docketNumber}
+                          </span>
+                        )}
+                        {item.supplier && (
+                          <span className="text-[10px] font-mono text-slate-400">
+                            {item.supplier}
+                          </span>
+                        )}
+                        {part.palletNumber && (
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-black/40 text-slate-400 border border-slate-700">
+                            Pallet {part.palletNumber}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="text-xs text-slate-300 font-sans leading-snug">
+                        <HighlightMatch text={part.description || 'Laser-cut item'} query={searchQuery} />
+                      </p>
+
+                      {(part.material || part.thickness) && (
+                        <div className="text-[11px] font-mono text-slate-400">
+                          {[part.thickness, part.material].filter(Boolean).join(' · ')}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-3 self-end sm:self-auto shrink-0">
+                      <div className="text-right font-mono">
+                        <div className="text-xs font-bold text-white tabular-nums">
+                          {verState.receivedQty} / {verState.requiredQty}
+                        </div>
+                        <div className="text-[10px] text-slate-500 uppercase">Qty</div>
+                      </div>
+
+                      <div>
+                        {verState.state === 'verified' ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/30">
+                            VERIFIED
+                          </span>
+                        ) : verState.state === 'quantity_mismatch' ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-400 border border-amber-500/30">
+                            MISMATCH
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                            OUTSTANDING
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (parentDelivery) {
+                              handleSelectOrder(parentDelivery);
+                            }
+                            onNavigateToChecklist(part.palletNumber ? String(part.palletNumber) : undefined);
+                          }}
+                          className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1E2E4A] border border-[#1E2D44] text-xs font-mono font-medium text-slate-300 hover:text-white inline-flex items-center gap-1 cursor-pointer transition-colors"
+                          title="Open part in Checklist"
+                        >
+                          <ListChecks className="w-3.5 h-3.5 text-cyan-400" />
+                          <span className="hidden sm:inline">Checklist</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (parentDelivery) {
+                              handleSelectOrder(parentDelivery);
+                            }
+                            onStartScanning();
+                          }}
+                          className="h-8 px-2.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs font-mono inline-flex items-center gap-1 cursor-pointer shadow-sm transition-colors"
+                          title="Scan this part"
+                        >
+                          <QrCode className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">Scan</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+         * 4. ORDERS LIST
          * ========================================================================= */}
         <div className="space-y-3.5">
+          {debouncedQuery && filteredOrders.length > 0 && (
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-xs font-mono font-bold uppercase tracking-wider text-slate-400">
+                Matching Orders ({filteredOrders.length})
+              </span>
+            </div>
+          )}
           {filteredOrders.length > 0 ? (
-            filteredOrders.map(({ delivery: d, total, received, remaining, percentage, category, isActive }) => {
+            filteredOrders.map(({ delivery: d, total, received, remaining, percentage, category, isActive, matchingPartsCount }) => {
               const isExpanded = expandedOrderId === d.id;
 
               return (
@@ -465,10 +639,20 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         <button
                           type="button"
                           onClick={(e) => toggleExpand(d.id, e)}
-                          className="h-8 px-2.5 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono text-slate-300 hover:text-white inline-flex items-center gap-1 cursor-pointer transition-colors"
+                          className={`h-8 px-2.5 rounded-lg border text-xs font-mono inline-flex items-center gap-1 cursor-pointer transition-colors ${
+                            matchingPartsCount > 0
+                              ? 'bg-cyan-950/80 hover:bg-cyan-900 border-cyan-500/50 text-cyan-300 font-bold'
+                              : 'bg-[#142036] hover:bg-[#1C2C4A] border-[#1E2D44] text-slate-300 hover:text-white'
+                          }`}
                           title={isExpanded ? 'Collapse parts' : 'View individual parts'}
                         >
-                          <span>{isExpanded ? 'Hide' : 'Parts'}</span>
+                          <span>
+                            {isExpanded
+                              ? 'Hide'
+                              : matchingPartsCount > 0
+                              ? `Parts (${matchingPartsCount} matched)`
+                              : 'Parts'}
+                          </span>
                           {isExpanded ? (
                             <ChevronUp className="w-3.5 h-3.5 text-cyan-400" />
                           ) : (
@@ -598,16 +782,34 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
                       {/* Parts Rows */}
                       <div className="divide-y divide-white/5 border border-[#1E2D44] rounded-xl overflow-hidden bg-[#070A0F]">
-                        {d.parts
-                          .filter((p) => {
+                        {(() => {
+                          let partsList = d.parts;
+                          if (debouncedQuery) {
+                            const smartList = filterPartsSmart(d.parts, debouncedQuery, {
+                              docketNumber: d.docketNumber,
+                              supplier: d.supplier,
+                            });
+                            if (smartList.length > 0) {
+                              partsList = smartList;
+                            }
+                          }
+
+                          const filteredList = partsList.filter((p) => {
                             if (partsFilter === 'outstanding') return p.status !== 'received';
                             if (partsFilter === 'received') return p.status === 'received';
                             return true;
-                          })
-                          .slice(0, 100)
-                          .map((part) => {
+                          });
+
+                          if (filteredList.length === 0) {
+                            return (
+                              <div className="p-4 text-center text-xs font-mono text-slate-500">
+                                No parts match the selected filter.
+                              </div>
+                            );
+                          }
+
+                          return filteredList.slice(0, 100).map((part) => {
                             const verState = getPartVerificationState(part);
-                            const isReceived = part.status === 'received';
 
                             return (
                               <div
@@ -661,7 +863,8 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                 </div>
                               </div>
                             );
-                          })}
+                          });
+                        })()}
                       </div>
                     </div>
                   )}
@@ -672,22 +875,35 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
             /* Empty State */
             <div className="py-16 px-6 rounded-2xl bg-[#0E1626] border border-dashed border-[#1E2D44] text-center flex flex-col items-center justify-center space-y-3">
               <ClipboardList className="w-10 h-10 text-slate-500" />
-              <h3 className="text-base font-bold text-white">No Orders Found</h3>
-              <p className="text-xs font-mono text-slate-400 max-w-sm leading-relaxed">
+              <h3 className="text-base font-bold text-white">
+                {searchQuery ? 'No Matching Parts or Orders' : 'No Orders Found'}
+              </h3>
+              <p className="text-xs font-mono text-slate-400 max-w-md leading-relaxed">
                 {searchQuery
-                  ? `No orders match your search "${searchQuery}". Try a different keyword or reset filters.`
+                  ? `No parts or orders match "${searchQuery}". You can search by the last 4 digits (e.g. 2048), partial part numbers (e.g. 048, BRK), descriptions (e.g. bracket, mount, stainless), or docket numbers.`
                   : categoryFilter !== 'all'
                   ? `No orders currently in the "${categoryFilter}" category.`
                   : 'No delivery orders or dockets logged in the system yet.'}
               </p>
-              <button
-                type="button"
-                onClick={onOpenNewDelivery}
-                className="mt-2 h-10 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs uppercase tracking-wider inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
-              >
-                <Plus className="w-4 h-4 stroke-[2.5]" />
-                <span>Upload New Docket</span>
-              </button>
+              {searchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="mt-2 h-9 px-4 rounded-xl bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-cyan-300 font-mono text-xs inline-flex items-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                  <span>Clear Search Query</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onOpenNewDelivery}
+                  className="mt-2 h-10 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs uppercase tracking-wider inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                >
+                  <Plus className="w-4 h-4 stroke-[2.5]" />
+                  <span>Upload New Docket</span>
+                </button>
+              )}
             </div>
           )}
         </div>

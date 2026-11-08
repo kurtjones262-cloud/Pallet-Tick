@@ -25,7 +25,6 @@ import {
   AlertTriangle,
   FolderOpen,
   ClipboardList,
-  Search,
 } from 'lucide-react';
 import { Delivery, DeliveryPart, ScanEvent, SupplierRuleId } from '../types/delivery';
 import { exportDeliveryPdf } from '../utils/pdfExport';
@@ -48,7 +47,6 @@ interface DeliveryDashboardProps {
   onOpenNewDelivery?: () => void;
   onOpenDeliveriesList?: () => void;
   onOpenSettings?: () => void;
-  onOpenSmartSearch?: () => void;
 }
 
 export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
@@ -61,7 +59,6 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   onStartScanning,
   onOpenNewDelivery,
   onOpenDeliveriesList,
-  onOpenSmartSearch,
 }) => {
   const [allDeliveries, setAllDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
   const [isOnline, setIsOnline] = useState<boolean>(() =>
@@ -438,18 +435,6 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
                 <span>SCAN NOW</span>
                 <ArrowUpRight className="w-4 h-4" />
               </button>
-
-              {onOpenSmartSearch && (
-                <button
-                  type="button"
-                  onClick={onOpenSmartSearch}
-                  className="h-12 px-4 rounded-xl bg-[#131E33]/90 hover:bg-[#1A2845] border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 font-semibold text-xs tracking-wide inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                  title="Search parts by last 4 digits (e.g. 2048) or keyword"
-                >
-                  <Search className="w-4 h-4 text-cyan-400" />
-                  <span>Search Part</span>
-                </button>
-              )}
 
               {onOpenNewDelivery && (
                 <button

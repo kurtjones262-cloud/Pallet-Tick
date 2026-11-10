@@ -213,14 +213,20 @@ export function computeExponentialBackoffWithJitter(
   return Math.min(20000, exponentialDelay + jitter);
 }
 
+// In-memory cooldown map for models that hit daily quota exhaustion or 404 (avoids 15s retry loops on subsequent batches)
+const modelQuotaCooldownUntil = new Map<string, number>();
+const MODEL_COOLDOWN_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
 /**
- * Extracts HTTP status code and classifies whether an error is a retryable availability/rate-limit/5xx error.
+ * Extracts HTTP status code and classifies whether an error is a retryable availability/rate-limit/5xx error
+ * or a per-day/model quota exhaustion that should immediately fail over to the secondary model.
  */
 export function classifyGeminiError(err: any): {
   statusCode: number;
   isRetryableAvailabilityError: boolean;
   isRateLimit: boolean;
   isHighDemand503: boolean;
+  isModelDailyQuotaExhausted: boolean;
   cleanMessage: string;
 } {
   const rawMessage = String(err?.message || err || 'Unknown Gemini API error').replace(
@@ -231,7 +237,7 @@ export function classifyGeminiError(err: any): {
   let statusCode = Number(err?.status || err?.statusCode || err?.httpStatus || 0);
   if (!statusCode) {
     const codeMatch =
-      rawMessage.match(/\b(429|500|502|503|504)\b/) ||
+      rawMessage.match(/\b(400|401|403|404|429|500|502|503|504)\b/) ||
       rawMessage.match(/"code"\s*:\s*(\d{3})/);
     if (codeMatch) {
       statusCode = parseInt(codeMatch[1], 10);
@@ -247,6 +253,13 @@ export function classifyGeminiError(err: any): {
   const isRateLimit =
     statusCode === 429 ||
     /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
+
+  // Detect per-day / free-tier model quota exhaustion (where retrying the same model 2s later cannot succeed for hours)
+  const isModelDailyQuotaExhausted =
+    isRateLimit &&
+    /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
+      rawMessage
+    );
 
   const isTemporary5xx =
     statusCode === 500 ||
@@ -267,6 +280,7 @@ export function classifyGeminiError(err: any): {
     isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
     isRateLimit,
     isHighDemand503,
+    isModelDailyQuotaExhausted,
     cleanMessage: rawMessage.slice(0, 260),
   };
 }
@@ -420,7 +434,17 @@ export async function generateWithRetryAndFallback(
   retryAttempts: number;
 }> {
   const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
-  const candidateModels = [primaryModel, ...fallbackModels];
+  const allConfiguredModels = [primaryModel, ...fallbackModels];
+  const nowMs = Date.now();
+  const useCooldownMemory = baseDelayMs >= 500;
+
+  // Place models not in daily-quota cooldown first so subsequent batches don't re-hit an exhausted model
+  const candidateModels = useCooldownMemory
+    ? [
+        ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) <= nowMs),
+        ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) > nowMs),
+      ]
+    : allConfiguredModels;
 
   let totalRetryAttempts = 0;
   let lastError: any = null;
@@ -428,7 +452,7 @@ export async function generateWithRetryAndFallback(
 
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const currentModel = candidateModels[mIdx];
-    const isFallbackModel = mIdx > 0;
+    const isFallbackModel = currentModel !== primaryModel;
     // Maximum of 3 automatic retries per model (initial attempt + up to 3 automatic retries)
     const maxRetriesForModel = MAX_AUTOMATIC_RETRIES;
 
@@ -519,12 +543,20 @@ export async function generateWithRetryAndFallback(
           throw permErr;
         }
 
-        // Model not found (404): do not retry the same 404 model; immediately advance to the next fallback model.
+        // Model not found (404) or daily/free-tier quota exhausted for this specific model:
+        // do not waste 15s retrying a model whose daily quota is 0; immediately advance to the next fallback model.
         if (
-          !classification.isRetryableAvailabilityError &&
-          !isValidationFailure &&
-          classification.statusCode === 404
+          (classification.statusCode === 404 && !classification.isRetryableAvailabilityError && !isValidationFailure) ||
+          (classification.isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1)
         ) {
+          if (useCooldownMemory) {
+            modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_COOLDOWN_DURATION_MS);
+          }
+          logOcrEvent('info', 'model_daily_quota_or_404_fast_failover', {
+            exhaustedModel: currentModel,
+            nextModel: candidateModels[mIdx + 1],
+            statusCode: classification.statusCode,
+          });
           break;
         }
 

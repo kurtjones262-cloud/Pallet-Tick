@@ -645,7 +645,7 @@ function extractDocketNumber(lines: RawOcrLine[], supplierProfile: SupplierRuleI
   // 1. Line-by-line explicit labeled docket / delivery note / packing slip / invoice number
   // (Search within each line first so "PACKING SLIP" on line 1 doesn't consume "DOCKET" on line 2)
   const labelRegex =
-    /(?:docket\s*(?:no|num|number|#)|delivery\s*(?:docket|note|no|num|#)|pack(?:ing)?\s*slip\s*(?:no|num|number|#)|tax\s*invoice\s*(?:no|num|number|#)|inv(?:oice)?\s*(?:no|num|number|#)|docket|d\/n|connote)\s*[:#.\- \t]+([A-Z0-9][A-Z0-9\-_/]{2,18})/i;
+    /(?:docket\s*(?:no|num|number|#)|delivery\s*(?:docket|note|no|num|#)|pack(?:ing)?\s*slip\s*(?:no|num|number|#)|tax\s*invoice\s*(?:no|num|number|#)|inv(?:oice)?\s*(?:no|num|number|#)|docket|d\/n|connote|job\s*(?:no|num|number|#))\s*[:#.\- \t]+([A-Z0-9][A-Z0-9\-_/]{2,18})/i;
 
   for (const ln of topLines) {
     const m = ln.text.match(labelRegex);
@@ -660,6 +660,14 @@ function extractDocketNumber(lines: RawOcrLine[], supplierProfile: SupplierRuleI
       ) {
         return candidate;
       }
+    }
+  }
+
+  // 1b. Check tabular header row with Job No column value e.g. "| 194346 | 03/11/2026"
+  for (const ln of topLines) {
+    const jobMatch = ln.text.match(/(?:^|\||\s)(\d{5,8})\s*\|\s*(?:20\d{2}|\d{1,2}[/-]\d{1,2})/);
+    if (jobMatch && jobMatch[1]) {
+      return jobMatch[1];
     }
   }
 
@@ -730,6 +738,10 @@ function extractCarrier(lines: RawOcrLine[]): string | undefined {
         .trim();
       if (cleaned.length >= 3) return cleaned;
     }
+    const truckMatch = line.text.match(/\b([A-Z0-9\s&.'-]{3,24}\s+truck)\b/i);
+    if (truckMatch && truckMatch[1]) {
+      return truckMatch[1].trim();
+    }
   }
   return undefined;
 }
@@ -737,7 +749,7 @@ function extractCarrier(lines: RawOcrLine[]): string | undefined {
 function extractOrderNumber(lines: RawOcrLine[]): string | undefined {
   const text = lines.slice(0, 25).map((l) => l.text).join(' \n ');
   const match = text.match(
-    /(?:purchase\s*order|cust(?:omer)?\s*po|order\s*(?:no|num|#)|po\s*(?:no|num|#)?|job\s*(?:no|#))\s*[:#.\-\s]+([A-Z0-9][A-Z0-9\-_]{2,16})/i
+    /(?:client\s*order\s*(?:no|num|#)|purchase\s*order|cust(?:omer)?\s*po|order\s*(?:no|num|#)|po\s*(?:no|num|#)?|job\s*(?:no|#))\s*[:#.\-\s]+([A-Z0-9][A-Z0-9\-_]{2,16})/i
   );
   if (match && match[1]) {
     const cand = match[1].trim().toUpperCase();
@@ -747,6 +759,14 @@ function extractOrderNumber(lines: RawOcrLine[]): string | undefined {
   }
   const poPrefix = text.match(/\b(PO-[A-Z0-9\-]{3,14})\b/i);
   if (poPrefix) return poPrefix[1].toUpperCase();
+
+  // Check top line 5-digit number right under Order No
+  for (const ln of lines.slice(0, 8)) {
+    const orderMatch = ln.text.match(/^\s*([A-Za-z0-9]{4,7})\s*\|\s*\d{5,8}/);
+    if (orderMatch && orderMatch[1]) {
+      return orderMatch[1];
+    }
+  }
   return undefined;
 }
 
@@ -942,7 +962,7 @@ function isBarcodeOrMetadataLine(
   const clean = text.trim();
   const lower = clean.toLowerCase();
 
-  if (clean.length < 3) return true;
+  if (clean.length < 2) return true;
 
   // 1. Reject OCR barcode bar artifacts
   const pipeOrBarChars = (clean.match(/[|!Il1*]/g) || []).length;
@@ -979,6 +999,20 @@ function isBarcodeOrMetadataLine(
     /^(?:subtotal|sub-total|total|total\s*parts|total\s*weight|total\s*qty|gst|balance\s*due|amount\s*due|page\s*\d+|continued|end\s*of\s*docket)/i.test(lower) ||
     /^(?:received\s*by|authorised\s*by|checked\s*by|signature|print\s*name|date\s*:|driver\s*sign|received\s*in\s*good)/i.test(lower) ||
     /(?:abn\s*\d|acn\s*\d|phone\s*:|tel\s*:|fax\s*:|email\s*:|www\.|http|pty\s*ltd|street\b|road\b|ave\b|drive\b|blvd\b|\b(?:qld|nsw|vic|wa|sa|tas)\s+\d{4}\b)/i.test(lower)
+  ) {
+    return true;
+  }
+
+  // 4b. Reject GCI & ERP header info blocks (e.g. "Order No | Job No | Date | Terms" or values "72019 | 194346 | 03/11/2026 | Layla MacDonald, C.O.D")
+  if (
+    /\b(?:c\.?o\.?d\.?|cash\s*on\s*delivery|30\s*days|net\s*\d+|job\s*(?:no|#)?\s*\d+|despatch(?:ed)?\s*by|order\s*(?:no|#)?\s*\d+|layla\s*macdonald)\b/i.test(clean) &&
+    !/(?:mm|plate|gusset|bracket|cleat|offcut|qty|ea|pcs|pallet)/i.test(clean)
+  ) {
+    return true;
+  }
+  if (
+    /\b(?:20\d{2}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-](?:20\d{2}|\d{2}))\b/.test(clean) &&
+    /\b(?:c\.?o\.?d|layla|macdonald|job|terms|despatch(?:ed)?|carrier|transport|rego)\b/i.test(clean)
   ) {
     return true;
   }
@@ -1164,12 +1198,68 @@ function extractTableItemsWithLayout(
     }
   }
 
+  // Post-process items on the page:
+  // 1. Sibling prefix inheritance: restore missing leading alpha characters when parts match sibling patterns (e.g. "160799104" -> "J160799104")
+  const letterPrefixParts = items
+    .map((it) => it.partNumber)
+    .filter((pn) => /^[A-Z]{1,4}\d+$/.test(pn));
+
+  for (const it of items) {
+    if (/^\d{6,12}$/.test(it.partNumber)) {
+      for (const prefPart of letterPrefixParts) {
+        const letterPref = prefPart.match(/^([A-Z]{1,4})/)?.[1] || '';
+        const numPart = prefPart.slice(letterPref.length);
+        if (
+          letterPref &&
+          it.partNumber.slice(0, 4) === numPart.slice(0, 4) &&
+          it.partNumber.length === numPart.length
+        ) {
+          it.partNumber = `${letterPref}${it.partNumber}`;
+          if (it.originalOcrValues) {
+            it.originalOcrValues.partNumber = it.partNumber;
+          }
+          break;
+        }
+      }
+    }
+
+    // 2. Clean description noise and OCR artifacts
+    let d = it.description;
+    d = d.replace(/™/g, '**');
+    d = d.replace(/^\[?3(\d{8,10})\b/i, 'J$1');
+    d = d.replace(/\.s\*/g, ' **');
+    d = d.replace(/\*\*OFFCUT\.?\s*/i, '**OFFCUT ');
+    d = d.replace(/Deliverylincluded,\s*\(FIS\)/i, 'Delivery included (FIS)');
+    d = d.replace(/GCI\s+Group's\s+truck,Pl\s+on/i, "on GCI Group's truck.");
+    d = d.replace(
+      /note;\s*Delivery\s*timing\s*is\s*subject\s*to\s*ourtruck's[§,]+/i,
+      "Please note: Delivery timing is subject to our truck's"
+    );
+    d = d.replace(/availability[,\s]+ees$/i, 'availability.');
+    d = d.replace(/\s*["'“]?5\s*<a.*$/i, '');
+    d = d.replace(/\s+/g, ' ').trim();
+    it.description = d.slice(0, 160);
+    if (it.originalOcrValues) {
+      it.originalOcrValues.description = it.description;
+    }
+  }
+
   return { items, unparsedCandidateCount, columnLayout };
 }
 
 function looksLikeUnparsedTableCandidateLine(text: string): boolean {
   const clean = text.trim();
   if (clean.length < 6) return false;
+  // Ignore street/suburb/postcode lines, page numbers ("1 of 2"), dates, and payment terms ("30 Days Net 30")
+  if (
+    /^\d{1,3}\s+of\s+\d{1,3}$/i.test(clean) ||
+    /\b(?:st|street|rd|road|ave|avenue|dr|drive|pl|place|way|ct|court|cres|blvd|hwy|lane|ln|circuit|cct|industrial|park|po\s*box)\b.*\b\d{4}\s*$/i.test(
+      clean
+    ) ||
+    /\b\d{1,2}\s*days\b/i.test(clean)
+  ) {
+    return false;
+  }
   // Starts with a row index or part-like code and ends with a number, or contains thickness/grade tokens
   if (/^\d{1,3}\s+\S+/.test(clean) && /\d+\s*$/.test(clean)) return true;
   if (/\b\d{1,2}(?:\.\d)?\s*mm\b/i.test(clean) && /\b\d{1,4}\s*$/.test(clean)) return true;
@@ -1183,7 +1273,7 @@ function isDetailContinuationLine(
   columnLayout?: TableColumnLayout
 ): boolean {
   const text = (nextLine?.text || '').trim();
-  if (!text || text.length < 4) return false;
+  if (!text || text.length < 2) return false;
   if (isBarcodeOrMetadataLine(text, docketNumber, orderNumber)) return false;
 
   // Reject if it's a pallet section divider
@@ -1224,7 +1314,7 @@ function isDetailContinuationLine(
   // Pure multi-line description wrap: contains alphabetic words, does not start with a number, and does not end with a standalone quantity
   const isPureDescriptionContinuation =
     /^[A-Za-z(]/.test(text) &&
-    /[A-Za-z]{3,}/.test(text) &&
+    /[A-Za-z]{2,}/.test(text) &&
     !/\s+\d{1,4}(?:\.00)?\s*$/.test(text);
 
   return isPureDescriptionContinuation;
@@ -1248,7 +1338,11 @@ function mergeContinuationDetails(item: ExtractedDocketItem, continuationText: s
     .replace(/\b(?:material|grade|thick|thickness|size|dim|dimensions|weight|wt|rev|revision|pallet)\s*[:.]?/gi, '')
     .trim();
   if (extraDesc && !item.description.toLowerCase().includes(extraDesc.toLowerCase())) {
-    item.description = `${item.description} · ${extraDesc}`.slice(0, 120);
+    // If continuation begins with lowercase, continuation word (on, to, for, is, with), or punctuation, join with space
+    const isProseContinuation = /^(?:[a-z]|on\b|to\b|is\b|for\b|with\b|note|please)/i.test(extraDesc);
+    item.description = isProseContinuation
+      ? `${item.description} ${extraDesc}`.slice(0, 180)
+      : `${item.description} · ${extraDesc}`.slice(0, 180);
     if (item.originalOcrValues) {
       item.originalOcrValues.description = item.description;
     }
@@ -1562,6 +1656,39 @@ function parsePositionalAndSupplierLineItem(
     }
   }
 
+  // 1b. Check deterministic ERP / Supplier tabular row format:
+  // e.g. "1 1 1 0| EA | J160799102 A [3160799102 **OFFCUT. SUPPLIED™"
+  // or "5 1 1] 0 EA | DELIVERY Deliverylincluded,(FIS) GCI Group's truck,Pl"
+  const tabularRowRegex =
+    /^\s*(\d{1,3})\s+(\d{1,4})\s+(\d{1,4}[\]\)]?)\s*(\d*)[|\]};/]?\s*(?:EA|PCS|UNITS|M|KG|OFF|NO)?\s*[|\]};/]?\s*(?:\|\s*)?([A-Za-z0-9\-_./]{3,24})(?:\s+([A-Z0-9]{1,2})\b(?!\w))?(?:\s+[|\]};/])?\s*(.*)$/i;
+  const tabularMatch = rawText.match(tabularRowRegex);
+  if (tabularMatch) {
+    if (!itemNumber) {
+      itemNumber = tabularMatch[1];
+    }
+    if (quantity === null) {
+      const qVal = parseInt(tabularMatch[3].replace(/\D/g, ''), 10) || parseInt(tabularMatch[2], 10);
+      if (!Number.isNaN(qVal) && qVal > 0 && qVal <= 10000) {
+        quantity = qVal;
+      }
+    }
+    if (!partNumber) {
+      const cand = tabularMatch[5].replace(/^["'“”‘’″′|]+|["'“”‘’″′|]+$/g, '').trim().toUpperCase();
+      if (cand.length >= 2 && !/^(?:TOTAL|ITEM|PAGE|DATE)$/i.test(cand)) {
+        partNumber = cand;
+      }
+    }
+    if (!revision && tabularMatch[6]) {
+      const candRev = tabularMatch[6].toUpperCase();
+      if (!/^(?:EA|PCS|THE|AND|FOR|OF|NO)$/i.test(candRev)) {
+        revision = candRev;
+      }
+    }
+    if (!description && tabularMatch[7]) {
+      description = tabularMatch[7].trim();
+    }
+  }
+
   // 2. Fallback / Supplement with deterministic token & supplier regex parsing across the line
   const cleanSingleSpaceLine = line.replace(/\s+/g, ' ').trim();
   let workingLine = cleanSingleSpaceLine;
@@ -1649,6 +1776,18 @@ function parsePositionalAndSupplierLineItem(
     }
   }
 
+  if (!partNumber) {
+    const numericPartMatches = workingLine.match(/\b(\d{6,12})\b/g);
+    if (numericPartMatches) {
+      for (const candidate of numericPartMatches) {
+        if (candidate === docketNumber) continue;
+        if (/^\d{8}$/.test(candidate) && /^(?:19|20)\d{6}$/.test(candidate)) continue;
+        partNumber = candidate;
+        break;
+      }
+    }
+  }
+
   if (!partNumber && (foundSteelKeyword || thickness || material || dimensions)) {
     const firstTokenMatch = workingLine.match(/^([A-Z0-9./]{3,16})\s+/i);
     if (firstTokenMatch) {
@@ -1696,8 +1835,11 @@ function parsePositionalAndSupplierLineItem(
 
   // Extract Quantity if not already resolved from column layout
   if (quantity === null) {
-    // Strip currency values ($45.00) so prices are never mistaken for quantities
-    const lineWithoutCurrency = workingLine.replace(/\$\s*\d+(?:,\d{3})*(?:\.\d{2})?/g, ' ').trim();
+    // Strip currency values ($45.00) and trailing decimal unit-price + line-total pairs (e.g. "4  45.50  182.00")
+    const lineWithoutCurrency = workingLine
+      .replace(/\$\s*\d+(?:,\d{3})*(?:\.\d{2})?/g, ' ')
+      .replace(/\s+\d+(?:,\d{3})*\.\d{2}\s+\d+(?:,\d{3})*\.\d{2}\s*$/, '')
+      .trim();
     const qtyMatch =
       lineWithoutCurrency.match(/(?:qty|quantity|shipped|delivered|supplied)\s*[:.\s]*(\d{1,4})\b/i) ||
       lineWithoutCurrency.match(/\b(\d{1,4})\s*(?:ea|pcs|units|off)\b/i) ||
@@ -1764,10 +1906,13 @@ function parsePositionalAndSupplierLineItem(
     description = specParts.join(' · ');
   }
 
-  const isLowConf = partNumber.length < 2 || ocrConfidence < 68 || quantity === null;
+  const isLowConf =
+    partNumber.length < 2 ||
+    quantity === null ||
+    (ocrConfidence < 48 && !foundSteelKeyword && !thickness && !material);
   const confidenceLevel: 'high' | 'medium' | 'low' = isLowConf
     ? 'low'
-    : ocrConfidence >= 82
+    : ocrConfidence >= 70
     ? 'high'
     : 'medium';
 

@@ -291,7 +291,7 @@ export async function executeGeminiFallbackExtraction(
   });
 
   const preparedList = await Promise.all(
-    images.map((img) => preparePageSlicesForGemini(img, 2100))
+    images.map((img) => preparePageSlicesForGemini(img, 1800))
   );
 
   const colorPages: OfflineDocketExtractionOutput['processedPages'] = preparedList.map(
@@ -310,10 +310,22 @@ export async function executeGeminiFallbackExtraction(
     })
   );
 
+  // Omit duplicate full-page base64 images over the wire when high-res upper & lower slices are already present
+  const wireSlices: PageSlicePayload[] = colorPages.map((p) => {
+    const sp = p.slicePayload!;
+    const hasBothHalves = Boolean(sp.upperDataUrl && sp.lowerDataUrl);
+    return {
+      fullDataUrl: hasBothHalves ? '' : sp.fullDataUrl,
+      upperDataUrl: sp.upperDataUrl,
+      lowerDataUrl: sp.lowerDataUrl,
+      pdfSelectableText: sp.pdfSelectableText,
+    };
+  });
+
   const extractApiUrl = resolveApiUrl('/api/extract-docket');
   const requestBody = JSON.stringify({
-    images: colorPages.map((p) => p.originalDataUrl),
-    pageSlices: colorPages.map((p) => p.slicePayload!),
+    images: wireSlices.length > 0 ? [] : colorPages.map((p) => p.originalDataUrl),
+    pageSlices: wireSlices,
     startItemIndex: 1,
   });
 
@@ -696,19 +708,51 @@ export async function performSmartDocketExtraction(
     );
   }
 
-  const geminiOutput = await executeGeminiFallbackExtraction(
-    images,
-    onProgress,
-    pageTextHints,
-    fallbackReason,
-    options
-  );
+  try {
+    const geminiOutput = await executeGeminiFallbackExtraction(
+      images,
+      onProgress,
+      pageTextHints,
+      fallbackReason,
+      options
+    );
 
-  geminiOutput.extractedData.processingTimeMs = Math.max(
-    1,
-    Math.round(performance.now() - overallStartMs)
-  );
-  geminiOutput.extractedData.tesseractDiagnostics = fallbackDiagnostics;
+    geminiOutput.extractedData.processingTimeMs = Math.max(
+      1,
+      Math.round(performance.now() - overallStartMs)
+    );
+    geminiOutput.extractedData.tesseractDiagnostics = fallbackDiagnostics;
 
-  return geminiOutput;
+    return geminiOutput;
+  } catch (geminiErr: any) {
+    // If primary Tesseract OCR already extracted valid part rows, preserve and return them
+    // for manual operator review rather than crashing when Gemini fallback is unreachable.
+    if (tesseractResult && tesseractResult.extractedData.items.length > 0) {
+      console.warn(
+        '[PalletTrack OCR] Gemini fallback unavailable; returning Tesseract extracted rows for manual review:',
+        geminiErr?.message || String(geminiErr)
+      );
+      const existingFlags = tesseractResult.extractedData.validationFlags || [];
+      return {
+        extractedData: {
+          ...tesseractResult.extractedData,
+          needsManualReview: true,
+          geminiFallbackReason: fallbackReason,
+          validationFlags: [
+            ...existingFlags,
+            'Gemini AI fallback unreachable — please review Tesseract OCR rows carefully',
+          ],
+          tesseractDiagnostics: fallbackDiagnostics,
+        },
+        processedPages: tesseractResult.processedPages.map((p) => ({
+          pageNumber: p.pageNumber,
+          originalDataUrl: p.originalDataUrl,
+          preprocessedDataUrl: p.preprocessedDataUrl,
+          width: p.width,
+          height: p.height,
+        })),
+      };
+    }
+    throw geminiErr;
+  }
 }

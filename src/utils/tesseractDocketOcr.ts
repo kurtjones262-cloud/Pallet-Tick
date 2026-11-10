@@ -627,12 +627,47 @@ export async function recognizeDocketPageWithTesseract(
     const base64 = Buffer.from(imageSource).toString('base64');
     originalDataUrl = `data:image/png;base64,${base64}`;
     preprocessedDataUrl = originalDataUrl;
-    recordStage?.(
-      `page_${pageNumber}_image_preprocess`,
-      'ok',
-      `Page ${pageNumber} binary buffer staged (${imageSource.byteLength} bytes)`,
-      Math.round(performance.now() - prepStartMs)
-    );
+
+    if (!isBrowser && isRealImage) {
+      try {
+        const sharpMod = await import('sharp');
+        const sharp = (sharpMod.default || sharpMod) as any;
+        const buf = Buffer.isBuffer(imageSource) ? imageSource : Buffer.from(imageSource);
+        const { data, info } = await sharp(buf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
+        const { preprocessRgbaImageBufferInPlace } = await import('./imagePreprocessing');
+        const diag = preprocessRgbaImageBufferInPlace(clamped, info.width, info.height);
+        const preprocessedBuf = await sharp(Buffer.from(clamped), {
+          raw: { width: info.width, height: info.height, channels: 4 },
+        })
+          .jpeg({ quality: 92 })
+          .toBuffer();
+        preprocessedDataUrl = `data:image/jpeg;base64,${preprocessedBuf.toString('base64')}`;
+        width = info.width;
+        height = info.height;
+        hashInput = preprocessedDataUrl;
+        recordStage?.(
+          `page_${pageNumber}_image_preprocess`,
+          'ok',
+          `Page ${pageNumber} buffer preprocessed via sharp (${width}x${height}, pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter})`,
+          Math.round(performance.now() - prepStartMs)
+        );
+      } catch {
+        recordStage?.(
+          `page_${pageNumber}_image_preprocess`,
+          'ok',
+          `Page ${pageNumber} binary buffer staged (${imageSource.byteLength} bytes)`,
+          Math.round(performance.now() - prepStartMs)
+        );
+      }
+    } else {
+      recordStage?.(
+        `page_${pageNumber}_image_preprocess`,
+        'ok',
+        `Page ${pageNumber} binary buffer staged (${imageSource.byteLength} bytes)`,
+        Math.round(performance.now() - prepStartMs)
+      );
+    }
   }
 
   const preprocessDurationMs = Math.max(0, Math.round(performance.now() - prepStartMs));
@@ -695,8 +730,7 @@ export async function recognizeDocketPageWithTesseract(
     const recStartMs = performance.now();
 
     try {
-      const targetForTesseract =
-        typeof imageSource === 'string' || isBrowser ? preprocessedDataUrl : imageSource;
+      const targetForTesseract = preprocessedDataUrl || imageSource;
       recognizeCalled = true;
       try {
         recognitionOutput = await worker.recognize(

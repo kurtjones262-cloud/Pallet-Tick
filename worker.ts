@@ -223,6 +223,11 @@ async function callGeminiRestWithRetryAndFallback(
         lastError = err;
         const status = Number(err?.status || 500);
         const msg = String(err?.message || '');
+        const isModelDailyQuotaExhausted =
+          status === 429 &&
+          /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
+            msg
+          );
         const isRetryable =
           status === 503 ||
           status === 429 ||
@@ -242,7 +247,10 @@ async function callGeminiRestWithRetryAndFallback(
         if (!isRetryable && (status === 400 || status === 401 || status === 403)) {
           throw err;
         }
-        if (!isRetryable && status === 404) {
+        if (
+          (!isRetryable && status === 404) ||
+          (isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1)
+        ) {
           break;
         }
 

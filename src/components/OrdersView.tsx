@@ -20,6 +20,8 @@ import {
   AlertTriangle,
   ArrowUpRight,
   X,
+  Edit3,
+  FileSpreadsheet,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { Delivery, DeliveryPart } from '../types/delivery';
@@ -38,6 +40,7 @@ import {
   HighlightMatch,
   PartSearchResult,
 } from '../utils/partSearch';
+import { PartsListEditorModal, PartsEditorMode } from './PartsListEditorModal';
 
 interface OrdersViewProps {
   activeDelivery: Delivery | null;
@@ -62,6 +65,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(() => activeDelivery?.id || null);
   const [partsFilter, setPartsFilter] = useState<'all' | 'outstanding' | 'received'>('all');
+  const [editorState, setEditorState] = useState<{
+    delivery: Delivery;
+    mode: PartsEditorMode;
+  } | null>(null);
 
   // Debounce search input for high performance live filtering
   useEffect(() => {
@@ -694,9 +701,13 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     <div className="border-t border-[#1E2D44] bg-[#0A101C] p-4 sm:p-5 space-y-4">
                       {/* Action Bar for this Order */}
                       <div className="flex flex-wrap items-center justify-between gap-2.5 pb-3 border-b border-white/5">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-mono font-bold uppercase tracking-wider text-slate-400">
-                            Individual Parts ({(d.parts || []).length})
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-xs font-mono font-bold uppercase tracking-wider text-slate-300">
+                            {(d.parts || []).length} Part Rows
+                          </span>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-xs font-mono font-bold text-emerald-400">
+                            {(d.parts || []).reduce((sum, p) => sum + Math.max(1, p.quantity ?? 1), 0)} Total Qty
                           </span>
                           <span className="text-slate-600">·</span>
                           <span className="text-xs font-mono text-cyan-400">
@@ -704,8 +715,35 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           </span>
                         </div>
 
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditorState({
+                                delivery: d,
+                                mode: { type: 'add' },
+                              })
+                            }
+                            className="h-8 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs font-mono inline-flex items-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                          >
+                            <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+                            <span>+ Add Part</span>
+                          </button>
 
-                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditorState({
+                                delivery: d,
+                                mode: { type: 'bulk-edit' },
+                              })
+                            }
+                            className="h-8 px-3 rounded-lg bg-[#142036] hover:bg-[#1C2C4A] border border-[#1E2D44] text-xs font-mono font-medium text-slate-200 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                          >
+                            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>Edit Parts List</span>
+                          </button>
+
                           <button
                             type="button"
                             onClick={() => {
@@ -820,10 +858,18 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                 className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-white/[0.02] transition-colors"
                               >
                                 <div className="min-w-0 space-y-0.5">
-                                  <div className="flex items-center gap-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                                      No. {part.itemNumber}
+                                    </span>
                                     <span className="font-mono font-bold text-xs text-white">
                                       <HighlightMatch text={part.partNumber} query={searchQuery} />
                                     </span>
+                                    {part.revision ? (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-amber-300 border border-amber-500/30">
+                                        Rev {part.revision}
+                                      </span>
+                                    ) : null}
                                     {part.palletNumber ? (
                                       <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#131E33] text-cyan-300 border border-cyan-500/30">
                                         Pallet {part.palletNumber}
@@ -834,13 +880,25 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                         {part.thickness}
                                       </span>
                                     ) : null}
+                                    {part.manuallyEdited ? (
+                                      <span
+                                        className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-blue-950/80 text-blue-300 border border-blue-500/30"
+                                        title={
+                                          part.originalOcrValues
+                                            ? `Edited by ${part.lastEditedBy || 'Operator'} · Original OCR: ${part.originalOcrValues.partNumber} (Qty ${part.originalOcrValues.quantity})`
+                                            : `Manually edited by ${part.lastEditedBy || 'Operator'}`
+                                        }
+                                      >
+                                        Edited
+                                      </span>
+                                    ) : null}
                                   </div>
                                   <p className="text-xs text-slate-400 truncate font-sans">
                                     <HighlightMatch text={part.description || 'Laser-cut item'} query={searchQuery} />
                                   </p>
                                 </div>
 
-                                <div className="flex items-center gap-3 self-end sm:self-auto shrink-0">
+                                <div className="flex items-center gap-2.5 self-end sm:self-auto shrink-0">
                                   <div className="text-right font-mono">
                                     <div className="text-xs font-bold text-white tabular-nums">
                                       {verState.receivedQty} / {verState.requiredQty}
@@ -862,6 +920,37 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                         UNSCANNED
                                       </span>
                                     )}
+                                  </div>
+
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setEditorState({
+                                          delivery: d,
+                                          mode: { type: 'edit-single', part },
+                                        })
+                                      }
+                                      className="p-1.5 rounded-lg bg-[#142036] hover:bg-[#1E2E4A] border border-[#1E2D44] text-slate-300 hover:text-white cursor-pointer transition-colors"
+                                      title={`Edit part ${part.partNumber}`}
+                                      aria-label={`Edit part ${part.partNumber}`}
+                                    >
+                                      <Edit3 className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setEditorState({
+                                          delivery: d,
+                                          mode: { type: 'delete-confirm', part },
+                                        })
+                                      }
+                                      className="p-1.5 rounded-lg bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-400 hover:text-red-200 cursor-pointer transition-colors"
+                                      title={`Delete part ${part.partNumber}`}
+                                      aria-label={`Delete part ${part.partNumber}`}
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
                                   </div>
                                 </div>
                               </div>
@@ -912,6 +1001,22 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         </div>
 
       </div>
+
+      {/* Parts List Editor Modal for Orders View */}
+      {editorState && (
+        <PartsListEditorModal
+          delivery={editorState.delivery}
+          mode={editorState.mode}
+          onClose={() => setEditorState(null)}
+          onDeliveryUpdated={(updated) => {
+            refreshDeliveries();
+            if (activeDelivery?.id === updated.id) {
+              onSelectDelivery(updated);
+            }
+          }}
+        />
+      )}
     </div>
   );
 };
+

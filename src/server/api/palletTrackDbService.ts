@@ -42,6 +42,7 @@ export interface CreateDeliveryInput {
     itemNumber: string;
     docketLineIndex?: number;
     description: string;
+    revision?: string;
     quantity?: number;
     receivedQuantity?: number;
     verificationStatus?: 'unscanned' | 'verified' | 'quantity_mismatch';
@@ -57,6 +58,16 @@ export interface CreateDeliveryInput {
     notes?: string;
     flaggedForReview?: boolean;
     ocrConfidence?: string;
+    manuallyEdited?: boolean;
+    lastEditedBy?: string;
+    lastEditedAt?: string;
+    originalOcrValues?: {
+      partNumber: string;
+      itemNumber?: string;
+      description: string;
+      revision?: string;
+      quantity: number;
+    };
   }>;
   scanHistory?: Array<{
     id?: string;
@@ -120,6 +131,23 @@ export class PalletTrackDbService {
    * Helper to format delivery parts from DB row to frontend object
    */
   private mapPartRow(row: DeliveryPartRow) {
+    let parsedOriginalOcr:
+      | {
+          partNumber: string;
+          itemNumber?: string;
+          description: string;
+          revision?: string;
+          quantity: number;
+        }
+      | undefined = undefined;
+    if (row.original_ocr_values) {
+      try {
+        parsedOriginalOcr = JSON.parse(row.original_ocr_values);
+      } catch {
+        parsedOriginalOcr = undefined;
+      }
+    }
+
     return {
       id: row.id,
       deliveryId: row.delivery_id,
@@ -127,6 +155,7 @@ export class PalletTrackDbService {
       itemNumber: row.item_number,
       docketLineIndex: row.docket_line_index,
       description: row.description,
+      revision: row.revision || undefined,
       quantity: row.required_quantity,
       receivedQuantity: row.received_quantity,
       verificationStatus: row.verification_status,
@@ -142,6 +171,10 @@ export class PalletTrackDbService {
       notes: row.notes || undefined,
       flaggedForReview: Boolean(row.flagged_for_review),
       ocrConfidence: (row.ocr_confidence as any) || undefined,
+      manuallyEdited: Boolean(row.manually_edited),
+      lastEditedBy: row.last_edited_by || undefined,
+      lastEditedAt: row.last_edited_at || undefined,
+      originalOcrValues: parsedOriginalOcr,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -351,16 +384,25 @@ export class PalletTrackDbService {
             : 'quantity_mismatch'
           : 'unscanned';
 
+      const originalOcrObj = p.originalOcrValues || {
+        partNumber: p.partNumber.trim().toUpperCase(),
+        itemNumber: p.itemNumber.trim(),
+        description: p.description.trim(),
+        revision: p.revision ? String(p.revision).trim() : undefined,
+        quantity: reqQty,
+      };
+
       stmts.push(
         this.db
           .prepare(
             `INSERT INTO delivery_parts (
-              id, delivery_id, part_number, item_number, docket_line_index, description,
+              id, delivery_id, part_number, item_number, docket_line_index, description, revision,
               required_quantity, received_quantity, verification_status, status,
               material, thickness, dimensions, weight, pallet_number,
               scanned_at, scanned_via, scanned_code, notes, flagged_for_review,
-              ocr_confidence, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ocr_confidence, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .bind(
             partId,
@@ -369,6 +411,7 @@ export class PalletTrackDbService {
             p.itemNumber.trim(),
             lineIndex,
             p.description.trim(),
+            p.revision ? String(p.revision).trim() : null,
             reqQty,
             recQty,
             verStatus,
@@ -384,6 +427,10 @@ export class PalletTrackDbService {
             p.notes || null,
             p.flaggedForReview ? 1 : 0,
             p.ocrConfidence || null,
+            p.manuallyEdited ? 1 : 0,
+            JSON.stringify(originalOcrObj),
+            p.lastEditedBy || null,
+            p.lastEditedAt || null,
             now,
             now
           )
@@ -488,6 +535,572 @@ export class PalletTrackDbService {
       .all<DeliveryPartRow>();
 
     return (res.results || []).map((p) => this.mapPartRow(p));
+  }
+
+  /**
+   * Manually add a new part to an existing delivery docket with validation and audit logging
+   */
+  async addDeliveryPart(
+    deliveryId: string,
+    input: {
+      id?: string;
+      partNumber: string;
+      itemNumber?: string;
+      description?: string;
+      revision?: string;
+      quantity?: number;
+      material?: string;
+      thickness?: string;
+      dimensions?: string;
+      weight?: string;
+      palletNumber?: string | number;
+      notes?: string;
+    },
+    actor?: { id?: string; employeeName?: string; role?: string }
+  ) {
+    const delivery = await this.db
+      .prepare('SELECT id FROM deliveries WHERE id = ?')
+      .bind(deliveryId)
+      .first<DeliveryRow>();
+
+    if (!delivery) {
+      throw new Error(`Delivery not found: ${deliveryId}`);
+    }
+
+    const partNumber = String(input.partNumber || '')
+      .trim()
+      .toUpperCase();
+    if (!partNumber) {
+      throw new Error('Part Number is required when adding a part.');
+    }
+
+    const rawQty = input.quantity === undefined || input.quantity === null ? 1 : Number(input.quantity);
+    if (Number.isNaN(rawQty) || rawQty < 1) {
+      throw new Error('Quantity must be a valid positive number (at least 1).');
+    }
+    const reqQty = Math.max(1, Math.round(rawQty));
+
+    const existingParts = await this.db
+      .prepare('SELECT item_number, docket_line_index FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC')
+      .bind(deliveryId)
+      .all<{ item_number: string; docket_line_index: number }>();
+
+    const maxLineIndex = (existingParts.results || []).reduce(
+      (max, r) => Math.max(max, Number(r.docket_line_index) || 0),
+      0
+    );
+    const maxItemNum = (existingParts.results || []).reduce((max, r) => {
+      const parsed = parseInt(String(r.item_number || '').replace(/\D+/g, ''), 10);
+      return Number.isNaN(parsed) ? max : Math.max(max, parsed);
+    }, 0);
+
+    const nextIndex = maxLineIndex + 1;
+    const itemNumber = String(input.itemNumber || '').trim() || String(Math.max(nextIndex, maxItemNum + 1));
+    const description = String(input.description || '').trim() || `Part ${partNumber}`;
+    const revision = input.revision ? String(input.revision).trim() : null;
+    const now = new Date().toISOString();
+    const partId = input.id || `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const actorName = actor?.employeeName || 'Authorized User';
+    const actorId = actor?.id || 'usr_receiver_default';
+    const actorRole = actor?.role || 'supervisor';
+
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const auditMessage = `Manually added part ${partNumber} (No. ${itemNumber}${
+      revision ? `, Rev ${revision}` : ''
+    }) — "${description}" (Qty ${reqQty}) by ${actorName}`;
+
+    const stmts = [
+      this.db
+        .prepare(
+          `INSERT INTO delivery_parts (
+            id, delivery_id, part_number, item_number, docket_line_index, description, revision,
+            required_quantity, received_quantity, verification_status, status,
+            material, thickness, dimensions, weight, pallet_number,
+            notes, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'unscanned', 'outstanding', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)`
+        )
+        .bind(
+          partId,
+          deliveryId,
+          partNumber,
+          itemNumber,
+          nextIndex,
+          description,
+          revision,
+          reqQty,
+          input.material ? String(input.material).trim() : null,
+          input.thickness ? String(input.thickness).trim() : null,
+          input.dimensions ? String(input.dimensions).trim() : null,
+          input.weight ? String(input.weight).trim() : null,
+          input.palletNumber ? String(input.palletNumber).trim() : null,
+          input.notes ? String(input.notes).trim() : null,
+          actorName,
+          now,
+          now,
+          now
+        ),
+      this.db
+        .prepare(
+          `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_added', ?, 0, ?, ?, ?, 'part_added')`
+        )
+        .bind(scanId, deliveryId, partId, actorId, now, partNumber, reqQty, auditMessage, actorName, actorRole),
+      this.db
+        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .bind(now, deliveryId),
+    ];
+
+    await this.db.batch(stmts);
+
+    const createdPartRow = await this.db
+      .prepare('SELECT * FROM delivery_parts WHERE id = ?')
+      .bind(partId)
+      .first<DeliveryPartRow>();
+
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+
+    return {
+      status: 'added',
+      part: createdPartRow ? this.mapPartRow(createdPartRow) : null,
+      delivery: updatedDelivery,
+    };
+  }
+
+  /**
+   * Manually edit an existing part on a delivery docket.
+   * Preserves original OCR values, keeps scanning/verification status consistent if already scanned,
+   * and records an audit event in scan_events.
+   */
+  async updateDeliveryPart(
+    deliveryId: string,
+    partId: string,
+    updates: {
+      partNumber?: string;
+      itemNumber?: string;
+      description?: string;
+      revision?: string | null;
+      quantity?: number;
+      material?: string | null;
+      thickness?: string | null;
+      dimensions?: string | null;
+      weight?: string | null;
+      palletNumber?: string | number | null;
+      notes?: string | null;
+    },
+    actor?: { id?: string; employeeName?: string; role?: string }
+  ) {
+    const existing = await this.db
+      .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+      .bind(deliveryId, partId)
+      .first<DeliveryPartRow>();
+
+    if (!existing) {
+      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+    }
+
+    const newPartNumber =
+      updates.partNumber !== undefined
+        ? String(updates.partNumber).trim().toUpperCase()
+        : existing.part_number;
+    if (!newPartNumber) {
+      throw new Error('Part Number cannot be empty.');
+    }
+
+    const newItemNumber =
+      updates.itemNumber !== undefined
+        ? String(updates.itemNumber).trim() || existing.item_number
+        : existing.item_number;
+
+    const newDescription =
+      updates.description !== undefined
+        ? String(updates.description).trim()
+        : existing.description;
+
+    const newRevision =
+      updates.revision !== undefined
+        ? updates.revision
+          ? String(updates.revision).trim()
+          : null
+        : existing.revision || null;
+
+    let newReqQty = existing.required_quantity;
+    if (updates.quantity !== undefined && updates.quantity !== null) {
+      const parsedQty = Number(updates.quantity);
+      if (Number.isNaN(parsedQty) || parsedQty < 1) {
+        throw new Error('Quantity must be a positive number (at least 1).');
+      }
+      newReqQty = Math.max(1, Math.round(parsedQty));
+    }
+
+    const newMaterial =
+      updates.material !== undefined
+        ? updates.material
+          ? String(updates.material).trim()
+          : null
+        : existing.material;
+    const newThickness =
+      updates.thickness !== undefined
+        ? updates.thickness
+          ? String(updates.thickness).trim()
+          : null
+        : existing.thickness;
+    const newDimensions =
+      updates.dimensions !== undefined
+        ? updates.dimensions
+          ? String(updates.dimensions).trim()
+          : null
+        : existing.dimensions;
+    const newWeight =
+      updates.weight !== undefined
+        ? updates.weight
+          ? String(updates.weight).trim()
+          : null
+        : existing.weight;
+    const newPalletNumber =
+      updates.palletNumber !== undefined
+        ? updates.palletNumber !== null && String(updates.palletNumber).trim() !== ''
+          ? String(updates.palletNumber).trim()
+          : null
+        : existing.pallet_number;
+    const newNotes =
+      updates.notes !== undefined
+        ? updates.notes
+          ? String(updates.notes).trim()
+          : null
+        : existing.notes;
+
+    // Preserve original OCR values before applying manual edits
+    let originalOcrJson = existing.original_ocr_values;
+    if (!originalOcrJson) {
+      originalOcrJson = JSON.stringify({
+        partNumber: existing.part_number,
+        itemNumber: existing.item_number,
+        description: existing.description,
+        revision: existing.revision || undefined,
+        quantity: existing.required_quantity,
+      });
+    }
+
+    // Keep scanning & verification status consistent with pallet scanning and outstanding quantities
+    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+    const isScanned = existing.status === 'received' || recQty > 0;
+    const newStatus = isScanned ? 'received' : 'outstanding';
+    const newVerificationStatus = isScanned
+      ? recQty === newReqQty
+        ? 'verified'
+        : 'quantity_mismatch'
+      : 'unscanned';
+
+    const changesSummary: string[] = [];
+    if (newPartNumber !== existing.part_number) {
+      changesSummary.push(`Part#: ${existing.part_number} → ${newPartNumber}`);
+    }
+    if (newItemNumber !== existing.item_number) {
+      changesSummary.push(`No: ${existing.item_number} → ${newItemNumber}`);
+    }
+    if (newDescription !== existing.description) {
+      changesSummary.push(`Desc: "${existing.description}" → "${newDescription}"`);
+    }
+    if ((newRevision || '') !== (existing.revision || '')) {
+      changesSummary.push(`Rev: ${existing.revision || '—'} → ${newRevision || '—'}`);
+    }
+    if (newReqQty !== existing.required_quantity) {
+      changesSummary.push(`Qty: ${existing.required_quantity} → ${newReqQty}`);
+    }
+    if ((newPalletNumber || '') !== (existing.pallet_number || '')) {
+      changesSummary.push(`Pallet: ${existing.pallet_number || '—'} → ${newPalletNumber || '—'}`);
+    }
+    if ((newMaterial || '') !== (existing.material || '')) {
+      changesSummary.push(`Mat: ${existing.material || '—'} → ${newMaterial || '—'}`);
+    }
+    if ((newThickness || '') !== (existing.thickness || '')) {
+      changesSummary.push(`Thk: ${existing.thickness || '—'} → ${newThickness || '—'}`);
+    }
+
+    const now = new Date().toISOString();
+    const actorName = actor?.employeeName || 'Authorized User';
+    const actorId = actor?.id || 'usr_receiver_default';
+    const actorRole = actor?.role || 'supervisor';
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const auditMessage =
+      changesSummary.length > 0
+        ? `Manually edited part ${newPartNumber} (No. ${newItemNumber}): ${changesSummary.join('; ')} by ${actorName}`
+        : `Saved part ${newPartNumber} (No. ${newItemNumber}) by ${actorName}`;
+
+    const stmts: any[] = [
+      this.db
+        .prepare(
+          `UPDATE delivery_parts
+           SET part_number = ?, item_number = ?, description = ?, revision = ?,
+               required_quantity = ?, verification_status = ?, status = ?,
+               material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
+               notes = ?, manually_edited = 1, original_ocr_values = ?,
+               last_edited_by = ?, last_edited_at = ?, updated_at = ?
+           WHERE delivery_id = ? AND id = ?`
+        )
+        .bind(
+          newPartNumber,
+          newItemNumber,
+          newDescription,
+          newRevision,
+          newReqQty,
+          newVerificationStatus,
+          newStatus,
+          newMaterial,
+          newThickness,
+          newDimensions,
+          newWeight,
+          newPalletNumber,
+          newNotes,
+          originalOcrJson,
+          actorName,
+          now,
+          now,
+          deliveryId,
+          partId
+        ),
+      this.db
+        .prepare(
+          `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_edited', 0, ?, ?, ?, ?, 'part_edited')`
+        )
+        .bind(
+          scanId,
+          deliveryId,
+          partId,
+          actorId,
+          now,
+          newPartNumber,
+          recQty,
+          auditMessage,
+          actorName,
+          actorRole
+        ),
+      this.db
+        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .bind(now, deliveryId),
+    ];
+
+    await this.db.batch(stmts);
+
+    const updatedPartRow = await this.db
+      .prepare('SELECT * FROM delivery_parts WHERE id = ?')
+      .bind(partId)
+      .first<DeliveryPartRow>();
+
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+
+    return {
+      status: 'updated',
+      part: updatedPartRow ? this.mapPartRow(updatedPartRow) : null,
+      delivery: updatedDelivery,
+    };
+  }
+
+  /**
+   * Delete a part from a delivery docket and record an audit trail entry in scan_events.
+   */
+  async deleteDeliveryPart(
+    deliveryId: string,
+    partId: string,
+    actor?: { id?: string; employeeName?: string; role?: string }
+  ) {
+    const existing = await this.db
+      .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+      .bind(deliveryId, partId)
+      .first<DeliveryPartRow>();
+
+    if (!existing) {
+      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+    }
+
+    const now = new Date().toISOString();
+    const actorName = actor?.employeeName || 'Authorized User';
+    const actorId = actor?.id || 'usr_receiver_default';
+    const actorRole = actor?.role || 'supervisor';
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const wasScannedNote =
+      existing.status === 'received' || existing.received_quantity > 0
+        ? ` [Was already scanned: ${existing.received_quantity}/${existing.required_quantity}]`
+        : '';
+    const auditMessage = `Deleted part ${existing.part_number} (No. ${existing.item_number}${
+      existing.revision ? `, Rev ${existing.revision}` : ''
+    }) — "${existing.description}" (Qty ${existing.required_quantity})${wasScannedNote} by ${actorName}`;
+
+    const stmts = [
+      this.db
+        .prepare('UPDATE scan_events SET part_id = NULL WHERE delivery_id = ? AND part_id = ?')
+        .bind(deliveryId, partId),
+      this.db
+        .prepare('DELETE FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+        .bind(deliveryId, partId),
+      this.db
+        .prepare(
+          `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, 0, ?, ?, ?, 'part_deleted')`
+        )
+        .bind(scanId, deliveryId, actorId, now, existing.part_number, auditMessage, actorName, actorRole),
+      this.db
+        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .bind(now, deliveryId),
+    ];
+
+    await this.db.batch(stmts);
+
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+
+    return {
+      status: 'deleted',
+      deletedPartId: partId,
+      delivery: updatedDelivery,
+    };
+  }
+
+  /**
+   * Batch save an entire delivery's parts list (supports multi-row inline edits, additions, and deletions).
+   */
+  async batchSaveDeliveryParts(
+    deliveryId: string,
+    partsInput: Array<{
+      id?: string;
+      partNumber: string;
+      itemNumber?: string;
+      docketLineIndex?: number;
+      description?: string;
+      revision?: string | null;
+      quantity?: number;
+      material?: string | null;
+      thickness?: string | null;
+      dimensions?: string | null;
+      weight?: string | null;
+      palletNumber?: string | number | null;
+      notes?: string | null;
+    }>,
+    actor?: { id?: string; employeeName?: string; role?: string }
+  ) {
+    const delivery = await this.db
+      .prepare('SELECT id FROM deliveries WHERE id = ?')
+      .bind(deliveryId)
+      .first<DeliveryRow>();
+
+    if (!delivery) {
+      throw new Error(`Delivery not found: ${deliveryId}`);
+    }
+
+    if (!Array.isArray(partsInput)) {
+      throw new Error('parts array is required');
+    }
+
+    const existingRowsRes = await this.db
+      .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index ASC')
+      .bind(deliveryId)
+      .all<DeliveryPartRow>();
+    const existingRows = existingRowsRes.results || [];
+    const existingById = new Map<string, DeliveryPartRow>(existingRows.map((r) => [r.id, r]));
+
+    const incomingIds = new Set<string>();
+    for (const p of partsInput) {
+      if (!String(p.partNumber || '').trim()) {
+        throw new Error('All parts must have a non-empty Part Number.');
+      }
+      const q = Number(p.quantity ?? 1);
+      if (Number.isNaN(q) || q < 1) {
+        throw new Error(`Invalid quantity for part ${p.partNumber}: must be at least 1.`);
+      }
+      if (p.id) incomingIds.add(p.id);
+    }
+
+    // 1. Delete any existing parts removed in the batch
+    for (const existing of existingRows) {
+      if (!incomingIds.has(existing.id)) {
+        await this.deleteDeliveryPart(deliveryId, existing.id, actor);
+      }
+    }
+
+    // 2. Update existing parts that changed or add new parts
+    for (let idx = 0; idx < partsInput.length; idx++) {
+      const item = partsInput[idx];
+      const existing = item.id ? existingById.get(item.id) : undefined;
+      if (existing) {
+        const cleanPartNo = String(item.partNumber).trim().toUpperCase();
+        const cleanItemNo = String(item.itemNumber ?? existing.item_number).trim();
+        const cleanDesc = String(item.description ?? existing.description).trim();
+        const cleanRev = item.revision ? String(item.revision).trim() : null;
+        const cleanQty = Math.max(1, Math.round(Number(item.quantity ?? existing.required_quantity)));
+        const cleanPallet =
+          item.palletNumber !== undefined && item.palletNumber !== null && String(item.palletNumber).trim() !== ''
+            ? String(item.palletNumber).trim()
+            : null;
+        const cleanMat = item.material ? String(item.material).trim() : null;
+        const cleanThk = item.thickness ? String(item.thickness).trim() : null;
+
+        const hasChanged =
+          cleanPartNo !== existing.part_number ||
+          cleanItemNo !== existing.item_number ||
+          cleanDesc !== existing.description ||
+          (cleanRev || '') !== (existing.revision || '') ||
+          cleanQty !== existing.required_quantity ||
+          (cleanPallet || '') !== (existing.pallet_number || '') ||
+          (cleanMat || '') !== (existing.material || '') ||
+          (cleanThk || '') !== (existing.thickness || '');
+
+        if (hasChanged) {
+          await this.updateDeliveryPart(
+            deliveryId,
+            existing.id,
+            {
+              partNumber: cleanPartNo,
+              itemNumber: cleanItemNo,
+              description: cleanDesc,
+              revision: cleanRev,
+              quantity: cleanQty,
+              palletNumber: cleanPallet,
+              material: cleanMat,
+              thickness: cleanThk,
+              dimensions: item.dimensions,
+              weight: item.weight,
+              notes: item.notes,
+            },
+            actor
+          );
+        }
+      } else {
+        await this.addDeliveryPart(
+          deliveryId,
+          {
+            id: item.id,
+            partNumber: item.partNumber,
+            itemNumber: item.itemNumber || String(idx + 1),
+            description: item.description,
+            revision: item.revision || undefined,
+            quantity: item.quantity ?? 1,
+            palletNumber: item.palletNumber || undefined,
+            material: item.material || undefined,
+            thickness: item.thickness || undefined,
+            dimensions: item.dimensions || undefined,
+            weight: item.weight || undefined,
+            notes: item.notes || undefined,
+          },
+          actor
+        );
+      }
+    }
+
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+    return {
+      status: 'batch_saved',
+      delivery: updatedDelivery,
+    };
   }
 
   /**
@@ -777,10 +1390,13 @@ export class PalletTrackDbService {
         .prepare('SELECT id, employee_code, role, active FROM users LIMIT 1')
         .first();
       await this.db.prepare('SELECT id FROM sessions LIMIT 1').first();
+      await this.db
+        .prepare('SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at FROM delivery_parts LIMIT 1')
+        .first();
       PalletTrackDbService.schemaVerified = true;
       return;
     } catch {
-      // Tables or columns missing on a newly created D1 instance; initialize non-destructively
+      // Tables or columns missing on a newly created or upgraded D1 instance; initialize non-destructively
     }
 
     const createStatements = [
@@ -830,6 +1446,7 @@ export class PalletTrackDbService {
         item_number TEXT NOT NULL,
         docket_line_index INTEGER NOT NULL DEFAULT 1,
         description TEXT NOT NULL,
+        revision TEXT,
         required_quantity INTEGER NOT NULL DEFAULT 1,
         received_quantity INTEGER NOT NULL DEFAULT 0,
         verification_status TEXT NOT NULL DEFAULT 'unscanned',
@@ -845,6 +1462,10 @@ export class PalletTrackDbService {
         notes TEXT,
         flagged_for_review INTEGER NOT NULL DEFAULT 0,
         ocr_confidence TEXT,
+        manually_edited INTEGER NOT NULL DEFAULT 0,
+        original_ocr_values TEXT,
+        last_edited_by TEXT,
+        last_edited_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
@@ -897,6 +1518,11 @@ export class PalletTrackDbService {
       'ALTER TABLE scan_events ADD COLUMN employee_name TEXT',
       'ALTER TABLE scan_events ADD COLUMN employee_role TEXT',
       "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
+      'ALTER TABLE delivery_parts ADD COLUMN revision TEXT',
+      'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT',
+      'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT',
+      'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT',
     ];
 
     for (const sql of alterCols) {

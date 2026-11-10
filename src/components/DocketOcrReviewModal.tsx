@@ -11,9 +11,8 @@ import {
   ChevronRight,
   Sparkles,
   WifiOff,
-  Barcode,
-  QrCode,
   FileText,
+  RefreshCw,
 } from 'lucide-react';
 import { Delivery, DeliveryPart, DocketAttachment, SupplierRuleId } from '../types/delivery';
 import { ExtractedDocketResult, ExtractedDocketItem } from '../server/docketOcr';
@@ -23,11 +22,17 @@ import {
   saveDocketImages,
   SUPPLIER_RULES,
 } from '../utils/storage';
+import { getStoredUser } from '../services/palletTrackApi';
+import {
+  performSmartDocketExtraction,
+  PageTextHint,
+} from '../utils/offlineOcr';
 
 interface AttachedPage {
   pageNumber: number;
   dataUrl: string;
   name?: string;
+  textHint?: PageTextHint;
 }
 
 interface DocketOcrReviewModalProps {
@@ -64,12 +69,50 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   const [orderNumber, setOrderNumber] = useState(extractedData.orderNumber || '');
   const [notes, setNotes] = useState(extractedData.notes || '');
 
-  const [items, setItems] = useState<ExtractedDocketItem[]>(extractedData.items || []);
+  const [items, setItems] = useState<ExtractedDocketItem[]>(() =>
+    (extractedData.items || []).map((it) => ({
+      ...it,
+      originalOcrValues: it.originalOcrValues || {
+        partNumber: it.partNumber,
+        itemNumber: it.itemNumber,
+        description: it.description,
+        revision: it.rev,
+        quantity: Math.max(1, it.quantity || 1),
+      },
+    }))
+  );
   const [filterMode, setFilterMode] = useState<'all' | 'flagged'>('all');
   const [expandQuantities, setExpandQuantities] = useState(false);
 
   const [showPhotoViewer, setShowPhotoViewer] = useState(false);
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
+
+  // Add Part Modal State inside Review Screen
+  const [showAddPartForm, setShowAddPartForm] = useState(false);
+  const [newPartDraft, setNewPartDraft] = useState({
+    itemNumber: '',
+    partNumber: '',
+    description: '',
+    rev: '',
+    quantity: '1',
+    material: '',
+    thickness: '',
+    palletNumber: 'Pallet 1',
+  });
+  const [addPartError, setAddPartError] = useState<string | null>(null);
+
+  // Delete Row Confirmation State
+  const [pendingDeleteIdx, setPendingDeleteIdx] = useState<number | null>(null);
+
+  // Re-run OCR State (preserving manual edits)
+  const [isRetryingOcr, setIsRetryingOcr] = useState(false);
+  const [retryOcrStatus, setRetryOcrStatus] = useState<string | null>(null);
+  const [retryOcrError, setRetryOcrError] = useState<string | null>(null);
+
+  const getActorLabel = () => {
+    const u = getStoredUser();
+    return u ? `${u.employeeName} (${u.employeeCode})` : 'Workshop Operator';
+  };
 
   const handleSelectSupplierRule = (ruleId: SupplierRuleId) => {
     setSupplierRule(ruleId);
@@ -77,9 +120,26 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   };
 
   const handleItemChange = (index: number, field: keyof ExtractedDocketItem, value: any) => {
+    const actor = getActorLabel();
+    const now = new Date().toISOString();
     setItems((prev) => {
       const next = [...prev];
-      next[index] = { ...next[index], [field]: value };
+      const current = next[index];
+      const origOcr = current.originalOcrValues || {
+        partNumber: current.partNumber,
+        itemNumber: current.itemNumber,
+        description: current.description,
+        revision: current.rev,
+        quantity: Math.max(1, current.quantity || 1),
+      };
+      next[index] = {
+        ...current,
+        [field]: value,
+        manuallyEdited: true,
+        lastEditedBy: actor,
+        lastEditedAt: now,
+        originalOcrValues: origOcr,
+      };
       if (field === 'partNumber' || field === 'itemNumber') {
         next[index].confidence = 'high';
       }
@@ -87,27 +147,165 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     });
   };
 
-  const handleAddItem = () => {
+  const handleOpenAddPartModal = () => {
+    setAddPartError(null);
+    const maxItemNo = items.reduce((max, it, idx) => {
+      const parsed = parseInt(String(it.itemNumber || '').replace(/\D+/g, ''), 10);
+      return Number.isNaN(parsed) ? Math.max(max, idx + 1) : Math.max(max, parsed);
+    }, 0);
+    setNewPartDraft({
+      itemNumber: String(maxItemNo + 1),
+      partNumber: '',
+      description: '',
+      rev: '',
+      quantity: '1',
+      material: '',
+      thickness: '',
+      palletNumber: 'Pallet 1',
+    });
+    setShowAddPartForm(true);
+  };
+
+  const handleConfirmAddPart = (e: React.FormEvent, keepOpenForAnother = false) => {
+    e.preventDefault();
+    setAddPartError(null);
+
+    const cleanPartNo = newPartDraft.partNumber.trim().toUpperCase();
+    if (!cleanPartNo) {
+      setAddPartError('Part Number is required.');
+      return;
+    }
+
+    const parsedQty = parseInt(newPartDraft.quantity, 10);
+    if (Number.isNaN(parsedQty) || parsedQty < 1) {
+      setAddPartError('Quantity is required and must be at least 1.');
+      return;
+    }
+
+    const actor = getActorLabel();
+    const now = new Date().toISOString();
+    const cleanItemNo = newPartDraft.itemNumber.trim() || String(items.length + 1);
+
     const newItem: ExtractedDocketItem = {
-      partNumber: `PLT-${items.length + 101}`,
-      itemNumber: `${items.length + 1}`,
-      description: 'Laser-cut steel part',
-      material: '350Gr',
-      thickness: '10mm',
+      partNumber: cleanPartNo,
+      itemNumber: cleanItemNo,
+      description: newPartDraft.description.trim() || `Part ${cleanPartNo}`,
+      rev: newPartDraft.rev.trim() || undefined,
+      material: newPartDraft.material.trim() || undefined,
+      thickness: newPartDraft.thickness.trim() || undefined,
       dimensions: '',
-      quantity: 1,
-      palletNumber: `Pallet 1`,
+      quantity: parsedQty,
+      palletNumber: newPartDraft.palletNumber.trim() || 'Pallet 1',
       confidence: 'high',
+      manuallyEdited: true,
+      lastEditedBy: actor,
+      lastEditedAt: now,
     };
-    setItems([newItem, ...items]);
+
+    const updatedItems = [...items, newItem];
+    setItems(updatedItems);
+
+    if (keepOpenForAnother) {
+      const nextNo = parseInt(cleanItemNo.replace(/\D+/g, ''), 10);
+      setNewPartDraft({
+        itemNumber: Number.isNaN(nextNo) ? String(updatedItems.length + 1) : String(nextNo + 1),
+        partNumber: '',
+        description: '',
+        rev: '',
+        quantity: '1',
+        material: newPartDraft.material,
+        thickness: newPartDraft.thickness,
+        palletNumber: newPartDraft.palletNumber,
+      });
+    } else {
+      setShowAddPartForm(false);
+    }
   };
 
-  const handleRemoveItem = (index: number) => {
-    setItems(items.filter((_, i) => i !== index));
+  const handleConfirmRemoveItem = () => {
+    if (pendingDeleteIdx === null) return;
+    setItems((prev) => prev.filter((_, i) => i !== pendingDeleteIdx));
+    setPendingDeleteIdx(null);
   };
 
-  const totalExpandedParts = items.reduce((acc, it) => acc + (it.quantity || 1), 0);
+  /**
+   * Re-runs Gemini OCR extraction on the attached docket pages while preserving
+   * any rows that were manually edited or added by the user (`manuallyEdited: true`).
+   */
+  const handleRerunOcrPreservingManualEdits = async () => {
+    if (attachedPages.length === 0 || isRetryingOcr) return;
+    setIsRetryingOcr(true);
+    setRetryOcrError(null);
+    setRetryOcrStatus('Re-running Gemini OCR while preserving your manual edits...');
+
+    try {
+      const imagesToProcess = attachedPages.map((p) => p.dataUrl);
+      const pageTextHints = attachedPages.map((p) => p.textHint || {});
+      const output = await performSmartDocketExtraction(
+        imagesToProcess,
+        (update) => {
+          setRetryOcrStatus(update.statusText);
+        },
+        false,
+        pageTextHints
+      );
+
+      const freshItems = output.extractedData.items || [];
+      const manualRows = items.filter((it) => it.manuallyEdited);
+      const manualByItemNo = new Map<string, ExtractedDocketItem>();
+      const extraManualRows: ExtractedDocketItem[] = [];
+
+      for (const m of manualRows) {
+        const key = String(m.itemNumber || '').trim();
+        if (key && !manualByItemNo.has(key)) {
+          manualByItemNo.set(key, m);
+        } else {
+          extraManualRows.push(m);
+        }
+      }
+
+      const merged: ExtractedDocketItem[] = freshItems.map((fresh) => {
+        const key = String(fresh.itemNumber || '').trim();
+        if (key && manualByItemNo.has(key)) {
+          const preserved = manualByItemNo.get(key)!;
+          manualByItemNo.delete(key);
+          return preserved;
+        }
+        return {
+          ...fresh,
+          originalOcrValues: {
+            partNumber: fresh.partNumber,
+            itemNumber: fresh.itemNumber,
+            description: fresh.description,
+            revision: fresh.rev,
+            quantity: Math.max(1, fresh.quantity || 1),
+          },
+        };
+      });
+
+      // Append any remaining manually added rows that didn't match an OCR item number
+      for (const remainingManual of manualByItemNo.values()) {
+        merged.push(remainingManual);
+      }
+      for (const extra of extraManualRows) {
+        merged.push(extra);
+      }
+
+      setItems(merged);
+      setRetryOcrStatus(null);
+    } catch (err: any) {
+      setRetryOcrError(
+        err?.message || 'Gemini OCR retry failed. Your existing parts and manual edits are preserved.'
+      );
+      setRetryOcrStatus(null);
+    } finally {
+      setIsRetryingOcr(false);
+    }
+  };
+
+  const totalExpandedParts = items.reduce((acc, it) => acc + Math.max(1, it.quantity || 1), 0);
   const lowConfidenceCount = items.filter((i) => i.confidence === 'low').length;
+  const manuallyEditedCount = items.filter((i) => i.manuallyEdited).length;
 
   const filteredItems = items.filter((it) => {
     if (filterMode === 'flagged') return it.confidence === 'low';
@@ -115,6 +313,15 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   });
 
   const handleConfirmImport = async () => {
+    // Validate required fields before importing
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      if (!String(row.partNumber || '').trim()) {
+        setRetryOcrError(`Row ${i + 1} (No. ${row.itemNumber || i + 1}) is missing a Part Number.`);
+        return;
+      }
+    }
+
     const deliveryId = `del_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const finalParts: DeliveryPart[] = [];
     let lineIdx = 1;
@@ -122,7 +329,6 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     items.forEach((it, rowIdx) => {
       const qty = expandQuantities ? Math.max(1, it.quantity || 1) : 1;
       const isMultiple = qty > 1;
-      // Preserve the exact Docket "No" (e.g. "1", "2", "3") so "<numbers>-<No>" barcodes cross-reference directly
       const cleanDocketNo =
         it.itemNumber.trim().replace(/^(?:ITM|LINE|POS|NO\.?)\s*[-:]?\s*0*/i, '') ||
         String(rowIdx + 1);
@@ -136,6 +342,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           description: isMultiple
             ? `${it.description} (Piece ${q} of ${qty})`
             : it.description,
+          revision: it.rev?.trim() || undefined,
           material: it.material?.trim() || undefined,
           thickness: it.thickness?.trim() || undefined,
           dimensions: it.dimensions?.trim() || undefined,
@@ -146,6 +353,16 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           ocrConfidence: it.confidence,
           flaggedForReview: it.confidence === 'low',
           notes: it.notes,
+          manuallyEdited: Boolean(it.manuallyEdited),
+          lastEditedBy: it.lastEditedBy,
+          lastEditedAt: it.lastEditedAt,
+          originalOcrValues: it.originalOcrValues || {
+            partNumber: it.partNumber.trim().toUpperCase(),
+            itemNumber: cleanDocketNo.toUpperCase(),
+            description: it.description,
+            revision: it.rev?.trim() || undefined,
+            quantity: expandQuantities ? 1 : Math.max(1, it.quantity || 1),
+          },
         });
 
         lineIdx++;
@@ -197,7 +414,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <h3 className="font-bold text-sm text-[#18181B]">
-                Compiled Docket Parts List ({items.length} Distinct Part Lines · {totalExpandedParts} Total Pieces)
+                Compiled Docket Parts List ({items.length} Part Rows · {totalExpandedParts} Total Quantities)
               </h3>
               {extractedData.extractionMethod === 'ai-vision' ? (
                 <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
@@ -215,25 +432,44 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   <span>On-Device OCR</span>
                 </span>
               )}
+              {manuallyEditedCount > 0 && (
+                <span className="font-mono text-[10px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-[3px]">
+                  {manuallyEditedCount} Manually Edited / Added
+                </span>
+              )}
             </div>
             <p className="text-[11px] text-zinc-500 mt-0.5">
-              Review the compiled parts list and confirm the supplier scanning rule before opening the scanner.
+              Edit any part row, add missing parts, or remove unwanted rows before saving the docket.
             </p>
           </div>
 
           <div className="flex items-center gap-2">
             {attachedPages.length > 0 && (
-              <button
-                onClick={() => setShowPhotoViewer(!showPhotoViewer)}
-                className={`h-7 px-2.5 rounded-[4px] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
-                  showPhotoViewer
-                    ? 'bg-[#18181B] text-white'
-                    : 'bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50'
-                }`}
-              >
-                {showPhotoViewer ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                <span>{showPhotoViewer ? 'Hide docket' : 'View docket'}</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={handleRerunOcrPreservingManualEdits}
+                  disabled={isRetryingOcr}
+                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                  title="Re-run Gemini OCR extraction while preserving any rows you have manually edited or added"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isRetryingOcr ? 'animate-spin text-[#059669]' : ''}`} />
+                  <span className="hidden sm:inline">Re-run OCR (Keep Edits)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowPhotoViewer(!showPhotoViewer)}
+                  className={`h-7 px-2.5 rounded-[4px] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                    showPhotoViewer
+                      ? 'bg-[#18181B] text-white'
+                      : 'bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50'
+                  }`}
+                >
+                  {showPhotoViewer ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  <span>{showPhotoViewer ? 'Hide docket' : 'View docket'}</span>
+                </button>
+              </>
             )}
 
             <button
@@ -245,13 +481,65 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           </div>
         </div>
 
+        {/* Status / Error Banners */}
+        {retryOcrStatus && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center gap-2 shrink-0">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-600 shrink-0" />
+            <span className="font-semibold">{retryOcrStatus}</span>
+          </div>
+        )}
+        {retryOcrError && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+              <span>{retryOcrError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRetryOcrError(null)}
+              className="text-red-500 hover:text-red-800 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Delete Row Confirmation Banner */}
+        {pendingDeleteIdx !== null && items[pendingDeleteIdx] && (
+          <div className="px-4 py-2.5 bg-red-600 text-white flex flex-wrap items-center justify-between gap-3 text-xs shrink-0">
+            <div className="flex items-center gap-2">
+              <Trash2 className="w-4 h-4 shrink-0" />
+              <span>
+                Confirm delete part row <strong>No. {items[pendingDeleteIdx].itemNumber}</strong> —{' '}
+                <strong className="font-mono">{items[pendingDeleteIdx].partNumber}</strong> (
+                {items[pendingDeleteIdx].description}, Qty {items[pendingDeleteIdx].quantity})?
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteIdx(null)}
+                className="h-7 px-2.5 rounded bg-white/15 hover:bg-white/25 text-white font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmRemoveItem}
+                className="h-7 px-3 rounded bg-white text-red-700 font-bold cursor-pointer"
+              >
+                Confirm Delete
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Content Area: Table Review + Optional Side-by-Side Docket Photo */}
         <div className="flex-1 flex overflow-hidden">
           {/* Left / Main Section: Metadata & Compiled Parts Table */}
           <div className="flex-1 flex flex-col overflow-y-auto">
             {/* Header Metadata Form */}
             <div className="p-3.5 bg-white border-b border-[#E4E3DE] space-y-2.5 text-xs">
-
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
                 <div>
                   <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
@@ -334,7 +622,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                       : 'bg-white border border-[#E4E3DE] text-zinc-600 hover:text-[#18181B]'
                   }`}
                 >
-                  All Individual Parts ({items.length})
+                  All Part Rows ({items.length})
                 </button>
 
                 {lowConfidenceCount > 0 && (
@@ -364,14 +652,132 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                 </label>
 
                 <button
-                  onClick={handleAddItem}
-                  className="h-7 px-2.5 bg-white border border-[#E4E3DE] hover:bg-zinc-50 rounded-[3px] font-medium text-xs text-[#18181B] flex items-center gap-1 cursor-pointer"
+                  type="button"
+                  onClick={handleOpenAddPartModal}
+                  className="h-7 px-3 bg-[#059669] hover:bg-[#047857] text-white rounded-[4px] font-bold text-xs flex items-center gap-1 cursor-pointer shadow-2xs"
                 >
-                  <Plus className="w-3 h-3" />
-                  <span>Add part</span>
+                  <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+                  <span>+ Add Part</span>
                 </button>
               </div>
             </div>
+
+            {/* Inline / Modal Add Part Form */}
+            {showAddPartForm && (
+              <form
+                onSubmit={(e) => handleConfirmAddPart(e, false)}
+                className="p-3.5 bg-emerald-50/70 border-b-2 border-[#059669] space-y-2.5 text-xs"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-[11px] font-bold uppercase text-[#059669]">
+                    + Add Missing Part to Docket
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddPartForm(false)}
+                    className="text-zinc-500 hover:text-[#18181B] cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {addPartError && (
+                  <div className="p-2 rounded bg-red-50 border border-red-200 text-red-700 font-medium">
+                    {addPartError}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-8 gap-2">
+                  <div>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
+                      No
+                    </label>
+                    <input
+                      type="text"
+                      value={newPartDraft.itemNumber}
+                      onChange={(e) =>
+                        setNewPartDraft((p) => ({ ...p, itemNumber: e.target.value }))
+                      }
+                      className="w-full h-8 px-2 font-mono text-xs font-bold text-[#059669] bg-white border border-emerald-300 rounded-[3px] outline-none"
+                    />
+                  </div>
+                  <div className=" sm:col-span-2">
+                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">
+                      Part Number *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="e.g. PLT-2048"
+                      value={newPartDraft.partNumber}
+                      onChange={(e) =>
+                        setNewPartDraft((p) => ({ ...p, partNumber: e.target.value }))
+                      }
+                      className="w-full h-8 px-2 font-mono text-xs font-bold uppercase bg-white border border-emerald-300 rounded-[3px] outline-none"
+                    />
+                  </div>
+                  <div className="col-span-2 sm:col-span-2">
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
+                      Description
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Part description"
+                      value={newPartDraft.description}
+                      onChange={(e) =>
+                        setNewPartDraft((p) => ({ ...p, description: e.target.value }))
+                      }
+                      className="w-full h-8 px-2 text-xs bg-white border border-emerald-300 rounded-[3px] outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
+                      Rev
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. A"
+                      value={newPartDraft.rev}
+                      onChange={(e) =>
+                        setNewPartDraft((p) => ({ ...p, rev: e.target.value }))
+                      }
+                      className="w-full h-8 px-2 font-mono text-xs uppercase bg-white border border-emerald-300 rounded-[3px] outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">
+                      Qty *
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      required
+                      value={newPartDraft.quantity}
+                      onChange={(e) =>
+                        setNewPartDraft((p) => ({ ...p, quantity: e.target.value }))
+                      }
+                      className="w-full h-8 px-2 font-mono text-xs font-bold text-center bg-white border border-emerald-300 rounded-[3px] outline-none"
+                    />
+                  </div>
+                  <div className="flex items-end gap-1.5">
+                    <button
+                      type="submit"
+                      className="h-8 px-3 bg-[#059669] hover:bg-[#047857] text-white font-bold rounded-[3px] cursor-pointer whitespace-nowrap"
+                    >
+                      Save Part
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => handleConfirmAddPart(e, true)}
+                      className="h-8 px-2.5 bg-white border border-[#059669] text-[#059669] hover:bg-emerald-50 font-semibold rounded-[3px] cursor-pointer whitespace-nowrap"
+                      title="Save this part and immediately add another"
+                    >
+                      + Next
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
 
             {/* Extracted Individual Parts Table with ALL Details */}
             <div className="flex-1 overflow-x-auto bg-white">
@@ -385,10 +791,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                       No (######-No)
                     </th>
                     <th className="py-2 px-2.5 min-w-[130px]">Part #</th>
-                    <th className="py-2 px-2.5 min-w-[200px]">Part Description</th>
-                    <th className="py-2 px-2 min-w-[95px]">Material</th>
+                    <th className="py-2 px-2.5 min-w-[190px]">Part Description</th>
+                    <th className="py-2 px-2 w-16 text-center">Rev</th>
+                    <th className="py-2 px-2 min-w-[90px]">Material</th>
                     <th className="py-2 px-2 w-20">Thickness</th>
-                    <th className="py-2 px-2 min-w-[105px]">Size / Dim</th>
+                    <th className="py-2 px-2 min-w-[100px]">Size / Dim</th>
                     <th className="py-2 px-2 w-16 text-center">Qty</th>
                     <th className="py-2 px-2 w-24">Pallet</th>
                     <th className="py-2 px-2 w-10 text-center"></th>
@@ -403,10 +810,14 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                       <tr
                         key={originalIdx}
                         className={`hover:bg-zinc-50/80 transition-colors ${
-                          isFlagged ? 'bg-amber-50/30' : ''
+                          isFlagged
+                            ? 'bg-amber-50/30'
+                            : item.manuallyEdited
+                            ? 'bg-blue-50/20'
+                            : ''
                         }`}
                       >
-                        {/* Docket "No" Column (matched by numbers after '-' in ######-No barcode) */}
+                        {/* Docket "No" Column */}
                         <td className="py-1.5 px-2 text-center">
                           <div className="flex items-center gap-1">
                             {attachedPages.length > 1 && item.pageNumber && (
@@ -423,7 +834,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                               onChange={(e) =>
                                 handleItemChange(originalIdx, 'itemNumber', e.target.value)
                               }
-                              title="Part 'No' on the delivery docket / invoice (cross-referenced by numbers after '-' in barcode)"
+                              title="Part 'No' on the delivery docket / invoice"
                               className="w-full h-7 px-1.5 text-center font-mono text-xs font-bold text-[#059669] bg-emerald-50/70 border border-emerald-200 hover:border-emerald-400 focus:border-[#059669] rounded-[3px] outline-none"
                             />
                           </div>
@@ -454,6 +865,19 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                               handleItemChange(originalIdx, 'description', e.target.value)
                             }
                             className="w-full h-7 px-2 text-xs text-zinc-800 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                          />
+                        </td>
+
+                        {/* Revision (Rev) */}
+                        <td className="py-1.5 px-2 text-center">
+                          <input
+                            type="text"
+                            value={item.rev || ''}
+                            placeholder="—"
+                            onChange={(e) =>
+                              handleItemChange(originalIdx, 'rev', e.target.value)
+                            }
+                            className="w-full h-7 px-1.5 text-center font-mono text-xs uppercase text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
                           />
                         </td>
 
@@ -501,7 +925,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                           <input
                             type="number"
                             min="1"
-                            max="9999"
+                            max="99999"
                             value={item.quantity}
                             onChange={(e) =>
                               handleItemChange(
@@ -526,10 +950,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                           />
                         </td>
 
-                        {/* Delete action */}
+                        {/* Delete action with confirmation */}
                         <td className="py-1.5 px-2 text-center">
                           <button
-                            onClick={() => handleRemoveItem(originalIdx)}
+                            type="button"
+                            onClick={() => setPendingDeleteIdx(originalIdx)}
                             className="p-1 text-zinc-300 hover:text-red-600 transition-colors cursor-pointer"
                             title="Delete part row"
                           >
@@ -545,17 +970,18 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               {filteredItems.length === 0 && (
                 <div className="py-12 px-4 text-center text-xs text-zinc-500">
                   <p className="font-semibold text-[#18181B] mb-1">
-                    No individual parts detected on this page
+                    No individual parts in this view
                   </p>
                   <p className="text-[11px] text-zinc-400 mb-3">
-                    Click &quot;Add part&quot; above to add parts manually or re-photograph the parts table section of the docket clearly.
+                    Click &quot;+ Add Part&quot; above to add parts manually or re-run OCR extraction.
                   </p>
                   <button
-                    onClick={handleAddItem}
-                    className="h-8 px-3 bg-[#18181B] text-white rounded-[4px] font-medium text-xs inline-flex items-center gap-1 cursor-pointer"
+                    type="button"
+                    onClick={handleOpenAddPartModal}
+                    className="h-8 px-3 bg-[#059669] text-white rounded-[4px] font-bold text-xs inline-flex items-center gap-1 cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>Add Part Row</span>
+                    <span>+ Add Part</span>
                   </button>
                 </div>
               )}
@@ -620,10 +1046,12 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         {/* Footer Confirmation Bar */}
         <div className="px-4 py-3 bg-white border-t border-[#E4E3DE] flex items-center justify-between gap-3 shrink-0">
           <div className="text-xs text-zinc-500 font-mono">
-            <span>{items.length} part lines</span>
+            <span>
+              <strong className="text-[#18181B]">{items.length}</strong> part rows
+            </span>
             <span className="mx-1.5 text-zinc-300">·</span>
-            <span className="font-semibold text-[#18181B]">
-              {expandQuantities ? totalExpandedParts : items.length} parts in compiled checklist
+            <span className="font-semibold text-[#059669]">
+              {totalExpandedParts} total quantities
             </span>
           </div>
 
@@ -642,7 +1070,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
             >
               <Check className="w-3.5 h-3.5 stroke-[2.5]" />
               <span>
-                Confirm &amp; Open Scanner ({expandQuantities ? totalExpandedParts : items.length} Parts)
+                Save &amp; Open Scanner ({expandQuantities ? totalExpandedParts : items.length} Parts)
               </span>
             </button>
           </div>

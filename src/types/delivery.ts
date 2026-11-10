@@ -24,7 +24,34 @@ export type ScanStatusType =
   | 'duplicate_warning'
   | 'unexpected_warning'
   | 'manual_ticked'
-  | 'undo_performed';
+  | 'undo_performed'
+  | 'part_added'
+  | 'part_edited'
+  | 'part_deleted';
+
+export interface OriginalOcrPartSnapshot {
+  partNumber: string;
+  itemNumber?: string;
+  description: string;
+  revision?: string;
+  quantity: number;
+  material?: string;
+  thickness?: string;
+  capturedAt?: string;
+}
+
+export interface PartEditAuditEntry {
+  id?: string;
+  action: 'added' | 'edited' | 'deleted';
+  partId?: string;
+  partNumber?: string;
+  editedBy: string;
+  editedByRole?: string;
+  timestamp: string;
+  summary: string;
+  previousValues?: Record<string, any>;
+  newValues?: Record<string, any>;
+}
 
 export interface DeliveryPart {
   id: string; // Unique per physical piece / trackable unit
@@ -32,6 +59,7 @@ export interface DeliveryPart {
   partNumber: string; // Matched by QR Code (GCI) or OCR Label Scanner
   itemNumber: string; // Matched by Barcode ######-No (Laser Central)
   description: string;
+  revision?: string; // Drawing / engineering revision (e.g. Rev A, 01)
   material?: string;
   thickness?: string;
   dimensions?: string;
@@ -47,6 +75,11 @@ export interface DeliveryPart {
   notes?: string;
   flaggedForReview?: boolean;
   ocrConfidence?: 'high' | 'medium' | 'low';
+  manuallyEdited?: boolean;
+  lastEditedBy?: string;
+  lastEditedAt?: string;
+  originalOcrValues?: OriginalOcrPartSnapshot;
+  editHistory?: PartEditAuditEntry[];
 }
 
 export interface PendingQuantityConfirmation {
@@ -84,6 +117,9 @@ export interface ScanEvent {
   previousReceivedQuantity?: number; // Quantity before this scan (for accurate undo)
   previousStatus?: PartStatus; // Part status before this scan (for accurate undo)
   rawOcrText?: string; // Raw OCR text captured from the pallet label for troubleshooting
+  employeeName?: string;
+  employeeRole?: string;
+  eventAction?: string;
   message: string;
 }
 

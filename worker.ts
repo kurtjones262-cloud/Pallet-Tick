@@ -1,9 +1,10 @@
 /**
- * Cloudflare Worker: PalletTick Serverless API
+ * Cloudflare Worker: PalletTrack Serverless API
  *
- * Secure server-side endpoint for Gemini multimodal delivery docket & invoice extraction.
- * Reads the secret GEMINI_API_KEY from the Cloudflare Worker environment.
- * Never exposes the API key to frontend code, browser storage, or network responses.
+ * Secure server-side endpoint for Gemini multimodal delivery docket & invoice extraction
+ * and Cloudflare D1 multi-user database operations.
+ * Includes automatic retry handling (HTTP 503, 429, 5xx) with exponential backoff + jitter,
+ * configurable secondary Gemini model failover, output validation, and safe operational logging.
  */
 
 import { D1Database } from './src/server/db/types.ts';
@@ -11,14 +12,90 @@ import { handlePalletTrackApiRequest } from './src/server/api/palletTrackApiRout
 
 export interface Env {
   GEMINI_API_KEY?: string;
+  GEMINI_PRIMARY_MODEL?: string;
+  GEMINI_FALLBACK_MODEL?: string;
+  GEMINI_FALLBACK_MODELS?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
   DB?: D1Database;
   [key: string]: unknown;
 }
 
+const DEFAULT_PRIMARY_MODEL = 'gemini-3.8-flash';
+const DEFAULT_FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+const MAX_AUTOMATIC_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 2000;
 
-const PRIMARY_MODEL = 'gemini-3.8-flash';
-const FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeExponentialBackoffWithJitter(retryAttempt: number, baseMs: number = INITIAL_BACKOFF_MS): number {
+  const exp = Math.max(0, retryAttempt - 1);
+  return Math.min(20000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 650));
+}
+
+function logWorkerOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta: Record<string, unknown> = {}) {
+  const safe: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    safe[k] = typeof v === 'string' ? v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300) : v;
+  }
+  const msg = JSON.stringify({ timestamp: new Date().toISOString(), component: 'PalletTrack-Worker-OCR', event, ...safe });
+  if (level === 'error') console.error(msg);
+  else if (level === 'warn') console.warn(msg);
+  else console.log(msg);
+}
+
+function resolveWorkerModels(env: Env): { primaryModel: string; fallbackModels: string[] } {
+  const primaryModel =
+    (typeof env.GEMINI_PRIMARY_MODEL === 'string' && env.GEMINI_PRIMARY_MODEL.trim()) ||
+    DEFAULT_PRIMARY_MODEL;
+  const rawFallbacks =
+    (typeof env.GEMINI_FALLBACK_MODEL === 'string' && env.GEMINI_FALLBACK_MODEL.trim()) ||
+    (typeof env.GEMINI_FALLBACK_MODELS === 'string' && env.GEMINI_FALLBACK_MODELS.trim()) ||
+    DEFAULT_FALLBACK_MODELS.join(',');
+  const fallbackModels = rawFallbacks
+    .split(',')
+    .map((m) => m.trim())
+    .filter((m) => Boolean(m) && m !== primaryModel);
+  return {
+    primaryModel,
+    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_MODELS],
+  };
+}
+
+function validateOcrPayload(rawText: string): any {
+  const trimmed = (rawText || '').trim();
+  if (!trimmed) {
+    throw new Error('Malformed OCR response: empty body.');
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e: any) {
+    throw new Error(`Malformed OCR JSON response: ${e?.message || 'parse error'}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
+    throw new Error('Incomplete OCR response: missing items array.');
+  }
+  for (let i = 0; i < parsed.items.length; i++) {
+    const it = parsed.items[i];
+    if (!it || typeof it !== 'object') {
+      throw new Error(`Malformed OCR item at index ${i}.`);
+    }
+    const hasPartOrDesc =
+      (typeof it.part === 'string' && it.part.trim().length > 0) ||
+      (typeof it.desc === 'string' && it.desc.trim().length > 0);
+    if (!hasPartOrDesc) {
+      throw new Error(`Incomplete OCR item at index ${i}: missing part and description.`);
+    }
+    const q = Number(it.qty);
+    if (Number.isNaN(q) || q < 0) {
+      throw new Error(`Invalid OCR item quantity at index ${i}.`);
+    }
+  }
+  return parsed;
+}
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -47,7 +124,7 @@ function parseCleanRowNo(raw: unknown): string {
   return '';
 }
 
-async function callGeminiRest(
+async function callGeminiRestSingleAttempt(
   apiKey: string,
   model: string,
   systemInstruction: string,
@@ -79,20 +156,118 @@ async function callGeminiRest(
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Gemini API error (${response.status}): ${errText}`);
+    const err: any = new Error(`Gemini API error (${response.status}): ${errText.slice(0, 260)}`);
+    err.status = response.status;
+    throw err;
   }
 
   const result: any = await response.json();
   const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
-    throw new Error('Empty response received from Gemini AI model.');
+    throw new Error('Malformed OCR response: Empty response received from Gemini AI model.');
   }
   return text;
 }
 
+async function callGeminiRestWithRetryAndFallback(
+  apiKey: string,
+  env: Env,
+  systemInstruction: string,
+  parts: Array<Record<string, unknown>>,
+  responseSchema: Record<string, unknown>
+): Promise<{ parsed: any; modelUsed: string; fallbackUsed: boolean; retryAttempts: number }> {
+  const { primaryModel, fallbackModels } = resolveWorkerModels(env);
+  const candidateModels = [primaryModel, ...fallbackModels];
+
+  let totalRetryAttempts = 0;
+  let lastError: any = null;
+
+  for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
+    const model = candidateModels[mIdx];
+    const isFallback = mIdx > 0;
+    const maxRetries = isFallback ? 2 : MAX_AUTOMATIC_RETRIES;
+
+    logWorkerOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
+      model,
+      isFallback,
+    });
+
+    for (let retry = 0; retry <= maxRetries; retry++) {
+      try {
+        const rawJsonText = await callGeminiRestSingleAttempt(
+          apiKey,
+          model,
+          systemInstruction,
+          parts,
+          responseSchema
+        );
+        const parsed = validateOcrPayload(rawJsonText);
+        logWorkerOcrEvent('info', 'extraction_succeeded', {
+          model,
+          isFallback,
+          retryAttempts: totalRetryAttempts,
+          statusCode: 200,
+          itemsExtracted: parsed.items.length,
+        });
+        return {
+          parsed,
+          modelUsed: model,
+          fallbackUsed: isFallback,
+          retryAttempts: totalRetryAttempts,
+        };
+      } catch (err: any) {
+        lastError = err;
+        const status = Number(err?.status || 500);
+        const msg = String(err?.message || '');
+        const isRetryable =
+          status === 503 ||
+          status === 429 ||
+          status >= 500 ||
+          /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|Malformed|Incomplete OCR/i.test(msg);
+
+        logWorkerOcrEvent('warn', 'extraction_attempt_failed', {
+          model,
+          isFallback,
+          attempt: retry + 1,
+          maxAttempts: maxRetries + 1,
+          statusCode: status,
+          isRetryable,
+          reason: msg.slice(0, 220),
+        });
+
+        if (!isRetryable && (status === 400 || status === 401 || status === 403)) {
+          break;
+        }
+
+        if (retry < maxRetries) {
+          totalRetryAttempts++;
+          const waitMs = computeExponentialBackoffWithJitter(retry + 1, INITIAL_BACKOFF_MS);
+          logWorkerOcrEvent('info', 'retrying_after_backoff', {
+            model,
+            retryAttempt: retry + 1,
+            maxRetries,
+            waitMs,
+            statusCode: status,
+          });
+          await sleep(waitMs);
+        }
+      }
+    }
+  }
+
+  logWorkerOcrEvent('error', 'all_models_and_retries_exhausted', {
+    primaryModel,
+    fallbackModels: fallbackModels.join(','),
+    totalRetryAttempts,
+    error: String(lastError?.message || 'Unknown error').slice(0, 220),
+  });
+
+  throw lastError || new Error('Gemini AI could not process the docket after automatic retries and model fallback.');
+}
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
@@ -164,7 +339,7 @@ Transcribe EVERY physical part row literally visible across the document into th
   const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in the table.
 Rules:
 1. Extract every numbered part row from top to bottom.
-2. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
+2. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
 3. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
 
   parts.push({ text: promptText });
@@ -187,6 +362,7 @@ Rules:
             no: { type: 'STRING' },
             part: { type: 'STRING' },
             desc: { type: 'STRING' },
+            rev: { type: 'STRING' },
             mat: { type: 'STRING' },
             thk: { type: 'STRING' },
             dim: { type: 'STRING' },
@@ -200,45 +376,48 @@ Rules:
     required: ['items'],
   };
 
-  let rawJsonText = '';
-  let lastError: unknown = null;
-  let modelUsed: string = PRIMARY_MODEL;
+  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await callGeminiRestWithRetryAndFallback(
+    apiKey,
+    env,
+    systemInstruction,
+    parts,
+    responseSchema
+  );
 
-  for (const model of [PRIMARY_MODEL, ...FALLBACK_MODELS]) {
-    try {
-      rawJsonText = await callGeminiRest(apiKey, model, systemInstruction, parts, responseSchema);
-      if (rawJsonText) {
-        modelUsed = model;
-        break;
-      }
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  if (!rawJsonText) {
-    throw lastError || new Error('Could not extract parts from docket images.');
-  }
-
-  const parsed = JSON.parse(rawJsonText);
   const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
 
   const items = rawItems.map((it: any, idx: number) => {
     const cleanNo = parseCleanRowNo(it.no) || String(idx + 1);
     const rawQty = Number(it.qty);
     const qty = !Number.isNaN(rawQty) && rawQty >= 1 ? Math.round(rawQty) : 1;
+    const partNumber = String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase();
+    const description = String(it.desc || it.part || '').trim();
+    const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
+    const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
+    const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+
     return {
-      partNumber: String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase(),
+      partNumber,
       itemNumber: cleanNo,
-      description: String(it.desc || it.part || '').trim(),
-      material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined,
-      thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined,
+      description,
+      revision,
+      material,
+      thickness,
       dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
       weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
       quantity: qty,
       palletNumber: 'Pallet 1',
       pageNumber: Number(it.page) || 1,
       confidence: 'high',
+      originalOcrValues: {
+        partNumber,
+        itemNumber: cleanNo,
+        description,
+        revision,
+        quantity: qty,
+        material,
+        thickness,
+      },
     };
   });
 
@@ -254,6 +433,8 @@ Rules:
     needsManualReview: items.length === 0,
     extractionMethod: 'ai-vision',
     aiModelUsed: modelUsed,
+    fallbackUsed,
+    retryAttempts,
     pagesScanned: totalPages,
   };
 
@@ -302,6 +483,7 @@ async function handleRecoverDocketItems(request: Request, env: Env): Promise<Res
             no: { type: 'STRING' },
             part: { type: 'STRING' },
             desc: { type: 'STRING' },
+            rev: { type: 'STRING' },
             mat: { type: 'STRING' },
             thk: { type: 'STRING' },
             dim: { type: 'STRING' },
@@ -316,35 +498,20 @@ async function handleRecoverDocketItems(request: Request, env: Env): Promise<Res
   };
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${PRIMARY_MODEL}:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema,
-        },
-      }),
-    });
-
-    if (!res.ok) {
-      return new Response(JSON.stringify({ items: [] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
-      });
-    }
-
-    const resJson: any = await res.json();
-    const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
-    const parsed = JSON.parse(rawText || '{}');
+    const { parsed } = await callGeminiRestWithRetryAndFallback(
+      apiKey,
+      env,
+      'You are a precision industrial docket row recovery engine.',
+      parts,
+      responseSchema
+    );
     const rawItems: any[] = Array.isArray(parsed?.items) ? parsed.items : [];
 
     const items = rawItems.map((it: any) => ({
       partNumber: String(it.part || 'PART').trim().toUpperCase(),
       itemNumber: String(it.no || '').trim(),
       description: String(it.desc || it.part || '').trim(),
+      revision: it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined,
       material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined,
       thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined,
       dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
@@ -422,22 +589,31 @@ export default {
       if (apiResponse) return apiResponse;
     }
 
-
     if (url.pathname === '/api/extract-docket' && request.method === 'POST') {
       try {
         return await handleExtractDocket(request, env);
       } catch (err: any) {
         const rawMsg = err?.message || String(err || '');
         const isMissingKey = rawMsg.includes('GEMINI_API_KEY') || rawMsg.includes('API key');
+        const isHighDemand = /503|UNAVAILABLE|high demand|overloaded/i.test(rawMsg);
+        const isRateLimit = /429|RESOURCE_EXHAUSTED|rate limit/i.test(rawMsg);
         return new Response(
           JSON.stringify({
             error: isMissingKey
               ? 'Gemini AI API key is not configured in the Cloudflare Worker. Please set the GEMINI_API_KEY secret.'
+              : isHighDemand
+              ? 'Gemini AI is currently experiencing high demand (HTTP 503) after automatic retries and model fallback. Your uploaded docket has been preserved — please click "Retry Extraction".'
               : rawMsg || 'Gemini AI invoice extraction failed.',
-            code: isMissingKey ? 'MISSING_GEMINI_API_KEY' : 'AI_EXTRACTION_FAILED',
+            code: isMissingKey
+              ? 'MISSING_GEMINI_API_KEY'
+              : isHighDemand
+              ? 'GEMINI_HIGH_DEMAND_503'
+              : isRateLimit
+              ? 'GEMINI_RATE_LIMIT_429'
+              : 'AI_EXTRACTION_FAILED',
           }),
           {
-            status: isMissingKey ? 503 : 500,
+            status: isMissingKey || isHighDemand ? 503 : isRateLimit ? 429 : 500,
             headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
           }
         );
@@ -454,7 +630,6 @@ export default {
       if (assetRes.status !== 404) {
         return assetRes;
       }
-      // For any non-API 404 route in GET / HEAD, fall back to index.html for SPA client routing
       if (request.method === 'GET' || request.method === 'HEAD') {
         const indexUrl = new URL('/', request.url);
         return env.ASSETS.fetch(new Request(indexUrl.toString(), request));

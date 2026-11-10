@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS delivery_parts (
   item_number TEXT NOT NULL,
   docket_line_index INTEGER NOT NULL DEFAULT 1,
   description TEXT NOT NULL,
+  revision TEXT,
   required_quantity INTEGER NOT NULL DEFAULT 1 CHECK (required_quantity >= 0),
   received_quantity INTEGER NOT NULL DEFAULT 0 CHECK (received_quantity >= 0),
   verification_status TEXT NOT NULL DEFAULT 'unscanned' CHECK (verification_status IN ('unscanned', 'verified', 'quantity_mismatch')),
@@ -75,6 +76,10 @@ CREATE TABLE IF NOT EXISTS delivery_parts (
   notes TEXT,
   flagged_for_review INTEGER NOT NULL DEFAULT 0 CHECK (flagged_for_review IN (0, 1)),
   ocr_confidence TEXT,
+  manually_edited INTEGER NOT NULL DEFAULT 0,
+  original_ocr_values TEXT,
+  last_edited_by TEXT,
+  last_edited_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

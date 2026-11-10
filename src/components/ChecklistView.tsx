@@ -8,12 +8,17 @@ import {
   Printer,
   RotateCcw,
   AlertTriangle,
+  Edit3,
+  Trash2,
+  FileSpreadsheet,
+  History,
 } from 'lucide-react';
 import { Delivery, DeliveryPart } from '../types/delivery';
 import { setPartStatus, getPartVerificationState } from '../utils/storage';
 import { exportDeliveryPdf } from '../utils/pdfExport';
 import { playAudio, triggerHaptic } from '../utils/audioFeedback';
 import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
+import { PartsListEditorModal, PartsEditorMode } from './PartsListEditorModal';
 
 interface ChecklistViewProps {
   delivery: Delivery | null;
@@ -35,6 +40,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   const [palletFilter, setPalletFilter] = useState<string>(initialPalletFilter || 'all');
   const [selectedPart, setSelectedPart] = useState<DeliveryPart | null>(null);
   const [detailQtyInput, setDetailQtyInput] = useState<string>('1');
+  const [editorMode, setEditorMode] = useState<PartsEditorMode | null>(null);
 
   useEffect(() => {
     if (initialPalletFilter) {
@@ -67,7 +73,6 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
 
   // Filtered & searched parts using Smart Substring & Keyword Search
   const filteredParts = useMemo(() => {
-    // 1. Base filter by status & pallet selection
     const baseParts = parts.filter((part) => {
       if (statusFilter === 'outstanding' && part.status !== 'outstanding') return false;
       if (statusFilter === 'received' && part.status !== 'received') return false;
@@ -85,6 +90,10 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   }, [parts, statusFilter, palletFilter, searchQuery, delivery?.docketNumber, delivery?.supplier]);
 
   const totalCount = parts.length;
+  const totalQuantityPieces = useMemo(
+    () => parts.reduce((sum, p) => sum + Math.max(1, p.quantity ?? 1), 0),
+    [parts]
+  );
   const receivedCount = parts.filter((p) => p.status === 'received').length;
   const outstandingCount = totalCount - receivedCount;
   const unexpectedCount = unexpectedParts.length;
@@ -98,8 +107,6 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
     e.stopPropagation();
     if (!delivery) return;
 
-    // If clicking quick-checkbox on a part with required quantity > 1 without an explicit status/qty,
-    // open the detail modal so the user can enter or edit the actual quantity!
     const reqQty = Math.max(1, part.quantity ?? 1);
     if (reqQty > 1 && customQty === undefined && !forceStatus) {
       setSelectedPart(part);
@@ -168,7 +175,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder='Search by last 4 digits (e.g. 2048), part #, keyword...'
+              placeholder="Search by last 4 digits (e.g. 2048), part #, keyword..."
               className="w-full h-8 pl-8 pr-7 bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[4px] text-[#18181B] placeholder:text-zinc-400 text-xs outline-none transition-colors"
             />
             {searchQuery && (
@@ -202,12 +209,46 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
           <button
             type="button"
             onClick={() => exportDeliveryPdf(delivery)}
-            className="h-8 px-2.5 bg-[#059669] hover:bg-[#047857] text-white rounded-[4px] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors shrink-0 shadow-2xs"
+            className="h-8 px-2.5 bg-white hover:bg-zinc-50 border border-[#E4E3DE] text-[#18181B] rounded-[4px] text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors shrink-0 shadow-2xs"
             title="Export colour-coded PDF"
           >
-            <Printer className="w-3.5 h-3.5" />
-            <span>Export PDF</span>
+            <Printer className="w-3.5 h-3.5 text-[#059669]" />
+            <span className="hidden sm:inline">Export PDF</span>
           </button>
+        </div>
+
+        {/* Row 1.5: Parts List Summary & Manual Editing Actions (+ Add Part / Edit Parts List) */}
+        <div className="px-4 pb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-1.5 font-mono text-[11px] text-zinc-600">
+            <span>
+              <strong className="text-[#18181B]">{totalCount}</strong> Part Rows
+            </span>
+            <span className="text-zinc-300">·</span>
+            <span>
+              <strong className="text-[#059669]">{totalQuantityPieces}</strong> Total Qty
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setEditorMode({ type: 'add' })}
+              className="h-7 px-2.5 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs inline-flex items-center gap-1 cursor-pointer shadow-2xs transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+              <span>+ Add Part</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setEditorMode({ type: 'bulk-edit' })}
+              className="h-7 px-2.5 rounded-[4px] bg-white hover:bg-zinc-50 border border-[#E4E3DE] text-[#18181B] font-medium text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+              title="Edit multiple part rows at once"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-zinc-600" />
+              <span>Edit Parts List</span>
+            </button>
+          </div>
         </div>
 
         {/* Row 2: Minimalist Underline Filter Tabs */}
@@ -318,7 +359,7 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                 <div
                   key={part.id}
                   onClick={() => setSelectedPart(part)}
-                  className={`px-4 py-2 flex items-center gap-3 transition-colors cursor-pointer ${
+                  className={`px-4 py-2 flex items-center gap-2.5 transition-colors cursor-pointer ${
                     isMismatch
                       ? 'bg-amber-50/60 hover:bg-amber-50'
                       : isReceived
@@ -376,6 +417,11 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                           highlightClassName="bg-amber-200 text-amber-950 font-bold px-0.5 rounded"
                         />
                       </span>
+                      {part.revision && (
+                        <span className="px-1.5 py-0.2 rounded-[2px] font-mono text-[10px] font-bold bg-zinc-100 text-zinc-700 border border-zinc-300">
+                          Rev {part.revision}
+                        </span>
+                      )}
                       <span
                         className={`px-1.5 py-0.2 rounded-[2px] font-mono text-[10px] font-semibold ${
                           isMismatch
@@ -392,6 +438,18 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                       {(part.material || part.thickness || part.dimensions) && (
                         <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-[2px] bg-[#F6F5F2] border border-[#E4E3DE] text-zinc-600 truncate">
                           {[part.thickness, part.material, part.dimensions].filter(Boolean).join(' · ')}
+                        </span>
+                      )}
+                      {part.manuallyEdited && (
+                        <span
+                          className="font-mono text-[9px] px-1.5 py-0.2 rounded-[2px] bg-blue-50 text-blue-700 border border-blue-200"
+                          title={
+                            part.originalOcrValues
+                              ? `Edited by ${part.lastEditedBy || 'Operator'} · Original OCR: ${part.originalOcrValues.partNumber} (Qty ${part.originalOcrValues.quantity})`
+                              : `Manually added/edited by ${part.lastEditedBy || 'Operator'}`
+                          }
+                        >
+                          Edited
                         </span>
                       )}
                     </div>
@@ -423,18 +481,46 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                     </div>
                   </div>
 
-                  {/* Compact Unboxed Status */}
-                  <div className="shrink-0 text-right font-mono text-[11px]">
-                    {isMismatch ? (
-                      <span className="text-amber-600 font-semibold flex items-center gap-1">
-                        <AlertTriangle className="w-3 h-3" />
-                        <span>Mismatch ({vState.receivedQty}/{vState.requiredQty})</span>
-                      </span>
-                    ) : isReceived ? (
-                      <span className="text-[#059669] font-medium">Verified</span>
-                    ) : (
-                      <span className="text-red-600/80">Not Scanned</span>
-                    )}
+                  {/* Compact Unboxed Status + Quick Edit & Delete Icons */}
+                  <div className="shrink-0 flex items-center gap-1.5">
+                    <div className="text-right font-mono text-[11px] mr-1">
+                      {isMismatch ? (
+                        <span className="text-amber-600 font-semibold flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>Mismatch ({vState.receivedQty}/{vState.requiredQty})</span>
+                        </span>
+                      ) : isReceived ? (
+                        <span className="text-[#059669] font-medium">Verified</span>
+                      ) : (
+                        <span className="text-red-600/80">Not Scanned</span>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditorMode({ type: 'edit-single', part });
+                      }}
+                      className="p-1.5 rounded text-zinc-400 hover:text-[#18181B] hover:bg-zinc-100 transition-colors cursor-pointer"
+                      title={`Edit part ${part.partNumber}`}
+                      aria-label={`Edit part ${part.partNumber}`}
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditorMode({ type: 'delete-confirm', part });
+                      }}
+                      className="p-1.5 rounded text-zinc-400 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                      title={`Delete part ${part.partNumber}`}
+                      aria-label={`Delete part ${part.partNumber}`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </div>
               );
@@ -455,20 +541,53 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
           >
             <div className="flex items-start justify-between gap-3 pb-3 border-b border-[#E4E3DE]">
               <div>
-                <span className="font-mono text-base font-bold text-[#18181B] block">
-                  {selectedPart.partNumber}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-base font-bold text-[#18181B]">
+                    {selectedPart.partNumber}
+                  </span>
+                  {selectedPart.revision && (
+                    <span className="px-1.5 py-0.5 rounded bg-zinc-200 font-mono text-[10px] font-bold text-zinc-800">
+                      Rev {selectedPart.revision}
+                    </span>
+                  )}
+                </div>
                 <span className="font-mono text-xs text-zinc-500">
                   Docket No. {selectedPart.itemNumber} · Required Qty:{' '}
                   {Math.max(1, selectedPart.quantity ?? 1)}
                 </span>
               </div>
-              <button
-                onClick={() => setSelectedPart(null)}
-                className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = selectedPart;
+                    setSelectedPart(null);
+                    setEditorMode({ type: 'edit-single', part: target });
+                  }}
+                  className="p-1.5 text-zinc-500 hover:text-[#18181B] hover:bg-zinc-200/60 rounded cursor-pointer"
+                  title="Edit part details"
+                >
+                  <Edit3 className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = selectedPart;
+                    setSelectedPart(null);
+                    setEditorMode({ type: 'delete-confirm', part: target });
+                  }}
+                  className="p-1.5 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded cursor-pointer"
+                  title="Delete part from docket"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => setSelectedPart(null)}
+                  className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
 
             <div className="py-3 space-y-2 text-xs border-b border-[#E4E3DE]">
@@ -476,6 +595,12 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                 <span className="text-zinc-500 shrink-0">Description</span>
                 <span className="font-medium text-[#18181B] text-right">
                   {selectedPart.description}
+                </span>
+              </div>
+              <div className="flex justify-between py-1">
+                <span className="text-zinc-500">Revision</span>
+                <span className="font-mono text-[#18181B]">
+                  {selectedPart.revision || '—'}
                 </span>
               </div>
               <div className="flex justify-between py-1">
@@ -528,6 +653,21 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                     : 'Not Scanned'}
                 </span>
               </div>
+
+              {selectedPart.manuallyEdited && (
+                <div className="p-2 rounded bg-blue-50/70 border border-blue-200 text-[11px] text-blue-900 space-y-0.5">
+                  <div className="flex items-center gap-1 font-semibold">
+                    <History className="w-3 h-3" />
+                    <span>Manually Edited by {selectedPart.lastEditedBy || 'Operator'}</span>
+                  </div>
+                  {selectedPart.originalOcrValues && (
+                    <div className="font-mono text-[10px] text-blue-800">
+                      Original OCR: {selectedPart.originalOcrValues.partNumber} · Qty{' '}
+                      {selectedPart.originalOcrValues.quantity}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {Math.max(1, selectedPart.quantity ?? 1) > 1 && (
                 <div className="pt-2.5 border-t border-[#E4E3DE]">
@@ -624,6 +764,18 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Parts List Editor Modal (Add Part, Edit Single Part, Delete Confirmation, or Bulk Edit) */}
+      {editorMode && (
+        <PartsListEditorModal
+          delivery={delivery}
+          mode={editorMode}
+          onClose={() => setEditorMode(null)}
+          onDeliveryUpdated={(updated) => {
+            onUpdateDelivery(updated);
+          }}
+        />
       )}
     </div>
   );

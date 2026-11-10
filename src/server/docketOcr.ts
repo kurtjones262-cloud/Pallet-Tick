@@ -1,12 +1,18 @@
 /**
- * Data contracts for extracted delivery docket & invoice items.
- * Supports both Gemini AI Vision Extraction (when online) and 100% Offline On-Device Tesseract OCR.
+ * Data contracts and resilient Gemini AI Vision extraction engine for delivery dockets & invoices.
+ * Includes:
+ * - Automatic exponential backoff with jitter (starting at ~2s, max 3 retries) for HTTP 503, 429, and 5xx errors
+ * - Configurable secondary Gemini model failover using identical instructions and responseSchema
+ * - Strict structural and item-level validation before accepting primary or fallback OCR results
+ * - Safe, structured operational logging (never logs API keys or document contents)
  */
 
 export interface ExtractedDocketItem {
   partNumber: string;
   itemNumber: string;
   description: string;
+  revision?: string;
+  rev?: string;
   material?: string;
   thickness?: string;
   dimensions?: string;
@@ -16,6 +22,19 @@ export interface ExtractedDocketItem {
   pageNumber?: number;
   confidence: 'high' | 'medium' | 'low';
   notes?: string;
+  manuallyEdited?: boolean;
+  lastEditedBy?: string;
+  lastEditedAt?: string;
+  originalOcrValues?: {
+    partNumber: string;
+    itemNumber?: string;
+    description: string;
+    revision?: string;
+    rev?: string;
+    quantity: number;
+    material?: string;
+    thickness?: string;
+  };
 }
 
 export interface PageSlicePayload {
@@ -39,17 +58,217 @@ export interface ExtractedDocketResult {
   needsManualReview: boolean;
   extractionMethod?: 'ai-vision' | 'offline-ocr' | 'pdf-text';
   aiModelUsed?: string;
+  fallbackUsed?: boolean;
+  retryAttempts?: number;
   pagesScanned?: number;
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: number;
   lastVisibleRowNo?: number;
 }
 
-const PRIMARY_VISION_MODEL = 'gemini-3.8-flash';
-const FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+
+export const MAX_AUTOMATIC_RETRIES = 3;
+export const INITIAL_BACKOFF_MS = 2000;
+
+/**
+ * Resolves the configured primary and fallback Gemini vision models from environment variables
+ * or falls back to verified supported defaults.
+ */
+export function resolveConfiguredVisionModels(envOverride?: Record<string, unknown>): {
+  primaryModel: string;
+  fallbackModels: string[];
+} {
+  const procEnv = typeof process !== 'undefined' && process.env ? process.env : {};
+  const rawPrimary =
+    (typeof envOverride?.GEMINI_PRIMARY_MODEL === 'string' && envOverride.GEMINI_PRIMARY_MODEL.trim()) ||
+    (typeof procEnv.GEMINI_PRIMARY_MODEL === 'string' && procEnv.GEMINI_PRIMARY_MODEL.trim()) ||
+    DEFAULT_PRIMARY_VISION_MODEL;
+
+  const rawFallbacks =
+    (typeof envOverride?.GEMINI_FALLBACK_MODEL === 'string' && envOverride.GEMINI_FALLBACK_MODEL.trim()) ||
+    (typeof envOverride?.GEMINI_FALLBACK_MODELS === 'string' && envOverride.GEMINI_FALLBACK_MODELS.trim()) ||
+    (typeof procEnv.GEMINI_FALLBACK_MODEL === 'string' && procEnv.GEMINI_FALLBACK_MODEL.trim()) ||
+    (typeof procEnv.GEMINI_FALLBACK_MODELS === 'string' && procEnv.GEMINI_FALLBACK_MODELS.trim()) ||
+    DEFAULT_FALLBACK_VISION_MODELS.join(',');
+
+  const fallbackModels = rawFallbacks
+    .split(',')
+    .map((m) => m.trim())
+    .filter((m) => Boolean(m) && m !== rawPrimary);
+
+  return {
+    primaryModel: rawPrimary,
+    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_VISION_MODELS],
+  };
+}
+
+/**
+ * Safe structured logger for OCR model selection, retries, status codes, and failures.
+ * Strictly strips any potential API key query strings and never logs document/image contents.
+ */
+export function logOcrEvent(
+  level: 'info' | 'warn' | 'error',
+  event: string,
+  meta: Record<string, unknown> = {}
+): void {
+  const sanitizedMeta: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (typeof v === 'string') {
+      sanitizedMeta[k] = v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300);
+    } else {
+      sanitizedMeta[k] = v;
+    }
+  }
+  const timestamp = new Date().toISOString();
+  const payload = JSON.stringify({ timestamp, component: 'PalletTrack-OCR', event, ...sanitizedMeta });
+  if (level === 'error') {
+    console.error(payload);
+  } else if (level === 'warn') {
+    console.warn(payload);
+  } else {
+    console.log(payload);
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Computes exponential backoff with random jitter starting around 2 seconds:
+ * Attempt 1 (first retry): ~2000ms + 0..600ms jitter
+ * Attempt 2 (second retry): ~4000ms + 0..600ms jitter
+ * Attempt 3 (third retry): ~8000ms + 0..600ms jitter
+ */
+export function computeExponentialBackoffWithJitter(
+  retryAttempt: number,
+  baseDelayMs: number = INITIAL_BACKOFF_MS
+): number {
+  const exponent = Math.max(0, retryAttempt - 1);
+  const exponentialDelay = baseDelayMs * Math.pow(2, exponent);
+  const jitter = Math.floor(Math.random() * 650);
+  return Math.min(20000, exponentialDelay + jitter);
+}
+
+/**
+ * Extracts HTTP status code and classifies whether an error is a retryable availability/rate-limit/5xx error.
+ */
+export function classifyGeminiError(err: any): {
+  statusCode: number;
+  isRetryableAvailabilityError: boolean;
+  isRateLimit: boolean;
+  isHighDemand503: boolean;
+  cleanMessage: string;
+} {
+  const rawMessage = String(err?.message || err || 'Unknown Gemini API error').replace(
+    /key=[A-Za-z0-9_\-]+/gi,
+    'key=[REDACTED]'
+  );
+
+  let statusCode = Number(err?.status || err?.statusCode || err?.httpStatus || 0);
+  if (!statusCode) {
+    const codeMatch =
+      rawMessage.match(/\b(429|500|502|503|504)\b/) ||
+      rawMessage.match(/"code"\s*:\s*(\d{3})/);
+    if (codeMatch) {
+      statusCode = parseInt(codeMatch[1], 10);
+    }
+  }
+
+  const isHighDemand503 =
+    statusCode === 503 ||
+    /503|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity/i.test(
+      rawMessage
+    );
+
+  const isRateLimit =
+    statusCode === 429 ||
+    /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
+
+  const isTemporary5xx =
+    statusCode === 500 ||
+    statusCode === 502 ||
+    statusCode === 504 ||
+    /500|502|504|INTERNAL|DEADLINE_EXCEEDED|bad gateway|gateway timeout|timed out|AbortError|fetch failed/i.test(
+      rawMessage
+    );
+
+  if (!statusCode) {
+    if (isHighDemand503) statusCode = 503;
+    else if (isRateLimit) statusCode = 429;
+    else if (isTemporary5xx) statusCode = 502;
+  }
+
+  return {
+    statusCode: statusCode || 500,
+    isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
+    isRateLimit,
+    isHighDemand503,
+    cleanMessage: rawMessage.slice(0, 260),
+  };
+}
+
+/**
+ * Validates raw JSON text returned by primary or fallback Gemini models before accepting it.
+ * Never silently accepts incomplete, truncated, or malformed OCR responses.
+ */
+export function validateAndParseOcrJsonResponse(
+  rawText: string,
+  mode: 'batch' | 'recovery' | 'label' = 'batch'
+): any {
+  const trimmed = (rawText || '').trim();
+  if (!trimmed) {
+    throw new Error('Malformed OCR response: Gemini returned an empty response body.');
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (parseErr: any) {
+    throw new Error(
+      `Malformed OCR JSON response: Could not parse JSON output (${parseErr?.message || 'syntax error'}).`
+    );
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Malformed OCR response: Root JSON value must be an object.');
+  }
+
+  if (mode === 'label') {
+    if (typeof parsed.detectedCode !== 'string') {
+      throw new Error('Malformed label OCR response: missing detectedCode string field.');
+    }
+    return parsed;
+  }
+
+  if (!Array.isArray(parsed.items)) {
+    throw new Error('Incomplete OCR response: Missing required "items" array in JSON output.');
+  }
+
+  // Validate each extracted row for structural completeness
+  for (let i = 0; i < parsed.items.length; i++) {
+    const row = parsed.items[i];
+    if (!row || typeof row !== 'object') {
+      throw new Error(`Malformed OCR item at index ${i}: item is not an object.`);
+    }
+    const hasPartOrDesc =
+      (typeof row.part === 'string' && row.part.trim().length > 0) ||
+      (typeof row.desc === 'string' && row.desc.trim().length > 0);
+    if (!hasPartOrDesc) {
+      throw new Error(
+        `Incomplete OCR item at index ${i}: both part number and description are empty.`
+      );
+    }
+    const qtyNum = Number(row.qty);
+    if (Number.isNaN(qtyNum) || qtyNum < 0) {
+      throw new Error(`Invalid OCR item quantity at index ${i}: qty="${String(row.qty)}".`);
+    }
+  }
+
+  return parsed;
 }
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
@@ -68,13 +287,11 @@ function parseCleanRowNo(raw: any): string {
   const str = String(raw ?? '').trim();
   if (!str) return '';
 
-  // Format "######-<No>" (e.g. "482910-14" or "123456-03")
   const dashMatch = str.match(/^\d{3,10}\s*[-–—]\s*0*(\d{1,4})$/);
   if (dashMatch) {
     return dashMatch[1];
   }
 
-  // Format "1", "03", "No. 14", "Item 5", "#12"
   const cleanCandidate = str
     .replace(/^(?:ITM|ITEM|LINE|POS|NO\.?|SR\.?\s*NO\.?|#)\s*[-:]?\s*/i, '')
     .replace(/^0+(?=\d)/, '')
@@ -95,6 +312,7 @@ interface RawBatchItem {
   no: string;
   part: string;
   desc: string;
+  rev?: string;
   mat?: string;
   thk?: string;
   dim?: string;
@@ -113,107 +331,176 @@ interface BatchExtractionResponse {
   firstVisibleRowNo?: string;
   lastVisibleRowNo?: string;
   items: RawBatchItem[];
+  modelUsed: string;
+  fallbackUsed: boolean;
+  retryAttempts: number;
 }
 
 /**
- * Executes a Gemini generateContent call with automatic 429 rate-limit handling and model failover.
- * - Avoids hitting the 15-RPM Free Tier limit by retrying smoothly if the per-minute bucket is full.
+ * Executes a Gemini generateContent call with:
+ * 1. Automatic retry handling for HTTP 503, 429, and temporary 5xx errors
+ * 2. Exponential backoff with jitter starting at ~2s, maximum of 3 automatic retries
+ * 3. Automatic failover to configurable secondary Gemini model(s) using identical instructions & schema
+ * 4. Strict validation of extracted JSON data before accepting results
+ * 5. Safe operational logging without exposing API keys or document contents
  */
-async function generateWithRateLimitProtection(
+async function generateWithRetryAndFallback(
   ai: any,
   ThinkingLevel: any,
   parts: any[],
   systemInstruction: string,
-  responseSchema: any
-): Promise<string> {
-  let lastError: any = null;
+  responseSchema: any,
+  mode: 'batch' | 'recovery' | 'label' = 'batch',
+  envOverride?: Record<string, unknown>
+): Promise<{
+  parsed: any;
+  modelUsed: string;
+  fallbackUsed: boolean;
+  retryAttempts: number;
+}> {
+  const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
+  const candidateModels = [primaryModel, ...fallbackModels];
 
-  for (let round = 1; round <= 4; round++) {
-    // Try primary fast model first
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 25000);
-    try {
-      const response = await ai.models.generateContent({
-        model: PRIMARY_VISION_MODEL,
-        contents: { parts },
-        config: {
+  let totalRetryAttempts = 0;
+  let lastError: any = null;
+  let lastStatusCode = 500;
+
+  for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
+    const currentModel = candidateModels[mIdx];
+    const isFallbackModel = mIdx > 0;
+    // Primary model gets initial attempt + up to 3 automatic retries (4 attempts total).
+    // Each fallback model gets initial attempt + up to 2 automatic retries.
+    const maxRetriesForModel = isFallbackModel ? 2 : MAX_AUTOMATIC_RETRIES;
+
+    logOcrEvent('info', isFallbackModel ? 'model_fallback_selected' : 'model_selected', {
+      model: currentModel,
+      isFallback: isFallbackModel,
+      mode,
+    });
+
+    for (let retry = 0; retry <= maxRetriesForModel; retry++) {
+      const controller = new AbortController();
+      const timeoutMs = isFallbackModel ? 22000 : 26000;
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const config: Record<string, unknown> = {
           systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
           responseMimeType: 'application/json',
           responseSchema,
           abortSignal: controller.signal,
-        },
-      });
-      clearTimeout(timer);
-      const text = (response.text ?? '').trim();
-      if (text) return text;
-    } catch (err: any) {
-      clearTimeout(timer);
-      lastError = err;
-      const errStr = String(err?.message || err || '');
-      const isRateLimit =
-        err?.status === 429 ||
-        errStr.includes('429') ||
-        errStr.includes('RESOURCE_EXHAUSTED') ||
-        errStr.includes('quota');
+        };
 
-      if (isRateLimit) {
-        // Quick check if a fallback model has available quota in its own per-model bucket
-        for (const fallbackModel of FALLBACK_VISION_MODELS) {
-          const fbController = new AbortController();
-          const fbTimer = setTimeout(() => fbController.abort(), 12000);
-          try {
-            const fbRes = await ai.models.generateContent({
-              model: fallbackModel,
-              contents: { parts },
-              config: {
-                systemInstruction,
-                responseMimeType: 'application/json',
-                responseSchema,
-                abortSignal: fbController.signal,
-              },
-            });
-            clearTimeout(fbTimer);
-            const fbText = (fbRes.text ?? '').trim();
-            if (fbText) return fbText;
-          } catch {
-            clearTimeout(fbTimer);
-          }
+        // Only attach ThinkingLevel.MEDIUM on Gemini 3.8 / 4 primary models
+        if (currentModel.includes('3.8') || currentModel.includes('argon')) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
         }
 
-        // Wait for the Free Tier 15-RPM sliding window to roll over before next round
-        if (round < 4) {
-          const delayMatch = errStr.match(/retryDelay"?\s*:\s*"?(\d+)s/i);
-          const suggestedSec = delayMatch ? parseInt(delayMatch[1], 10) : 0;
-          const waitMs =
-            suggestedSec > 0 && suggestedSec <= 25
-              ? (suggestedSec + 1) * 1000
-              : round * 6500;
+        const response = await ai.models.generateContent({
+          model: currentModel,
+          contents: { parts },
+          config,
+        });
+        clearTimeout(timer);
+
+        const rawText = (response.text ?? '').trim();
+        const validated = validateAndParseOcrJsonResponse(rawText, mode);
+
+        logOcrEvent('info', 'extraction_succeeded', {
+          model: currentModel,
+          isFallback: isFallbackModel,
+          retryAttempts: totalRetryAttempts,
+          statusCode: 200,
+          itemsExtracted: Array.isArray(validated?.items) ? validated.items.length : 1,
+        });
+
+        return {
+          parsed: validated,
+          modelUsed: currentModel,
+          fallbackUsed: isFallbackModel,
+          retryAttempts: totalRetryAttempts,
+        };
+      } catch (err: any) {
+        clearTimeout(timer);
+        lastError = err;
+        const classification = classifyGeminiError(err);
+        lastStatusCode = classification.statusCode;
+
+        const isValidationFailure = String(err?.message || '').includes('Malformed') ||
+          String(err?.message || '').includes('Incomplete OCR');
+
+        logOcrEvent('warn', 'extraction_attempt_failed', {
+          model: currentModel,
+          isFallback: isFallbackModel,
+          attempt: retry + 1,
+          maxAttemptsForModel: maxRetriesForModel + 1,
+          statusCode: classification.statusCode,
+          isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
+          reason: classification.cleanMessage,
+        });
+
+        // If it's a permanent client error (e.g. 400 Invalid API Key or 403 Permission Denied), do not retry same model
+        if (
+          !classification.isRetryableAvailabilityError &&
+          !isValidationFailure &&
+          (classification.statusCode === 400 || classification.statusCode === 401 || classification.statusCode === 403)
+        ) {
+          break;
+        }
+
+        if (retry < maxRetriesForModel) {
+          totalRetryAttempts++;
+          const waitMs = computeExponentialBackoffWithJitter(retry + 1, INITIAL_BACKOFF_MS);
+          logOcrEvent('info', 'retrying_after_backoff', {
+            model: currentModel,
+            retryAttempt: retry + 1,
+            maxRetries: maxRetriesForModel,
+            waitMs,
+            statusCode: classification.statusCode,
+          });
           await sleep(waitMs);
           continue;
         }
-      } else if (round < 3) {
-        await sleep(400 * round);
-        continue;
       }
     }
   }
 
-  const rawMsg = String(lastError?.message || lastError || '');
-  if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
-    throw new Error(
-      'Gemini AI Free Tier rate limit (15 requests/min) reached. Please wait 30 seconds and click "Retry with Gemini AI".'
+  logOcrEvent('error', 'all_models_and_retries_exhausted', {
+    primaryModel,
+    fallbackModels: fallbackModels.join(','),
+    totalRetryAttempts,
+    lastStatusCode,
+    error: String(lastError?.message || lastError || 'Unknown error').slice(0, 240),
+  });
+
+  const finalClassification = classifyGeminiError(lastError);
+  if (finalClassification.isHighDemand503) {
+    const busyErr: any = new Error(
+      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retries and fallback to ${fallbackModels[0] || 'secondary model'}. Your uploaded docket has been preserved — please click "Retry Extraction" in a moment.`
     );
+    busyErr.status = 503;
+    busyErr.code = 'GEMINI_HIGH_DEMAND_503';
+    throw busyErr;
   }
-  throw new Error(rawMsg || 'Gemini AI could not process the docket image.');
+
+  if (finalClassification.isRateLimit) {
+    const rateErr: any = new Error(
+      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retries. Your uploaded docket has been preserved — please wait a few seconds and click "Retry Extraction".`
+    );
+    rateErr.status = 429;
+    rateErr.code = 'GEMINI_RATE_LIMIT_429';
+    throw rateErr;
+  }
+
+  throw new Error(
+    finalClassification.cleanMessage ||
+      'Gemini AI could not extract the docket after automatic retries. Please click "Retry Extraction".'
+  );
 }
 
 /**
  * Extracts a batch of 1 or 2 pages in a SINGLE Gemini API call by passing each page's
  * high-resolution Upper (0%-58%) and Lower (42%-100%) slices as separate image parts in one call.
- *
- * This gives 2x vertical zoom resolution on every row while using only 1 API call per 1-2 pages
- * (staying far below the 15-RPM Free Tier limit even on 199-part dockets!).
  */
 async function extractPageBatchInOneCall(
   ai: any,
@@ -269,6 +556,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. Never restart numbering at "1" on the lower half or on subsequent pages if printed row numbers continue across the document.
    - part: The Part Number, Drawing Number, Mark, Code, or DXF/Profile Name written on the row. If the table only has ONE text column (e.g. "Description" or "Part / Description"), put the part code/name in 'part' and the full text in 'desc'. NEVER put the row number in 'part'.
    - desc: The full part description or name written on the row.
+   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "01", "Rev B"), else "".
    - mat: Material grade ONLY if written on the row, else "".
    - thk: Thickness ONLY if written on the row, else "".
    - dim: Dimensions/length/size ONLY if written on the row, else "".
@@ -306,6 +594,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             no: { type: Type.STRING, description: 'Exact printed row "No".' },
             part: { type: Type.STRING, description: 'Part Number, Drawing No, or Part Name.' },
             desc: { type: Type.STRING, description: 'Full part description.' },
+            rev: { type: Type.STRING, description: 'Part revision if present.' },
             mat: { type: Type.STRING },
             thk: { type: Type.STRING },
             dim: { type: Type.STRING },
@@ -313,7 +602,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             qty: { type: Type.NUMBER, description: 'Quantity of this part (never price).' },
           },
           required: ['no', 'part', 'desc', 'qty'],
-          propertyOrdering: ['page', 'no', 'part', 'desc', 'mat', 'thk', 'dim', 'wt', 'qty'],
+          propertyOrdering: ['page', 'no', 'part', 'desc', 'rev', 'mat', 'thk', 'dim', 'wt', 'qty'],
         },
       },
     },
@@ -334,15 +623,15 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
 
   parts.push({ text: promptText });
 
-  const text = await generateWithRateLimitProtection(
+  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await generateWithRetryAndFallback(
     ai,
     ThinkingLevel,
     parts,
     systemInstruction,
-    responseSchema
+    responseSchema,
+    'batch'
   );
 
-  const parsed = JSON.parse(text);
   return {
     docketNumber: parsed.docketNumber,
     supplier: parsed.supplier,
@@ -354,13 +643,14 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     firstVisibleRowNo: parsed.firstVisibleRowNo,
     lastVisibleRowNo: parsed.lastVisibleRowNo,
     items: Array.isArray(parsed.items) ? parsed.items : [],
+    modelUsed,
+    fallbackUsed,
+    retryAttempts,
   };
 }
 
 /**
- * Single-Call Global Missing Row Recovery:
- * Recovers all missing "No" numbers across one or more pages in ONE single Gemini API call
- * so we stay well within the 15-RPM Free Tier limit while achieving 100% row recall (e.g. 199/199).
+ * Single-Call Global Missing Row Recovery
  */
 async function recoverMissingRowsBatch(
   ai: any,
@@ -411,6 +701,7 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
             no: { type: Type.STRING, description: 'Exact printed row "No" from the missing list.' },
             part: { type: Type.STRING, description: 'Part Number, Drawing No, or Part Name.' },
             desc: { type: Type.STRING, description: 'Full part description.' },
+            rev: { type: Type.STRING },
             mat: { type: Type.STRING },
             thk: { type: Type.STRING },
             dim: { type: Type.STRING },
@@ -418,7 +709,7 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
             qty: { type: Type.NUMBER },
           },
           required: ['no', 'part', 'desc', 'qty'],
-          propertyOrdering: ['page', 'no', 'part', 'desc', 'mat', 'thk', 'dim', 'wt', 'qty'],
+          propertyOrdering: ['page', 'no', 'part', 'desc', 'rev', 'mat', 'thk', 'dim', 'wt', 'qty'],
         },
       },
     },
@@ -428,14 +719,14 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
   parts.push({ text: promptText });
 
   try {
-    const text = await generateWithRateLimitProtection(
+    const { parsed } = await generateWithRetryAndFallback(
       ai,
       ThinkingLevel,
       parts,
       systemInstruction,
-      responseSchema
+      responseSchema,
+      'recovery'
     );
-    const parsed = JSON.parse(text);
     return Array.isArray(parsed.items) ? parsed.items : [];
   } catch {
     return [];
@@ -493,29 +784,41 @@ function normalizeRawBatchItem(
   const resolvedPage =
     typeof it.page === 'number' && it.page >= 1 ? it.page : defaultPageNumber;
 
+  const cleanRev = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
+  const cleanMat = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
+  const cleanThk = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+
   return {
     cleanNo,
     item: {
       partNumber: cleanPn,
       itemNumber: cleanNo,
       description: String(desc || cleanPn).trim(),
-      material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined,
-      thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined,
+      revision: cleanRev,
+      material: cleanMat,
+      thickness: cleanThk,
       dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
       weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
       quantity: cleanQty,
       palletNumber: 'Pallet 1',
       pageNumber: resolvedPage,
       confidence: 'high',
+      originalOcrValues: {
+        partNumber: cleanPn,
+        itemNumber: cleanNo,
+        description: String(desc || cleanPn).trim(),
+        revision: cleanRev,
+        quantity: cleanQty,
+        material: cleanMat,
+        thickness: cleanThk,
+      },
     },
   };
 }
 
 /**
- * Extracts all individual parts across 1 or more pages using:
- * - 1 API call per page (passing both Upper 58% and Lower 58% high-res zoomed halves in that single call,
- *   or batching 2 pages per call when > 4 pages) so total API requests stay at 1-4 calls (never hitting 15 RPM!).
- * - Plus 1 single combined Gap-Recovery API call if any "No" between 1 and MaxNo (e.g. 1..199) was missed.
+ * Extracts all individual parts across 1 or more pages using Gemini AI Vision
+ * with exponential backoff, jitter, and configurable model failover.
  */
 export async function extractDocketWithGeminiVision(
   base64Images: string[],
@@ -525,7 +828,9 @@ export async function extractDocketWithGeminiVision(
 ): Promise<ExtractedDocketResult> {
   const apiKey = overrideApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.');
+    throw new Error(
+      'Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.'
+    );
   }
 
   const { GoogleGenAI, Type, ThinkingLevel } = await import('@google/genai');
@@ -547,7 +852,6 @@ export async function extractDocketWithGeminiVision(
 
   const totalPages = resolvedPayloads.length;
 
-  // Group pages into batches so we never exceed 4 API calls in Pass 1 even for 8-page dockets
   const pagesPerBatch = totalPages >= 5 ? 2 : 1;
   const batches: Array<Array<{ pageNumber: number; payload: PageSlicePayload }>> = [];
   for (let i = 0; i < totalPages; i += pagesPerBatch) {
@@ -558,7 +862,6 @@ export async function extractDocketWithGeminiVision(
     batches.push(chunk);
   }
 
-  // Run batches with max concurrency of 2 to avoid bursting the Free Tier rate limiter
   const batchResponses: BatchExtractionResponse[] = [];
   for (let i = 0; i < batches.length; i += 2) {
     const pair = batches.slice(i, i + 2);
@@ -568,7 +871,6 @@ export async function extractDocketWithGeminiVision(
     batchResponses.push(...pairRes);
   }
 
-  // Merge all extracted items into a global map by numeric "No"
   const globalByNo = new Map<number, ExtractedDocketItem>();
   const unnumberedItems: ExtractedDocketItem[] = [];
   const pageMinNo = new Map<number, number>();
@@ -576,8 +878,16 @@ export async function extractDocketWithGeminiVision(
   let anyPrintedNoColumn = false;
   let globalMaxCandidate = 0;
 
+  let modelUsed = DEFAULT_PRIMARY_VISION_MODEL;
+  let fallbackUsed = false;
+  let totalRetries = 0;
+
   for (let bIdx = 0; bIdx < batchResponses.length; bIdx++) {
     const bRes = batchResponses[bIdx];
+    modelUsed = bRes.modelUsed || modelUsed;
+    fallbackUsed = fallbackUsed || Boolean(bRes.fallbackUsed);
+    totalRetries += bRes.retryAttempts || 0;
+
     const defaultPage = batches[bIdx][0].pageNumber;
     if (bRes.hasPrintedNoColumn !== false) {
       anyPrintedNoColumn = true;
@@ -610,7 +920,6 @@ export async function extractDocketWithGeminiVision(
         if (!existing) {
           globalByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
         } else if (existing.pageNumber === itemPage) {
-          // Overlap between Upper and Lower half of the same page: merge richest fields
           globalByNo.set(numNo, {
             ...existing,
             partNumber:
@@ -621,6 +930,7 @@ export async function extractDocketWithGeminiVision(
               norm.item.description.length > existing.description.length
                 ? norm.item.description
                 : existing.description,
+            revision: existing.revision || norm.item.revision,
             material: existing.material || norm.item.material,
             thickness: existing.thickness || norm.item.thickness,
             dimensions: existing.dimensions || norm.item.dimensions,
@@ -628,7 +938,6 @@ export async function extractDocketWithGeminiVision(
             quantity: existing.quantity || norm.item.quantity,
           });
         } else {
-          // Subsequent page restarted numbering at 1
           unnumberedItems.push(norm.item);
         }
       } else {
@@ -637,7 +946,7 @@ export async function extractDocketWithGeminiVision(
     }
   }
 
-  // Pass 2: Single-Call Global Missing "No" Recovery (1 .. globalMaxCandidate, e.g. 1..199)
+  // Pass 2: Single-Call Global Missing "No" Recovery
   if (
     anyPrintedNoColumn &&
     globalMaxCandidate > 1 &&
@@ -652,7 +961,6 @@ export async function extractDocketWithGeminiVision(
     }
 
     if (missingNos.length > 0 && missingNos.length <= 60) {
-      // Map each missing "No" to the page that covers or borders it
       const missingPerPage = new Map<number, Set<number>>();
       const assignToPage = (pNum: number, val: number) => {
         if (pNum < 1 || pNum > totalPages) return;
@@ -692,7 +1000,6 @@ export async function extractDocketWithGeminiVision(
         missingNos: Array.from(set).sort((a, b) => a - b),
       }));
 
-      // Execute in at most 1-2 recovery calls (up to 3 pages per recovery call)
       for (let i = 0; i < recoveryPayloads.length; i += 3) {
         const chunk = recoveryPayloads.slice(i, i + 3);
         const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
@@ -711,7 +1018,6 @@ export async function extractDocketWithGeminiVision(
     }
   }
 
-  // Assemble final items sorted cleanly by "No" (1, 2, 3, ..., 199)
   const validItems: ExtractedDocketItem[] = [];
   const sortedNos = Array.from(globalByNo.keys()).sort((a, b) => a - b);
   for (const n of sortedNos) {
@@ -760,7 +1066,9 @@ export async function extractDocketWithGeminiVision(
     confidenceScore: validItems.length > 0 ? 100 : 0,
     needsManualReview: validItems.length === 0,
     extractionMethod: 'ai-vision',
-    aiModelUsed: PRIMARY_VISION_MODEL,
+    aiModelUsed: modelUsed,
+    fallbackUsed,
+    retryAttempts: totalRetries,
     pagesScanned: totalPages,
     hasPrintedNoColumn: anyPrintedNoColumn,
     firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : undefined,
@@ -816,7 +1124,7 @@ export async function recoverMissingDocketItems(
 
 /**
  * Reads a barcode, QR code, Part Number, or Item Number from a single part label photo
- * using Gemini AI Vision (ideal when a barcode is blurry, angled, curved, or laser-etched).
+ * using Gemini AI Vision.
  */
 export async function extractPartCodeWithGeminiVision(
   imageDataUrl: string,
@@ -868,7 +1176,7 @@ Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode
   };
 
   try {
-    const text = await generateWithRateLimitProtection(
+    const { parsed } = await generateWithRetryAndFallback(
       ai,
       ThinkingLevel,
       [
@@ -876,10 +1184,10 @@ Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode
         { text: promptText },
       ],
       'Read the barcode or part code from the image.',
-      responseSchema
+      responseSchema,
+      'label'
     );
 
-    const parsed = JSON.parse(text || '{}');
     return {
       detectedCode: String(parsed.detectedCode || '').trim(),
       confidence: String(parsed.confidence || 'high'),

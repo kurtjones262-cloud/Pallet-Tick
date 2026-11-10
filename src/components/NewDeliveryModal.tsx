@@ -322,6 +322,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             pageNumber: idx + 1,
             dataUrl: p.dataUrl,
             name: p.name,
+            textHint: p.textHint,
           }))}
           onClose={() => setReviewData(null)}
           onDeliveryCreated={(newDel) => {
@@ -415,12 +416,18 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                     Gemini AI &amp; PDF Compiler · Compiling Parts List
                   </span>
 
-                  <h4 className="text-sm font-bold text-[#18181B] mb-1">
+                  <h4
+                    className={`text-sm font-bold mb-1 ${
+                      (ocrProgress?.statusText || '').toLowerCase().includes('retrying')
+                        ? 'text-amber-700 bg-amber-50 border border-amber-200 px-3 py-1 rounded-[4px]'
+                        : 'text-[#18181B]'
+                    }`}
+                  >
                     {ocrProgress?.statusText || 'Analyzing your delivery docket...'}
                   </h4>
 
                   <p className="text-xs text-zinc-500 max-w-xs leading-relaxed mb-5">
-                    Identifying every individual part number, item code, description, material, thickness, dimensions, and quantity into a compiled checklist.
+                    Identifying every individual part number, item code, description, revision, material, thickness, dimensions, and quantity into a compiled checklist.
                   </p>
 
                   {/* Progress Bar */}
@@ -445,10 +452,13 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                         <span>{ocrError}</span>
                       </div>
                       {capturedPages.length > 0 && (
-                        <div className="flex items-center gap-2 pl-6">
+                        <div className="flex items-center justify-between gap-2 pl-6 pt-1">
+                          <span className="text-[11px] text-red-600/90 font-mono">
+                            Your {capturedPages.length} uploaded page(s) are preserved.
+                          </span>
                           <button
                             onClick={handleExtractPartsFromDocket}
-                            className="px-2.5 py-1 rounded-[3px] bg-[#059669] text-white font-semibold text-[11px] cursor-pointer"
+                            className="px-3 py-1.5 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs cursor-pointer shadow-2xs"
                           >
                             Retry Extraction
                           </button>

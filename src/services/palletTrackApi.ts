@@ -564,3 +564,134 @@ export async function apiMigrateDeliveries(deliveries: Delivery[]): Promise<{
 
   return await res.json();
 }
+
+// ==========================================
+// MANUAL PARTS LIST EDITING API METHODS
+// ==========================================
+
+export async function apiAddDeliveryPart(
+  deliveryId: string,
+  partInput: {
+    id?: string;
+    partNumber: string;
+    itemNumber?: string;
+    description?: string;
+    revision?: string;
+    quantity?: number;
+    material?: string;
+    thickness?: string;
+    dimensions?: string;
+    weight?: string;
+    palletNumber?: string | number;
+    notes?: string;
+  }
+): Promise<{ status: string; part: DeliveryPart; delivery: Delivery }> {
+  const url = resolveApiUrl(`/api/deliveries/${encodeURIComponent(deliveryId)}/parts`);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify(partInput),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to add part to delivery (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+export async function apiUpdateDeliveryPart(
+  deliveryId: string,
+  partId: string,
+  updates: {
+    partNumber?: string;
+    itemNumber?: string;
+    description?: string;
+    revision?: string | null;
+    quantity?: number;
+    material?: string | null;
+    thickness?: string | null;
+    dimensions?: string | null;
+    weight?: string | null;
+    palletNumber?: string | number | null;
+    notes?: string | null;
+  }
+): Promise<{ status: string; part: DeliveryPart; delivery: Delivery }> {
+  const url = resolveApiUrl(
+    `/api/deliveries/${encodeURIComponent(deliveryId)}/parts/${encodeURIComponent(partId)}`
+  );
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify(updates),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to update part (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+export async function apiBatchSaveDeliveryParts(
+  deliveryId: string,
+  parts: Array<{
+    id?: string;
+    partNumber: string;
+    itemNumber?: string;
+    docketLineIndex?: number;
+    description?: string;
+    revision?: string | null;
+    quantity?: number;
+    material?: string | null;
+    thickness?: string | null;
+    dimensions?: string | null;
+    weight?: string | null;
+    palletNumber?: string | number | null;
+    notes?: string | null;
+  }>
+): Promise<{ status: string; delivery: Delivery }> {
+  const url = resolveApiUrl(`/api/deliveries/${encodeURIComponent(deliveryId)}/parts`);
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify({ parts }),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to batch save parts list (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+export async function apiDeleteDeliveryPart(
+  deliveryId: string,
+  partId: string
+): Promise<{ status: string; deletedPartId: string; delivery: Delivery }> {
+  const url = resolveApiUrl(
+    `/api/deliveries/${encodeURIComponent(deliveryId)}/parts/${encodeURIComponent(partId)}`
+  );
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: getAuthHeaders({
+      Accept: 'application/json',
+    }),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to delete part (HTTP ${res.status})`);
+  }
+  return body;
+}
+

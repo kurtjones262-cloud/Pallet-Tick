@@ -486,9 +486,48 @@ export async function handlePalletTrackApiRequest(
       }
 
       // GET /api/deliveries/:id/parts
-      if (subPath === '/parts' && method === 'GET') {
-        const parts = await service.getDeliveryParts(deliveryId);
-        return jsonResponse(parts);
+      // POST /api/deliveries/:id/parts (Add missing part)
+      // PUT /api/deliveries/:id/parts (Batch save parts list)
+      if (subPath === '/parts' || subPath === '/parts/') {
+        if (method === 'GET') {
+          const parts = await service.getDeliveryParts(deliveryId);
+          return jsonResponse(parts);
+        }
+
+        if (method === 'POST') {
+          const body: any = await request.json().catch(() => ({}));
+          if (!body || !String(body.partNumber || '').trim()) {
+            return errorResponse('Part Number is required when adding a part.', 400);
+          }
+          try {
+            const added = await service.addDeliveryPart(deliveryId, body, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role,
+            });
+            return jsonResponse(added, 201);
+          } catch (err: any) {
+            return errorResponse(err?.message || 'Failed to add part to delivery', 400);
+          }
+        }
+
+        if (method === 'PUT') {
+          const body: any = await request.json().catch(() => ({}));
+          const partsArray = Array.isArray(body) ? body : body?.parts;
+          if (!Array.isArray(partsArray)) {
+            return errorResponse('Expected an array of parts in "parts" field.', 400);
+          }
+          try {
+            const saved = await service.batchSaveDeliveryParts(deliveryId, partsArray, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role,
+            });
+            return jsonResponse(saved, 200);
+          } catch (err: any) {
+            return errorResponse(err?.message || 'Failed to save parts list', 400);
+          }
+        }
       }
 
       // POST /api/deliveries/:id/parts/:partId/receive
@@ -521,6 +560,39 @@ export async function handlePalletTrackApiRequest(
           return jsonResponse(result, 409); // 409 Conflict with strict duplicate scan payload
         }
         return jsonResponse(result, 200);
+      }
+
+      // PATCH / PUT / DELETE /api/deliveries/:id/parts/:partId (Edit or Delete a specific part row)
+      const partItemMatch = subPath.match(/^\/parts\/([^/]+)\/?$/);
+      if (partItemMatch) {
+        const partId = decodeURIComponent(partItemMatch[1]);
+
+        if (method === 'PATCH' || method === 'PUT') {
+          const body: any = await request.json().catch(() => ({}));
+          try {
+            const updated = await service.updateDeliveryPart(deliveryId, partId, body, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role,
+            });
+            return jsonResponse(updated, 200);
+          } catch (err: any) {
+            return errorResponse(err?.message || 'Failed to update part', 400);
+          }
+        }
+
+        if (method === 'DELETE') {
+          try {
+            const deleted = await service.deleteDeliveryPart(deliveryId, partId, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role,
+            });
+            return jsonResponse(deleted, 200);
+          } catch (err: any) {
+            return errorResponse(err?.message || 'Failed to delete part', 400);
+          }
+        }
       }
 
       // GET /api/deliveries/:id/scans

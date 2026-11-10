@@ -100,6 +100,12 @@ export class NodeSqliteD1Adapter implements D1Database {
     safeAddCol('scan_events', 'employee_role TEXT');
     safeAddCol('scan_events', "event_action TEXT DEFAULT 'part_scan'");
 
+    safeAddCol('delivery_parts', 'revision TEXT');
+    safeAddCol('delivery_parts', 'manually_edited INTEGER NOT NULL DEFAULT 0');
+    safeAddCol('delivery_parts', 'original_ocr_values TEXT');
+    safeAddCol('delivery_parts', 'last_edited_by TEXT');
+    safeAddCol('delivery_parts', 'last_edited_at TEXT');
+
     // Upgrade users table if an older local SQLite table had a restrictive role CHECK constraint
     try {
       const tblInfo = this.db

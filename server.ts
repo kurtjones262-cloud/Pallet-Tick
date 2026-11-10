@@ -31,7 +31,7 @@ app.use(express.json({ limit: '35mb' }));
 app.use((req, res, next) => {
   res.setHeader('Permissions-Policy', 'camera=*, microphone=*, geolocation=*');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -55,6 +55,7 @@ app.use(async (req, res, next) => {
   if (
     req.path.startsWith('/api/deliveries') ||
     req.path.startsWith('/api/users') ||
+    req.path.startsWith('/api/auth') ||
     req.path === '/api/health'
   ) {
     try {
@@ -186,11 +187,34 @@ app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse
     const rawMsg = err?.message || String(err || '');
     console.error('Gemini AI docket extraction error:', rawMsg);
     const isMissingKey = rawMsg.includes('GEMINI_API_KEY');
-    return res.status(isMissingKey ? 503 : 500).json({
+    const isRateLimited =
+      err?.status === 429 ||
+      err?.code === 'GEMINI_RATE_LIMIT_429' ||
+      rawMsg.includes('429') ||
+      rawMsg.includes('RESOURCE_EXHAUSTED');
+    const isHighDemand =
+      !isMissingKey &&
+      (err?.status === 503 ||
+        err?.code === 'GEMINI_HIGH_DEMAND_503' ||
+        rawMsg.includes('503') ||
+        rawMsg.toLowerCase().includes('high demand') ||
+        rawMsg.toLowerCase().includes('overloaded'));
+
+    const httpStatus = isMissingKey ? 503 : isHighDemand ? 503 : isRateLimited ? 429 : 500;
+    const errorCode = isMissingKey
+      ? 'MISSING_GEMINI_API_KEY'
+      : isHighDemand
+      ? 'GEMINI_HIGH_DEMAND_503'
+      : isRateLimited
+      ? 'GEMINI_RATE_LIMIT_429'
+      : err?.code || 'AI_EXTRACTION_FAILED';
+
+    return res.status(httpStatus).json({
       error: isMissingKey
         ? 'Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.'
         : rawMsg || 'Gemini AI docket extraction failed.',
-      code: isMissingKey ? 'MISSING_GEMINI_API_KEY' : 'AI_EXTRACTION_FAILED',
+      code: errorCode,
+      retryable: !isMissingKey,
     });
   }
 });

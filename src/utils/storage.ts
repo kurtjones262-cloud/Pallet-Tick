@@ -27,6 +27,11 @@ import {
   apiUpdateDelivery,
   apiReceivePart,
   apiMigrateDeliveries,
+  apiAddDeliveryPart,
+  apiUpdateDeliveryPart,
+  apiBatchSaveDeliveryParts,
+  apiDeleteDeliveryPart,
+  getStoredUser,
   checkBackendConnection,
   isBackendOnline,
 } from '../services/palletTrackApi';
@@ -1457,3 +1462,683 @@ export function undoLastScan(delivery: Delivery): Delivery {
   updateDelivery(updatedDelivery);
   return updatedDelivery;
 }
+
+// ============================================================================
+// MANUAL PARTS LIST EDITING, ADDING & DELETION (With Audit History & D1 Sync)
+// ============================================================================
+
+function getActiveActorInfo(): { id: string; name: string; role: string } {
+  const user = getStoredUser();
+  if (user) {
+    return {
+      id: user.id,
+      name: `${user.employeeName} (${user.employeeCode})`,
+      role: user.role,
+    };
+  }
+  return {
+    id: 'usr_receiver_default',
+    name: 'Workshop Operator',
+    role: 'supervisor',
+  };
+}
+
+/**
+ * Adds a new part row to an existing delivery's parts list in localStorage, IndexedDB, and Cloudflare D1,
+ * recording a full audit trail entry.
+ */
+export function addPartToDelivery(
+  deliveryId: string,
+  input: {
+    partNumber: string;
+    itemNumber?: string;
+    description?: string;
+    revision?: string;
+    quantity?: number;
+    material?: string;
+    thickness?: string;
+    dimensions?: string;
+    weight?: string;
+    palletNumber?: string;
+    notes?: string;
+  }
+): Delivery | null {
+  const deliveries = getStoredDeliveries();
+  const deliveryIdx = deliveries.findIndex((d) => d.id === deliveryId);
+  if (deliveryIdx === -1) return null;
+
+  const delivery = deliveries[deliveryIdx];
+  const cleanPartNumber = String(input.partNumber || '')
+    .trim()
+    .toUpperCase();
+  if (!cleanPartNumber) {
+    throw new Error('Part Number is required when adding a part.');
+  }
+
+  const rawQty = input.quantity === undefined || input.quantity === null ? 1 : Number(input.quantity);
+  if (Number.isNaN(rawQty) || rawQty < 1) {
+    throw new Error('Quantity must be at least 1.');
+  }
+  const reqQty = Math.max(1, Math.round(rawQty));
+
+  const maxLineIdx = delivery.parts.reduce(
+    (max, p, idx) => Math.max(max, p.docketLineIndex || idx + 1),
+    0
+  );
+  const maxNumericNo = delivery.parts.reduce((max, p) => {
+    const n = parseInt(String(p.itemNumber || '').replace(/\D+/g, ''), 10);
+    return Number.isNaN(n) ? max : Math.max(max, n);
+  }, 0);
+
+  const nextLineIndex = maxLineIdx + 1;
+  const cleanItemNo =
+    String(input.itemNumber || '').trim() || String(Math.max(nextLineIndex, maxNumericNo + 1));
+  const cleanDescription = String(input.description || '').trim() || `Part ${cleanPartNumber}`;
+  const cleanRevision = input.revision ? String(input.revision).trim() : undefined;
+  const now = new Date().toISOString();
+  const actor = getActiveActorInfo();
+  const newPartId = `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+  const newPart: DeliveryPart = {
+    id: newPartId,
+    partNumber: cleanPartNumber,
+    itemNumber: cleanItemNo,
+    docketLineIndex: nextLineIndex,
+    description: cleanDescription,
+    revision: cleanRevision,
+    quantity: reqQty,
+    verificationStatus: 'unscanned',
+    status: 'outstanding',
+    material: input.material ? String(input.material).trim() : undefined,
+    thickness: input.thickness ? String(input.thickness).trim() : undefined,
+    dimensions: input.dimensions ? String(input.dimensions).trim() : undefined,
+    weight: input.weight ? String(input.weight).trim() : undefined,
+    palletNumber: input.palletNumber ? String(input.palletNumber).trim() : undefined,
+    notes: input.notes ? String(input.notes).trim() : undefined,
+    manuallyEdited: true,
+    lastEditedBy: actor.name,
+    lastEditedAt: now,
+    editHistory: [
+      {
+        id: `aud_${Date.now()}`,
+        timestamp: now,
+        action: 'added',
+        editedBy: actor.name,
+        editedByRole: actor.role,
+        summary: `Added part ${cleanPartNumber} (No. ${cleanItemNo}${
+          cleanRevision ? `, Rev ${cleanRevision}` : ''
+        }, Qty ${reqQty})`,
+      },
+    ],
+  };
+
+  const scanEvent: ScanEvent = {
+    id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: now,
+    code: cleanPartNumber,
+    codeType: 'manual',
+    status: 'part_added',
+    partId: newPart.id,
+    partNumber: cleanPartNumber,
+    itemNumber: cleanItemNo,
+    requiredQuantity: reqQty,
+    receivedQuantity: 0,
+    message: `Added part ${cleanPartNumber} (No. ${cleanItemNo}${
+      cleanRevision ? `, Rev ${cleanRevision}` : ''
+    }) — "${cleanDescription}" (Qty ${reqQty}) by ${actor.name}`,
+  };
+
+  const updatedDelivery: Delivery = {
+    ...delivery,
+    parts: [...delivery.parts, newPart],
+    scanHistory: [scanEvent, ...(delivery.scanHistory || [])].slice(0, 300),
+    updatedAt: now,
+  };
+
+  deliveries[deliveryIdx] = updatedDelivery;
+  saveStoredDeliveries(deliveries);
+  saveDeliveryToIndexedDb(updatedDelivery).catch(console.error);
+
+  if (typeof window !== 'undefined') {
+    apiAddDeliveryPart(deliveryId, {
+      id: newPart.id,
+      partNumber: cleanPartNumber,
+      itemNumber: cleanItemNo,
+      description: cleanDescription,
+      revision: cleanRevision,
+      quantity: reqQty,
+      material: newPart.material,
+      thickness: newPart.thickness,
+      dimensions: newPart.dimensions,
+      weight: newPart.weight,
+      palletNumber: newPart.palletNumber,
+      notes: newPart.notes,
+    }).catch((err) => {
+      console.warn('Central database addPart sync notice:', err?.message || err);
+    });
+  }
+
+  return updatedDelivery;
+}
+
+/**
+ * Edits an existing part in a delivery's parts list.
+ * Preserves originalOcrValues before the first edit, recalculates verificationStatus if already scanned,
+ * and syncs to localStorage, IndexedDB, and Cloudflare D1.
+ */
+export function editPartInDelivery(
+  deliveryId: string,
+  partId: string,
+  updates: {
+    partNumber?: string;
+    itemNumber?: string;
+    description?: string;
+    revision?: string;
+    quantity?: number;
+    material?: string;
+    thickness?: string;
+    dimensions?: string;
+    weight?: string;
+    palletNumber?: string;
+    notes?: string;
+  }
+): Delivery | null {
+  const deliveries = getStoredDeliveries();
+  const deliveryIdx = deliveries.findIndex((d) => d.id === deliveryId);
+  if (deliveryIdx === -1) return null;
+
+  const delivery = deliveries[deliveryIdx];
+  const partIdx = delivery.parts.findIndex((p) => p.id === partId);
+  if (partIdx === -1) return null;
+
+  const existing = delivery.parts[partIdx];
+  const newPartNumber =
+    updates.partNumber !== undefined
+      ? String(updates.partNumber).trim().toUpperCase()
+      : existing.partNumber;
+  if (!newPartNumber) {
+    throw new Error('Part Number cannot be empty.');
+  }
+
+  const newItemNumber =
+    updates.itemNumber !== undefined
+      ? String(updates.itemNumber).trim() || existing.itemNumber
+      : existing.itemNumber;
+
+  const newDescription =
+    updates.description !== undefined ? String(updates.description).trim() : existing.description;
+
+  const newRevision =
+    updates.revision !== undefined
+      ? String(updates.revision).trim() || undefined
+      : existing.revision;
+
+  let newReqQty = Math.max(1, existing.quantity ?? 1);
+  if (updates.quantity !== undefined && updates.quantity !== null) {
+    const parsed = Number(updates.quantity);
+    if (Number.isNaN(parsed) || parsed < 1) {
+      throw new Error('Quantity must be at least 1.');
+    }
+    newReqQty = Math.max(1, Math.round(parsed));
+  }
+
+  const newMaterial =
+    updates.material !== undefined
+      ? String(updates.material).trim() || undefined
+      : existing.material;
+  const newThickness =
+    updates.thickness !== undefined
+      ? String(updates.thickness).trim() || undefined
+      : existing.thickness;
+  const newDimensions =
+    updates.dimensions !== undefined
+      ? String(updates.dimensions).trim() || undefined
+      : existing.dimensions;
+  const newWeight =
+    updates.weight !== undefined
+      ? String(updates.weight).trim() || undefined
+      : existing.weight;
+  const newPalletNumber =
+    updates.palletNumber !== undefined
+      ? String(updates.palletNumber).trim() || undefined
+      : existing.palletNumber;
+  const newNotes =
+    updates.notes !== undefined
+      ? String(updates.notes).trim() || undefined
+      : existing.notes;
+
+  // Preserve original OCR values before any manual edits
+  const originalOcrValues = existing.originalOcrValues || {
+    partNumber: existing.partNumber,
+    itemNumber: existing.itemNumber,
+    description: existing.description,
+    revision: existing.revision,
+    quantity: Math.max(1, existing.quantity ?? 1),
+  };
+
+  // Keep scanning & verification status consistent with pallet scanning and outstanding quantities
+  const isScanned = existing.status === 'received' || (existing.receivedQuantity ?? 0) > 0;
+  const recQty = isScanned
+    ? typeof existing.receivedQuantity === 'number'
+      ? existing.receivedQuantity
+      : Math.max(1, existing.quantity ?? 1)
+    : undefined;
+  const newVerificationStatus: DeliveryPart['verificationStatus'] = isScanned
+    ? recQty === newReqQty
+      ? 'verified'
+      : 'quantity_mismatch'
+    : 'unscanned';
+
+  const changes: string[] = [];
+  if (newPartNumber !== existing.partNumber) {
+    changes.push(`Part#: ${existing.partNumber} → ${newPartNumber}`);
+  }
+  if (newItemNumber !== existing.itemNumber) {
+    changes.push(`No: ${existing.itemNumber} → ${newItemNumber}`);
+  }
+  if (newDescription !== existing.description) {
+    changes.push(`Desc: "${existing.description}" → "${newDescription}"`);
+  }
+  if ((newRevision || '') !== (existing.revision || '')) {
+    changes.push(`Rev: ${existing.revision || '—'} → ${newRevision || '—'}`);
+  }
+  if (newReqQty !== (existing.quantity ?? 1)) {
+    changes.push(`Qty: ${existing.quantity ?? 1} → ${newReqQty}`);
+  }
+  if ((newPalletNumber || '') !== (existing.palletNumber || '')) {
+    changes.push(`Pallet: ${existing.palletNumber || '—'} → ${newPalletNumber || '—'}`);
+  }
+  if ((newMaterial || '') !== (existing.material || '')) {
+    changes.push(`Mat: ${existing.material || '—'} → ${newMaterial || '—'}`);
+  }
+  if ((newThickness || '') !== (existing.thickness || '')) {
+    changes.push(`Thk: ${existing.thickness || '—'} → ${newThickness || '—'}`);
+  }
+
+  const now = new Date().toISOString();
+  const actor = getActiveActorInfo();
+  const summaryText =
+    changes.length > 0
+      ? `Edited ${newPartNumber} (No. ${newItemNumber}): ${changes.join('; ')}`
+      : `Saved ${newPartNumber} (No. ${newItemNumber})`;
+
+  const updatedPart: DeliveryPart = {
+    ...existing,
+    partNumber: newPartNumber,
+    itemNumber: newItemNumber,
+    description: newDescription,
+    revision: newRevision,
+    quantity: newReqQty,
+    receivedQuantity: recQty,
+    verificationStatus: newVerificationStatus,
+    material: newMaterial,
+    thickness: newThickness,
+    dimensions: newDimensions,
+    weight: newWeight,
+    palletNumber: newPalletNumber,
+    notes: newNotes,
+    manuallyEdited: true,
+    lastEditedBy: actor.name,
+    lastEditedAt: now,
+    originalOcrValues,
+    editHistory: [
+      {
+        id: `aud_${Date.now()}`,
+        timestamp: now,
+        action: 'edited',
+        editedBy: actor.name,
+        editedByRole: actor.role,
+        summary: summaryText,
+        previousValues: {
+          partNumber: existing.partNumber,
+          itemNumber: existing.itemNumber,
+          description: existing.description,
+          revision: existing.revision,
+          quantity: existing.quantity,
+        },
+        newValues: {
+          partNumber: newPartNumber,
+          itemNumber: newItemNumber,
+          description: newDescription,
+          revision: newRevision,
+          quantity: newReqQty,
+        },
+      },
+      ...(existing.editHistory || []),
+    ],
+  };
+
+  const newParts = [...delivery.parts];
+  newParts[partIdx] = updatedPart;
+
+  const scanEvent: ScanEvent = {
+    id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: now,
+    code: newPartNumber,
+    codeType: 'manual',
+    status: 'part_edited',
+    partId: updatedPart.id,
+    partNumber: newPartNumber,
+    itemNumber: newItemNumber,
+    requiredQuantity: newReqQty,
+    receivedQuantity: recQty ?? 0,
+    message: `${summaryText} by ${actor.name}`,
+  };
+
+  const updatedDelivery: Delivery = {
+    ...delivery,
+    parts: newParts,
+    scanHistory: [scanEvent, ...(delivery.scanHistory || [])].slice(0, 300),
+    updatedAt: now,
+  };
+
+  deliveries[deliveryIdx] = updatedDelivery;
+  saveStoredDeliveries(deliveries);
+  saveDeliveryToIndexedDb(updatedDelivery).catch(console.error);
+
+  if (typeof window !== 'undefined') {
+    apiUpdateDeliveryPart(deliveryId, partId, {
+      partNumber: newPartNumber,
+      itemNumber: newItemNumber,
+      description: newDescription,
+      revision: newRevision || null,
+      quantity: newReqQty,
+      material: newMaterial || null,
+      thickness: newThickness || null,
+      dimensions: newDimensions || null,
+      weight: newWeight || null,
+      palletNumber: newPalletNumber || null,
+      notes: newNotes || null,
+    }).catch((err) => {
+      console.warn('Central database editPart sync notice:', err?.message || err);
+    });
+  }
+
+  return updatedDelivery;
+}
+
+/**
+ * Deletes a part row from a delivery's parts list in localStorage, IndexedDB, and Cloudflare D1,
+ * recording a full audit event in scanHistory.
+ */
+export function deletePartFromDelivery(deliveryId: string, partId: string): Delivery | null {
+  const deliveries = getStoredDeliveries();
+  const deliveryIdx = deliveries.findIndex((d) => d.id === deliveryId);
+  if (deliveryIdx === -1) return null;
+
+  const delivery = deliveries[deliveryIdx];
+  const targetPart = delivery.parts.find((p) => p.id === partId);
+  if (!targetPart) return null;
+
+  const now = new Date().toISOString();
+  const actor = getActiveActorInfo();
+  const wasScannedNote =
+    targetPart.status === 'received' || (targetPart.receivedQuantity ?? 0) > 0
+      ? ` [Was already scanned: ${targetPart.receivedQuantity ?? targetPart.quantity ?? 1}/${
+          targetPart.quantity ?? 1
+        }]`
+      : '';
+
+  const scanEvent: ScanEvent = {
+    id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: now,
+    code: targetPart.partNumber,
+    codeType: 'manual',
+    status: 'part_deleted',
+    partNumber: targetPart.partNumber,
+    itemNumber: targetPart.itemNumber,
+    requiredQuantity: targetPart.quantity ?? 1,
+    receivedQuantity: targetPart.receivedQuantity ?? 0,
+    message: `Deleted part ${targetPart.partNumber} (No. ${targetPart.itemNumber}${
+      targetPart.revision ? `, Rev ${targetPart.revision}` : ''
+    }) — "${targetPart.description}" (Qty ${targetPart.quantity ?? 1})${wasScannedNote} by ${
+      actor.name
+    }`,
+  };
+
+  const remainingParts = delivery.parts.filter((p) => p.id !== partId);
+  const updatedDelivery: Delivery = {
+    ...delivery,
+    parts: remainingParts,
+    scanHistory: [scanEvent, ...(delivery.scanHistory || [])].slice(0, 300),
+    updatedAt: now,
+  };
+
+  deliveries[deliveryIdx] = updatedDelivery;
+  saveStoredDeliveries(deliveries);
+  saveDeliveryToIndexedDb(updatedDelivery).catch(console.error);
+
+  if (typeof window !== 'undefined') {
+    apiDeleteDeliveryPart(deliveryId, partId).catch((err) => {
+      console.warn('Central database deletePart sync notice:', err?.message || err);
+    });
+  }
+
+  return updatedDelivery;
+}
+
+/**
+ * Saves multi-row edits, additions, and deletions for a delivery's parts list in bulk.
+ * Preserves original OCR values, recalculates verificationStatus on scanned parts, and syncs to D1.
+ */
+export function saveDeliveryPartsBatch(
+  deliveryId: string,
+  editedParts: Array<{
+    id?: string;
+    partNumber: string;
+    itemNumber?: string;
+    docketLineIndex?: number;
+    description: string;
+    revision?: string;
+    quantity: number;
+    material?: string;
+    thickness?: string;
+    dimensions?: string;
+    weight?: string;
+    palletNumber?: string;
+    notes?: string;
+  }>
+): Delivery | null {
+  const deliveries = getStoredDeliveries();
+  const deliveryIdx = deliveries.findIndex((d) => d.id === deliveryId);
+  if (deliveryIdx === -1) return null;
+
+  const delivery = deliveries[deliveryIdx];
+  const existingById = new Map<string, DeliveryPart>(delivery.parts.map((p) => [p.id, p]));
+  const now = new Date().toISOString();
+  const actor = getActiveActorInfo();
+  const newAuditEvents: ScanEvent[] = [];
+
+  // Validate all rows first
+  for (let i = 0; i < editedParts.length; i++) {
+    const row = editedParts[i];
+    if (!String(row.partNumber || '').trim()) {
+      throw new Error(`Row ${i + 1}: Part Number is required.`);
+    }
+    const q = Number(row.quantity ?? 1);
+    if (Number.isNaN(q) || q < 1) {
+      throw new Error(`Row ${i + 1} (${row.partNumber}): Quantity must be at least 1.`);
+    }
+  }
+
+  const incomingIds = new Set(editedParts.map((p) => p.id).filter(Boolean) as string[]);
+
+  // Track deleted parts
+  for (const oldPart of delivery.parts) {
+    if (!incomingIds.has(oldPart.id)) {
+      newAuditEvents.push({
+        id: `ev_${Date.now()}_del_${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: now,
+        code: oldPart.partNumber,
+        codeType: 'manual',
+        status: 'part_deleted',
+        partNumber: oldPart.partNumber,
+        itemNumber: oldPart.itemNumber,
+        requiredQuantity: oldPart.quantity ?? 1,
+        message: `Deleted part ${oldPart.partNumber} (No. ${oldPart.itemNumber}) — "${oldPart.description}" (Qty ${
+          oldPart.quantity ?? 1
+        }) by ${actor.name}`,
+      });
+    }
+  }
+
+  const updatedParts: DeliveryPart[] = editedParts.map((row, idx) => {
+    const existing = row.id ? existingById.get(row.id) : undefined;
+    const cleanPartNo = String(row.partNumber).trim().toUpperCase();
+    const cleanItemNo = String(row.itemNumber || idx + 1).trim();
+    const cleanDesc = String(row.description || '').trim() || `Part ${cleanPartNo}`;
+    const cleanRev = row.revision ? String(row.revision).trim() : undefined;
+    const cleanQty = Math.max(1, Math.round(Number(row.quantity ?? 1)));
+    const cleanPallet = row.palletNumber ? String(row.palletNumber).trim() : undefined;
+    const cleanMat = row.material ? String(row.material).trim() : undefined;
+    const cleanThk = row.thickness ? String(row.thickness).trim() : undefined;
+
+    if (!existing) {
+      const createdId = row.id || `part_${deliveryId}_manual_${Date.now()}_${idx}`;
+      newAuditEvents.push({
+        id: `ev_${Date.now()}_add_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+        timestamp: now,
+        code: cleanPartNo,
+        codeType: 'manual',
+        status: 'part_added',
+        partId: createdId,
+        partNumber: cleanPartNo,
+        itemNumber: cleanItemNo,
+        requiredQuantity: cleanQty,
+        receivedQuantity: 0,
+        message: `Added part ${cleanPartNo} (No. ${cleanItemNo}${
+          cleanRev ? `, Rev ${cleanRev}` : ''
+        }) — "${cleanDesc}" (Qty ${cleanQty}) by ${actor.name}`,
+      });
+
+      return {
+        id: createdId,
+        partNumber: cleanPartNo,
+        itemNumber: cleanItemNo,
+        docketLineIndex: row.docketLineIndex || idx + 1,
+        description: cleanDesc,
+        revision: cleanRev,
+        quantity: cleanQty,
+        verificationStatus: 'unscanned',
+        status: 'outstanding',
+        palletNumber: cleanPallet,
+        material: cleanMat,
+        thickness: cleanThk,
+        dimensions: row.dimensions,
+        weight: row.weight,
+        notes: row.notes,
+        manuallyEdited: true,
+        lastEditedBy: actor.name,
+        lastEditedAt: now,
+      };
+    }
+
+    const hasChanged =
+      cleanPartNo !== existing.partNumber ||
+      cleanItemNo !== existing.itemNumber ||
+      cleanDesc !== existing.description ||
+      (cleanRev || '') !== (existing.revision || '') ||
+      cleanQty !== (existing.quantity ?? 1) ||
+      (cleanPallet || '') !== (existing.palletNumber || '') ||
+      (cleanMat || '') !== (existing.material || '') ||
+      (cleanThk || '') !== (existing.thickness || '');
+
+    if (!hasChanged) {
+      return existing;
+    }
+
+    const originalOcrValues = existing.originalOcrValues || {
+      partNumber: existing.partNumber,
+      itemNumber: existing.itemNumber,
+      description: existing.description,
+      revision: existing.revision,
+      quantity: Math.max(1, existing.quantity ?? 1),
+    };
+
+    const isScanned = existing.status === 'received' || (existing.receivedQuantity ?? 0) > 0;
+    const recQty = isScanned
+      ? typeof existing.receivedQuantity === 'number'
+        ? existing.receivedQuantity
+        : Math.max(1, existing.quantity ?? 1)
+      : undefined;
+    const newVerificationStatus: DeliveryPart['verificationStatus'] = isScanned
+      ? recQty === cleanQty
+        ? 'verified'
+        : 'quantity_mismatch'
+      : 'unscanned';
+
+    newAuditEvents.push({
+      id: `ev_${Date.now()}_ed_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+      timestamp: now,
+      code: cleanPartNo,
+      codeType: 'manual',
+      status: 'part_edited',
+      partId: existing.id,
+      partNumber: cleanPartNo,
+      itemNumber: cleanItemNo,
+      requiredQuantity: cleanQty,
+      receivedQuantity: recQty ?? 0,
+      message: `Edited part ${cleanPartNo} (No. ${cleanItemNo}${
+        cleanRev ? `, Rev ${cleanRev}` : ''
+      }, Qty ${cleanQty}) by ${actor.name}`,
+    });
+
+    return {
+      ...existing,
+      partNumber: cleanPartNo,
+      itemNumber: cleanItemNo,
+      description: cleanDesc,
+      revision: cleanRev,
+      quantity: cleanQty,
+      receivedQuantity: recQty,
+      verificationStatus: newVerificationStatus,
+      palletNumber: cleanPallet,
+      material: cleanMat,
+      thickness: cleanThk,
+      dimensions: row.dimensions ?? existing.dimensions,
+      weight: row.weight ?? existing.weight,
+      notes: row.notes ?? existing.notes,
+      manuallyEdited: true,
+      lastEditedBy: actor.name,
+      lastEditedAt: now,
+      originalOcrValues,
+    };
+  });
+
+  const updatedDelivery: Delivery = {
+    ...delivery,
+    parts: updatedParts,
+    scanHistory: [...newAuditEvents, ...(delivery.scanHistory || [])].slice(0, 300),
+    updatedAt: now,
+  };
+
+  deliveries[deliveryIdx] = updatedDelivery;
+  saveStoredDeliveries(deliveries);
+  saveDeliveryToIndexedDb(updatedDelivery).catch(console.error);
+
+  if (typeof window !== 'undefined') {
+    apiBatchSaveDeliveryParts(
+      deliveryId,
+      updatedParts.map((p) => ({
+        id: p.id,
+        partNumber: p.partNumber,
+        itemNumber: p.itemNumber,
+        docketLineIndex: p.docketLineIndex,
+        description: p.description,
+        revision: p.revision || null,
+        quantity: p.quantity,
+        palletNumber: p.palletNumber || null,
+        material: p.material || null,
+        thickness: p.thickness || null,
+        dimensions: p.dimensions || null,
+        weight: p.weight || null,
+        notes: p.notes || null,
+      }))
+    ).catch((err) => {
+      console.warn('Central database batchSaveParts sync notice:', err?.message || err);
+    });
+  }
+
+  return updatedDelivery;
+}
+

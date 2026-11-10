@@ -81,6 +81,7 @@ export interface DeliveryPartRow {
   item_number: string;
   docket_line_index: number;
   description: string;
+  revision?: string | null;
   required_quantity: number;
   received_quantity: number;
   verification_status: 'unscanned' | 'verified' | 'quantity_mismatch';
@@ -96,6 +97,10 @@ export interface DeliveryPartRow {
   notes: string | null;
   flagged_for_review: number;
   ocr_confidence: string | null;
+  manually_edited?: number | null;
+  original_ocr_values?: string | null;
+  last_edited_by?: string | null;
+  last_edited_at?: string | null;
   created_at: string;
   updated_at: string;
 }

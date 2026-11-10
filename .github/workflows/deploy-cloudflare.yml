@@ -30,6 +30,24 @@ jobs:
       - name: Build frontend and Worker bundle
         run: npm run build
 
+      - name: Resolve D1 database_id for wrangler.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          if [ -n "$CLOUDFLARE_D1_DATABASE_ID" ]; then
+            echo "Injecting CLOUDFLARE_D1_DATABASE_ID from GitHub secret..."
+            sed -i "s/pallettrack-d1-placeholder-id/$CLOUDFLARE_D1_DATABASE_ID/g" wrangler.toml
+          elif grep -q "pallettrack-d1-placeholder-id" wrangler.toml && [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "Looking up existing pallettrack-db UUID from Cloudflare D1..."
+            DB_UUID=$(npx wrangler d1 info pallettrack-db --json 2>/dev/null | node -e "try { const d = JSON.parse(require('fs').readFileSync(0, 'utf8')); console.log(d.uuid || d.database_id || ''); } catch {}" || true)
+            if [ -n "$DB_UUID" ]; then
+              echo "Found pallettrack-db UUID: $DB_UUID"
+              sed -i "s/pallettrack-d1-placeholder-id/$DB_UUID/g" wrangler.toml
+            fi
+          fi
+
       - name: Deploy to Cloudflare Worker
         uses: cloudflare/wrangler-action@v3
         with:

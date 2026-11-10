@@ -399,8 +399,12 @@ export default {
       );
     }
 
-    // Handle PalletTrack Centralised Database API routes
-    if (url.pathname.startsWith('/api/deliveries') || url.pathname.startsWith('/api/users')) {
+    // Handle PalletTrack Centralised Database & Authentication API routes
+    if (
+      url.pathname.startsWith('/api/auth') ||
+      url.pathname.startsWith('/api/deliveries') ||
+      url.pathname.startsWith('/api/users')
+    ) {
       if (!env.DB) {
         return new Response(
           JSON.stringify({

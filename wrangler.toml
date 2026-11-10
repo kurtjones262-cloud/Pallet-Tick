@@ -10,14 +10,10 @@ binding = "ASSETS"
 not_found_handling = "single-page-application"
 
 # Cloudflare D1 Relational Database Binding
-# IMPORTANT: Replace "pallettrack-d1-placeholder-id" below with your actual
-# Cloudflare D1 Database ID (UUID format, e.g. "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-# from Cloudflare Dashboard -> Storage & Databases -> D1 SQL Database -> pallettrack-db,
-# or set the CLOUDFLARE_D1_DATABASE_ID secret in GitHub Actions.
 [[d1_databases]]
 binding = "DB"
 database_name = "pallettrack-db"
-database_id = "pallettrack-d1-placeholder-id"
+database_id = "e18c4d0a-cb04-4b4b-8f5d-35b4430fbdbb"
 migrations_dir = "migrations"
 
 # Cloudflare Worker Environment Secrets:

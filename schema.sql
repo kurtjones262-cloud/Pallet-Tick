@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS scan_events (
   user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   employee_name TEXT,
   employee_role TEXT,
-  event_action TEXT NOT NULL DEFAULT 'part_scan' CHECK (event_action IN ('part_scan', 'duplicate_attempt', 'quantity_correction', 'manual_override', 'delivery_completed', 'supervisor_approval')),
+  event_action TEXT NOT NULL DEFAULT 'part_scan',
   timestamp TEXT NOT NULL,
   code TEXT NOT NULL,
   scan_type TEXT NOT NULL CHECK (scan_type IN ('qr', 'barcode', 'ocr_label', 'manual')),

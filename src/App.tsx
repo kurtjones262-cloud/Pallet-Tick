@@ -419,14 +419,15 @@ export function App() {
         onMigrationComplete={() => reloadDelivery()}
       />
 
-      {/* Phase 2: Administrator User Management Modal */}
-      {isUserManagementOpen && currentUser?.role === 'admin' && (
-        <UserManagementModal
-          isOpen={isUserManagementOpen}
-          onClose={() => setIsUserManagementOpen(false)}
-          currentUser={currentUser}
-        />
-      )}
+      {/* Phase 2: Super Admin & Administrator User Management Modal */}
+      {isUserManagementOpen &&
+        (currentUser?.role === 'super_admin' || currentUser?.role === 'admin') && (
+          <UserManagementModal
+            isOpen={isUserManagementOpen}
+            onClose={() => setIsUserManagementOpen(false)}
+            currentUser={currentUser}
+          />
+        )}
     </div>
   );
 }

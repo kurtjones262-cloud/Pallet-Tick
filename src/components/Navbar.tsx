@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Users,
   LogOut,
+  ShieldAlert,
   Shield,
   UserCheck,
   HardHat,
@@ -46,6 +47,13 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const renderRoleBadge = (role?: UserRole) => {
     switch (role) {
+      case 'super_admin':
+        return (
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-amber-950/90 border border-amber-500/40 text-amber-300">
+            <ShieldAlert className="w-2.5 h-2.5 text-amber-400" />
+            Super Admin
+          </span>
+        );
       case 'admin':
         return (
           <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-indigo-950/90 border border-indigo-500/40 text-indigo-300">
@@ -60,12 +68,13 @@ export const Navbar: React.FC<NavbarProps> = ({
             Supervisor
           </span>
         );
+      case 'employee':
       case 'operator':
       default:
         return (
           <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-emerald-950/90 border border-emerald-500/40 text-emerald-300">
             <HardHat className="w-2.5 h-2.5 text-emerald-400" />
-            Operator
+            Employee
           </span>
         );
     }
@@ -148,16 +157,16 @@ export const Navbar: React.FC<NavbarProps> = ({
               </div>
             )}
 
-            {/* Admin-only User Management Button */}
-            {currentUser?.role === 'admin' && onOpenUserManagement && (
+            {/* Super Admin & Admin User Management Button */}
+            {(currentUser?.role === 'super_admin' || currentUser?.role === 'admin') && onOpenUserManagement && (
               <button
                 onClick={onOpenUserManagement}
                 className="h-8 px-2.5 inline-flex items-center gap-1.5 text-indigo-300 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/60 border border-indigo-500/40 rounded-lg transition-colors cursor-pointer text-xs font-mono font-semibold"
                 aria-label="User Management"
-                title="Employee Accounts & RBAC"
+                title="Employee & Admin Accounts (RBAC)"
               >
                 <Users className="w-3.5 h-3.5 text-indigo-400" />
-                <span className="hidden sm:inline">Employees</span>
+                <span className="hidden sm:inline">Accounts</span>
               </button>
             )}
 

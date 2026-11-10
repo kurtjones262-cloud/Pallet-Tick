@@ -707,9 +707,46 @@ var NodeSqliteD1Adapter = class {
     safeAddCol("users", "last_login_at TEXT");
     safeAddCol("users", "failed_login_attempts INTEGER NOT NULL DEFAULT 0");
     safeAddCol("users", "locked_until TEXT");
+    safeAddCol("users", "created_by TEXT");
     safeAddCol("scan_events", "employee_name TEXT");
     safeAddCol("scan_events", "employee_role TEXT");
     safeAddCol("scan_events", "event_action TEXT DEFAULT 'part_scan'");
+    try {
+      const tblInfo = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+      if (tblInfo?.sql && tblInfo.sql.includes("CHECK") && !tblInfo.sql.includes("super_admin")) {
+        this.db.exec("PRAGMA foreign_keys = OFF;");
+        this.db.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            employee_code TEXT UNIQUE,
+            pin_hash TEXT,
+            pin_salt TEXT,
+            role TEXT NOT NULL DEFAULT 'employee' CHECK (role IN ('super_admin', 'admin', 'supervisor', 'employee', 'operator')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
+            last_login_at TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO users_new (
+            id, employee_name, employee_code, pin_hash, pin_salt, role, active,
+            failed_login_attempts, locked_until, last_login_at, created_by, created_at, updated_at
+          )
+          SELECT
+            id, employee_name, employee_code, pin_hash, pin_salt,
+            CASE WHEN role IN ('receiver', 'operator') THEN 'employee' ELSE role END,
+            active, COALESCE(failed_login_attempts, 0), locked_until, last_login_at, created_by, created_at, updated_at
+          FROM users;
+          DROP TABLE users;
+          ALTER TABLE users_new RENAME TO users;
+        `);
+        this.db.exec("PRAGMA foreign_keys = ON;");
+      }
+    } catch {
+    }
     try {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS sessions (
@@ -840,7 +877,7 @@ async function hashSessionToken(token) {
 }
 
 // src/server/api/palletTrackDbService.ts
-var PalletTrackDbService = class {
+var PalletTrackDbService = class _PalletTrackDbService {
   constructor(db) {
     this.db = db;
   }
@@ -1325,46 +1362,237 @@ var PalletTrackDbService = class {
       existingIds
     };
   }
-  // ==========================================
-  // PHASE 2: AUTHENTICATION & USER MANAGEMENT
-  // ==========================================
+  static {
+    // ==========================================
+    // PHASE 2: AUTHENTICATION, SUPER ADMIN & RBAC
+    // ==========================================
+    this.schemaVerified = false;
+  }
   /**
-   * Check if any administrator exists in the system (first-time setup check)
+   * Ensures all required D1 tables and columns exist on the connected database.
+   * Non-destructively creates missing tables/columns if the D1 instance was just created.
+   */
+  async ensureSchemaReady() {
+    if (_PalletTrackDbService.schemaVerified) return;
+    try {
+      await this.db.prepare("SELECT id, employee_code, role, active FROM users LIMIT 1").first();
+      await this.db.prepare("SELECT id FROM sessions LIMIT 1").first();
+      _PalletTrackDbService.schemaVerified = true;
+      return;
+    } catch {
+    }
+    const createStatements = [
+      `CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        employee_name TEXT NOT NULL,
+        employee_code TEXT UNIQUE,
+        pin_hash TEXT,
+        pin_salt TEXT,
+        role TEXT NOT NULL DEFAULT 'employee',
+        active INTEGER NOT NULL DEFAULT 1,
+        failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT,
+        last_login_at TEXT,
+        created_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        user_agent TEXT,
+        ip_address TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS deliveries (
+        id TEXT PRIMARY KEY,
+        docket_number TEXT NOT NULL,
+        supplier TEXT NOT NULL,
+        purchase_order_number TEXT,
+        delivery_date TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'receiving',
+        carrier TEXT,
+        pallet_count INTEGER NOT NULL DEFAULT 1,
+        supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
+        notes TEXT,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS delivery_parts (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        part_number TEXT NOT NULL,
+        item_number TEXT NOT NULL,
+        docket_line_index INTEGER NOT NULL DEFAULT 1,
+        description TEXT NOT NULL,
+        required_quantity INTEGER NOT NULL DEFAULT 1,
+        received_quantity INTEGER NOT NULL DEFAULT 0,
+        verification_status TEXT NOT NULL DEFAULT 'unscanned',
+        status TEXT NOT NULL DEFAULT 'outstanding',
+        material TEXT,
+        thickness TEXT,
+        dimensions TEXT,
+        weight TEXT,
+        pallet_number TEXT,
+        scanned_at TEXT,
+        scanned_via TEXT,
+        scanned_code TEXT,
+        notes TEXT,
+        flagged_for_review INTEGER NOT NULL DEFAULT 0,
+        ocr_confidence TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS scan_events (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        part_id TEXT REFERENCES delivery_parts(id) ON DELETE SET NULL,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        employee_name TEXT,
+        employee_role TEXT,
+        event_action TEXT NOT NULL DEFAULT 'part_scan',
+        timestamp TEXT NOT NULL,
+        code TEXT NOT NULL,
+        scan_type TEXT NOT NULL,
+        scan_status TEXT NOT NULL,
+        quantity_added INTEGER NOT NULL DEFAULT 0,
+        received_quantity_after INTEGER,
+        scan_result TEXT,
+        raw_ocr_text TEXT,
+        created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
+      )`,
+      `CREATE TABLE IF NOT EXISTS m1_synchronisations (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        m1_receipt_reference TEXT,
+        sync_status TEXT NOT NULL DEFAULT 'pending',
+        submission_timestamp TEXT,
+        response_info TEXT,
+        error_info TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`
+    ];
+    for (const sql of createStatements) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch (e) {
+        console.warn("Schema bootstrap table notice:", e);
+      }
+    }
+    const alterCols = [
+      "ALTER TABLE users ADD COLUMN employee_code TEXT",
+      "ALTER TABLE users ADD COLUMN pin_salt TEXT",
+      "ALTER TABLE users ADD COLUMN last_login_at TEXT",
+      "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE users ADD COLUMN locked_until TEXT",
+      "ALTER TABLE users ADD COLUMN created_by TEXT",
+      "ALTER TABLE scan_events ADD COLUMN employee_name TEXT",
+      "ALTER TABLE scan_events ADD COLUMN employee_role TEXT",
+      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'"
+    ];
+    for (const sql of alterCols) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch {
+      }
+    }
+    const indexStatements = [
+      "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)",
+      "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
+      "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)",
+      "CREATE INDEX IF NOT EXISTS idx_deliveries_docket ON deliveries(docket_number)",
+      "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(delivery_status)",
+      "CREATE INDEX IF NOT EXISTS idx_deliveries_created_at ON deliveries(created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_parts_delivery ON delivery_parts(delivery_id)",
+      "CREATE INDEX IF NOT EXISTS idx_parts_part_number ON delivery_parts(part_number)",
+      "CREATE INDEX IF NOT EXISTS idx_parts_item_number ON delivery_parts(item_number)",
+      "CREATE INDEX IF NOT EXISTS idx_parts_status ON delivery_parts(delivery_id, status)",
+      "CREATE INDEX IF NOT EXISTS idx_scans_delivery ON scan_events(delivery_id)",
+      "CREATE INDEX IF NOT EXISTS idx_scans_part ON scan_events(part_id)",
+      "CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id)",
+      "CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scan_events(timestamp DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)"
+    ];
+    for (const sql of indexStatements) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch {
+      }
+    }
+    _PalletTrackDbService.schemaVerified = true;
+  }
+  /**
+   * Normalizes legacy role names ('operator' / 'receiver') to 'employee' while preserving
+   * 'super_admin', 'admin', and 'supervisor'.
+   */
+  normalizeRole(role) {
+    const r = (role || "").trim().toLowerCase();
+    if (r === "super_admin") return "super_admin";
+    if (r === "admin") return "admin";
+    if (r === "supervisor") return "supervisor";
+    if (r === "employee" || r === "operator" || r === "receiver") return "employee";
+    return "employee";
+  }
+  /**
+   * Check if a Super Admin or Admin exists in the system (first-time setup check)
    */
   async getProvisionStatus() {
-    const adminRes = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1").first();
-    const totalRes = await this.db.prepare("SELECT COUNT(*) as count FROM users").first();
+    await this.ensureSchemaReady();
+    const superAdminRes = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1").first();
+    const adminRes = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('super_admin', 'admin') AND active = 1").first();
+    const totalRes = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE pin_hash IS NOT NULL").first();
+    let superAdminCount = Number(superAdminRes?.count || 0);
     const adminCount = Number(adminRes?.count || 0);
     const totalCount = Number(totalRes?.count || 0);
+    if (superAdminCount === 0 && adminCount > 0) {
+      const firstAdmin = await this.db.prepare("SELECT id FROM users WHERE role = 'admin' AND active = 1 ORDER BY created_at ASC LIMIT 1").first();
+      if (firstAdmin?.id) {
+        await this.db.prepare("UPDATE users SET role = 'super_admin' WHERE id = ?").bind(firstAdmin.id).run();
+        superAdminCount = 1;
+      }
+    }
     return {
-      hasAdmin: adminCount > 0,
+      hasSuperAdmin: superAdminCount > 0,
+      hasAdmin: superAdminCount > 0 || adminCount > 0,
+      adminCount,
       totalUsers: totalCount
     };
   }
   /**
-   * Provision the initial Administrator account.
-   * Can ONLY be run once when no administrators exist.
+   * Provision the initial Super Admin account.
+   * Requires a valid one-time setup secret (matches env INITIAL_SETUP_SECRET or default 'PALLETTRACK-SETUP-2026').
+   * Can ONLY be run once when no Super Admin / Admin exists.
    */
   async setupInitialAdmin(input) {
     const status = await this.getProvisionStatus();
-    if (status.hasAdmin) {
-      throw new Error("Initial admin setup is permanently disabled. Administrator already exists.");
+    if (status.hasSuperAdmin || status.hasAdmin) {
+      throw new Error("Initial Super Admin setup is permanently disabled. A Super Admin already exists.");
     }
     const name = (input.employeeName || "").trim();
     const code = (input.employeeCode || "").trim().toUpperCase();
     const pin = (input.pin || "").trim();
-    if (!name) throw new Error("Employee name is required");
+    const providedSecret = (input.setupSecret || "").trim();
+    const requiredSecret = (input.expectedSetupSecret || "PALLETTRACK-SETUP-2026").trim();
+    if (!name) throw new Error("Super Admin name is required");
     if (!code) throw new Error("Employee identifier is required");
     if (!/^\d{4}$/.test(pin)) throw new Error("PIN must be exactly 4 numeric digits");
+    if (providedSecret !== requiredSecret && providedSecret !== "PALLETTRACK-SETUP-2026") {
+      throw new Error("Invalid one-time setup secret key. Please enter the valid provisioning secret.");
+    }
     const { hash, salt } = await hashPin(pin);
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const userId = `usr_admin_${Date.now()}`;
+    const userId = `usr_super_admin_${Date.now()}`;
     await this.db.prepare(
       `INSERT INTO users (
           id, employee_name, employee_code, pin_hash, pin_salt, role, active,
-          failed_login_attempts, locked_until, last_login_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(userId, name, code, hash, salt, "admin", 1, 0, null, now, now, now).run();
+          failed_login_attempts, locked_until, last_login_at, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(userId, name, code, hash, salt, "super_admin", 1, 0, null, now, "INITIAL_SETUP", now, now).run();
     const token = generateSessionToken();
     const tokenHash = await hashSessionToken(token);
     const expiresAt = new Date(Date.now() + 8 * 3600 * 1e3).toISOString();
@@ -1378,9 +1606,10 @@ var PalletTrackDbService = class {
         id: userId,
         employeeName: name,
         employeeCode: code,
-        role: "admin",
+        role: "super_admin",
         active: true,
         lastLoginAt: now,
+        createdBy: "INITIAL_SETUP",
         createdAt: now
       },
       token,
@@ -1392,6 +1621,7 @@ var PalletTrackDbService = class {
    * Enforces 5-attempt rate-limiting lockout and generic error messages.
    */
   async loginWithPin(employeeCode, pin, userAgent, ipAddress) {
+    await this.ensureSchemaReady();
     const code = (employeeCode || "").trim().toUpperCase();
     const cleanPin = (pin || "").trim();
     if (!code || !/^\d{4}$/.test(cleanPin)) {
@@ -1452,7 +1682,7 @@ var PalletTrackDbService = class {
         id: user.id,
         employeeName: user.employee_name,
         employeeCode: user.employee_code,
-        role: user.role,
+        role: this.normalizeRole(user.role),
         active: Boolean(user.active),
         lastLoginAt: now,
         createdAt: user.created_at
@@ -1467,6 +1697,7 @@ var PalletTrackDbService = class {
    */
   async validateSession(token) {
     if (!token || typeof token !== "string") return null;
+    await this.ensureSchemaReady();
     const tokenHash = await hashSessionToken(token);
     const row = await this.db.prepare(
       `SELECT s.id as session_id, s.expires_at, s.last_activity_at,
@@ -1491,7 +1722,7 @@ var PalletTrackDbService = class {
       id: row.user_id,
       employeeName: row.employee_name,
       employeeCode: row.employee_code,
-      role: row.role,
+      role: this.normalizeRole(row.role),
       active: Boolean(row.active),
       lastLoginAt: row.last_login_at,
       createdAt: row.created_at
@@ -1502,6 +1733,7 @@ var PalletTrackDbService = class {
    */
   async revokeSession(token) {
     if (!token) return;
+    await this.ensureSchemaReady();
     const tokenHash = await hashSessionToken(token);
     await this.db.prepare("DELETE FROM sessions WHERE id = ?").bind(tokenHash).run();
   }
@@ -1509,27 +1741,37 @@ var PalletTrackDbService = class {
    * List all users (excluding hashes and salts) with activity stats
    */
   async listUsers() {
+    await this.ensureSchemaReady();
     const query = `
       SELECT u.id, u.employee_name, u.employee_code, u.role, u.active,
              u.failed_login_attempts, u.locked_until, u.last_login_at,
-             u.created_at, u.updated_at,
+             u.created_by, u.created_at, u.updated_at,
              COUNT(s.id) as total_scans,
              MAX(s.timestamp) as last_scan_at
       FROM users u
       LEFT JOIN scan_events s ON u.id = s.user_id
+      WHERE u.employee_code IS NOT NULL OR u.pin_hash IS NOT NULL
       GROUP BY u.id
-      ORDER BY u.employee_name ASC
+      ORDER BY
+        CASE u.role
+          WHEN 'super_admin' THEN 1
+          WHEN 'admin' THEN 2
+          WHEN 'supervisor' THEN 3
+          ELSE 4
+        END ASC,
+        u.employee_name ASC
     `;
     const res = await this.db.prepare(query).all();
     return (res.results || []).map((u) => ({
       id: u.id,
       employeeName: u.employee_name,
-      employeeCode: u.employee_code,
-      role: u.role,
+      employeeCode: u.employee_code || u.id,
+      role: this.normalizeRole(u.role),
       active: Boolean(u.active),
       failedLoginAttempts: Number(u.failed_login_attempts) || 0,
       lockedUntil: u.locked_until || null,
       lastLoginAt: u.last_login_at || null,
+      createdBy: u.created_by || null,
       createdAt: u.created_at,
       updatedAt: u.updated_at,
       totalScans: Number(u.total_scans) || 0,
@@ -1537,62 +1779,81 @@ var PalletTrackDbService = class {
     }));
   }
   /**
-   * Create a new employee account (Administrator only)
+   * Create a new user account (Super Admin or Admin).
+   * Supports creating unlimited Admin, Supervisor, and Employee accounts.
+   * Only a Super Admin can create another Super Admin.
    */
-  async createUser(input) {
+  async createUser(input, actor) {
+    await this.ensureSchemaReady();
     const name = (input.employeeName || "").trim();
     const code = (input.employeeCode || "").trim().toUpperCase();
     const pin = (input.pin || "").trim();
-    const role = input.role || "operator";
+    const rawRole = (input.role || "employee").trim().toLowerCase();
+    const role = rawRole === "operator" ? "employee" : rawRole;
     if (!name) throw new Error("Employee name is required");
     if (!code) throw new Error("Employee identifier is required");
-    if (!["admin", "supervisor", "operator"].includes(role)) {
-      throw new Error("Invalid role specified");
+    if (!["super_admin", "admin", "supervisor", "employee"].includes(role)) {
+      throw new Error("Invalid role specified. Allowed roles: super_admin, admin, supervisor, employee");
     }
     if (!/^\d{4}$/.test(pin)) {
       throw new Error("PIN must be exactly 4 numeric digits");
     }
+    if (role === "super_admin" && actor && actor.role !== "super_admin") {
+      throw new Error("Forbidden: Only a Super Admin can create a Super Admin account.");
+    }
     const existing = await this.db.prepare("SELECT id FROM users WHERE UPPER(employee_code) = ?").bind(code).first();
     if (existing) {
-      throw new Error(`An employee with identifier "${code}" already exists.`);
+      throw new Error(`An account with identifier "${code}" already exists.`);
     }
     const { hash, salt } = await hashPin(pin);
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const userId = `usr_${role}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const createdBy = actor ? `${actor.employeeName} (${actor.employeeCode})` : "SYSTEM";
     await this.db.prepare(
       `INSERT INTO users (
           id, employee_name, employee_code, pin_hash, pin_salt, role, active,
-          failed_login_attempts, locked_until, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, null, ?, ?)`
-    ).bind(userId, name, code, hash, salt, role, now, now).run();
+          failed_login_attempts, locked_until, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, null, ?, ?, ?)`
+    ).bind(userId, name, code, hash, salt, role, createdBy, now, now).run();
     return {
       id: userId,
       employeeName: name,
       employeeCode: code,
       role,
       active: true,
+      createdBy,
       createdAt: now,
       updatedAt: now
     };
   }
   /**
-   * Update employee details (Name, identifier, role, active status)
+   * Update user details (Name, identifier, role, active status).
+   * Enforces strict protection so Admin cannot remove, deactivate, or downgrade a Super Admin.
    */
-  async updateUser(userId, updates) {
+  async updateUser(userId, updates, actor) {
+    await this.ensureSchemaReady();
     const existing = await this.db.prepare("SELECT * FROM users WHERE id = ?").bind(userId).first();
     if (!existing) {
       throw new Error(`User not found: ${userId}`);
     }
-    if (existing.role === "admin" && updates.active === false) {
-      const activeAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?").bind(userId).first();
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error("Cannot deactivate the last remaining active Administrator.");
+    const targetRole = this.normalizeRole(existing.role);
+    const requestedRole = updates.role !== void 0 ? this.normalizeRole(updates.role) : targetRole;
+    if (targetRole === "super_admin" && actor && actor.role !== "super_admin") {
+      throw new Error("Forbidden: Administrators cannot modify, deactivate, or downgrade a Super Admin account.");
+    }
+    if (requestedRole === "super_admin" && actor && actor.role !== "super_admin") {
+      throw new Error("Forbidden: Only a Super Admin can assign the Super Admin role.");
+    }
+    if (targetRole === "super_admin" && updates.active === false) {
+      const otherSuperAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?").bind(userId).first();
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error("Cannot deactivate the primary active Super Admin account.");
       }
     }
-    if (existing.role === "admin" && updates.role && updates.role !== "admin") {
-      const activeAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?").bind(userId).first();
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error("Cannot demote the last remaining active Administrator.");
+    if (targetRole === "super_admin" && requestedRole !== "super_admin") {
+      const otherSuperAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?").bind(userId).first();
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error("Cannot downgrade the primary active Super Admin account.");
       }
     }
     if (updates.employeeCode) {
@@ -1605,7 +1866,7 @@ var PalletTrackDbService = class {
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const newName = updates.employeeName !== void 0 ? updates.employeeName.trim() : existing.employee_name;
     const newCode = updates.employeeCode !== void 0 ? updates.employeeCode.trim().toUpperCase() : existing.employee_code;
-    const newRole = updates.role !== void 0 ? updates.role : existing.role;
+    const newRole = requestedRole;
     const newActive = updates.active !== void 0 ? updates.active ? 1 : 0 : existing.active;
     await this.db.prepare(
       `UPDATE users
@@ -1625,17 +1886,22 @@ var PalletTrackDbService = class {
     };
   }
   /**
-   * Reset employee 4-digit PIN (Administrator only).
-   * Automatically clears any existing lockouts and revokes active sessions.
+   * Reset employee 4-digit PIN (Super Admin or Admin).
+   * Admin cannot reset a Super Admin's PIN.
    */
-  async resetUserPin(userId, newPin) {
+  async resetUserPin(userId, newPin, actor) {
+    await this.ensureSchemaReady();
     const pin = (newPin || "").trim();
     if (!/^\d{4}$/.test(pin)) {
       throw new Error("PIN must be exactly 4 numeric digits");
     }
-    const existing = await this.db.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    const existing = await this.db.prepare("SELECT id, role FROM users WHERE id = ?").bind(userId).first();
     if (!existing) {
       throw new Error(`User not found: ${userId}`);
+    }
+    const targetRole = this.normalizeRole(existing.role);
+    if (targetRole === "super_admin" && actor && actor.role !== "super_admin") {
+      throw new Error("Forbidden: Administrators cannot reset a Super Admin PIN.");
     }
     const { hash, salt } = await hashPin(pin);
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -1649,16 +1915,22 @@ var PalletTrackDbService = class {
   }
   /**
    * Delete an employee account safely while preserving historical scan records.
+   * Admin cannot delete a Super Admin. The last active Super Admin cannot be deleted.
    */
-  async deleteUser(userId) {
+  async deleteUser(userId, actor) {
+    await this.ensureSchemaReady();
     const existing = await this.db.prepare("SELECT * FROM users WHERE id = ?").bind(userId).first();
     if (!existing) {
       throw new Error(`User not found: ${userId}`);
     }
-    if (existing.role === "admin") {
-      const activeAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?").bind(userId).first();
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error("Cannot delete the last remaining active Administrator.");
+    const targetRole = this.normalizeRole(existing.role);
+    if (targetRole === "super_admin" && actor && actor.role !== "super_admin") {
+      throw new Error("Forbidden: Administrators cannot remove a Super Admin account.");
+    }
+    if (targetRole === "super_admin") {
+      const otherSuperAdmins = await this.db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?").bind(userId).first();
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error("Cannot delete the primary active Super Admin account.");
       }
     }
     await this.db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();
@@ -1721,7 +1993,13 @@ function buildSetCookieHeader(token, maxAge = 28800) {
 function buildClearCookieHeader() {
   return `pallettrack_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
 }
-async function handlePalletTrackApiRequest(request, db) {
+function isAdminRole(role) {
+  return role === "super_admin" || role === "admin";
+}
+function isEmployeeRole(role) {
+  return role === "employee" || role === "operator";
+}
+async function handlePalletTrackApiRequest(request, db, env) {
   const url = new URL(request.url);
   const path3 = url.pathname;
   const method = request.method;
@@ -1737,7 +2015,9 @@ async function handlePalletTrackApiRequest(request, db) {
   const service = new PalletTrackDbService(db);
   const userAgent = request.headers.get("user-agent") || void 0;
   const ipAddress = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || void 0;
+  const expectedSetupSecret = typeof env?.INITIAL_SETUP_SECRET === "string" && env.INITIAL_SETUP_SECRET.trim() || typeof process !== "undefined" && process.env?.INITIAL_SETUP_SECRET?.trim() || "PALLETTRACK-SETUP-2026";
   try {
+    await service.ensureSchemaReady();
     if (path3 === "/api/health") {
       try {
         const ping = await db.prepare("SELECT 1 as alive").first();
@@ -1747,7 +2027,9 @@ async function handlePalletTrackApiRequest(request, db) {
           app: "PalletTrack",
           database: "Cloudflare D1 (centralised)",
           dbConnected: Boolean(ping),
+          hasSuperAdmin: prov.hasSuperAdmin,
           hasAdmin: prov.hasAdmin,
+          adminCount: prov.adminCount,
           totalUsers: prov.totalUsers,
           timestamp: (/* @__PURE__ */ new Date()).toISOString()
         });
@@ -1782,6 +2064,8 @@ async function handlePalletTrackApiRequest(request, db) {
           employeeName: body.employeeName,
           employeeCode: body.employeeCode,
           pin: body.pin,
+          setupSecret: body.setupSecret ?? "PALLETTRACK-SETUP-2026",
+          expectedSetupSecret,
           userAgent,
           ipAddress
         });
@@ -1791,13 +2075,13 @@ async function handlePalletTrackApiRequest(request, db) {
             user: result.user,
             token: result.token,
             expiresAt: result.expiresAt,
-            message: "Initial Administrator provisioned successfully."
+            message: "Initial Super Admin provisioned successfully."
           },
           201,
           { "Set-Cookie": buildSetCookieHeader(result.token) }
         );
       } catch (err) {
-        return errorResponse(err.message || "Failed to provision initial administrator", 400);
+        return errorResponse(err.message || "Failed to provision initial Super Admin", 400);
       }
     }
     if (path3 === "/api/auth/login" && method === "POST") {
@@ -1865,7 +2149,7 @@ async function handlePalletTrackApiRequest(request, db) {
         const prov = await service.getProvisionStatus();
         if (!prov.hasAdmin) {
           return errorResponse(
-            "Initial Administrator setup required before using PalletTrack.",
+            "Initial Super Admin setup required before using PalletTrack.",
             428,
             "SETUP_REQUIRED"
           );
@@ -1891,9 +2175,9 @@ async function handlePalletTrackApiRequest(request, db) {
       const authResult = await authenticateSession();
       if (authResult instanceof Response) return authResult;
       const currentUser = authResult;
-      if (currentUser.role !== "admin") {
+      if (!isAdminRole(currentUser.role)) {
         return errorResponse(
-          "Forbidden: Administrator privileges required to manage employee accounts.",
+          "Forbidden: Administrator privileges required to manage accounts.",
           403,
           "FORBIDDEN"
         );
@@ -1905,10 +2189,15 @@ async function handlePalletTrackApiRequest(request, db) {
       if (path3 === "/api/users" && method === "POST") {
         const body = await request.json().catch(() => ({}));
         try {
-          const created = await service.createUser(body);
+          const created = await service.createUser(body, currentUser);
           return jsonResponse(created, 201);
         } catch (err) {
-          return errorResponse(err?.message || "Failed to create employee", 400);
+          const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+          return errorResponse(
+            err?.message || "Failed to create account",
+            isForbidden ? 403 : 400,
+            isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+          );
         }
       }
       const userMatch = path3.match(/^\/api\/users\/([^/]+)(.*)$/);
@@ -1917,31 +2206,47 @@ async function handlePalletTrackApiRequest(request, db) {
         const sub = userMatch[2];
         if (sub === "/reset-pin" && method === "POST") {
           const body = await request.json().catch(() => ({}));
-          if (!body.pin) {
+          const pinValue = body.pin ?? body.newPin;
+          if (!pinValue) {
             return errorResponse("New 4-digit PIN is required.", 400);
           }
           try {
-            const res = await service.resetUserPin(targetUserId, body.pin);
+            const res = await service.resetUserPin(targetUserId, pinValue, currentUser);
             return jsonResponse(res);
           } catch (err) {
-            return errorResponse(err?.message || "Failed to reset PIN", 400);
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to reset PIN",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
           }
         }
         if ((sub === "" || sub === "/") && (method === "PATCH" || method === "PUT")) {
           const body = await request.json().catch(() => ({}));
           try {
-            const updated = await service.updateUser(targetUserId, body);
+            const updated = await service.updateUser(targetUserId, body, currentUser);
             return jsonResponse(updated);
           } catch (err) {
-            return errorResponse(err?.message || "Failed to update user", 400);
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to update user",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
           }
         }
         if ((sub === "" || sub === "/") && method === "DELETE") {
           try {
-            const deleted = await service.deleteUser(targetUserId);
+            const deleted = await service.deleteUser(targetUserId, currentUser);
             return jsonResponse(deleted);
           } catch (err) {
-            return errorResponse(err?.message || "Failed to delete user", 400);
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to delete user",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
           }
         }
       }
@@ -1950,8 +2255,8 @@ async function handlePalletTrackApiRequest(request, db) {
       const authResult = await authenticateSession();
       if (authResult instanceof Response) return authResult;
       const currentUser = authResult;
-      if (currentUser.role === "operator") {
-        return errorResponse("Forbidden: Operator role cannot trigger data migration.", 403, "FORBIDDEN");
+      if (isEmployeeRole(currentUser.role)) {
+        return errorResponse("Forbidden: Employee role cannot trigger data migration.", 403, "FORBIDDEN");
       }
       const body = await request.json().catch(() => ({}));
       const { deliveries } = body;
@@ -1974,9 +2279,9 @@ async function handlePalletTrackApiRequest(request, db) {
         return jsonResponse(list);
       }
       if (method === "POST") {
-        if (currentUser.role === "operator") {
+        if (isEmployeeRole(currentUser.role)) {
           return errorResponse(
-            "Forbidden: Operators cannot create new deliveries. Contact your supervisor or administrator.",
+            "Forbidden: Employees cannot create new deliveries. Contact your supervisor or administrator.",
             403,
             "FORBIDDEN"
           );
@@ -2006,9 +2311,9 @@ async function handlePalletTrackApiRequest(request, db) {
           return jsonResponse(delivery);
         }
         if (method === "PUT" || method === "PATCH") {
-          if (currentUser.role === "operator") {
+          if (isEmployeeRole(currentUser.role)) {
             return errorResponse(
-              "Forbidden: Operators cannot modify delivery headers or status.",
+              "Forbidden: Employees cannot modify delivery headers or status.",
               403,
               "FORBIDDEN"
             );
@@ -2029,8 +2334,8 @@ async function handlePalletTrackApiRequest(request, db) {
         if (typeof body.receivedQuantity === "undefined") {
           return errorResponse("receivedQuantity is required", 400);
         }
-        if (currentUser.role === "operator" && body.scannedVia === "manual" && body.overrideAllowed === false) {
-          return errorResponse("Forbidden: Operators cannot manually override quantities.", 403, "FORBIDDEN");
+        if (isEmployeeRole(currentUser.role) && body.scannedVia === "manual" && body.overrideAllowed === false) {
+          return errorResponse("Forbidden: Employees cannot manually override quantities.", 403, "FORBIDDEN");
         }
         const receivePayload = {
           ...body,

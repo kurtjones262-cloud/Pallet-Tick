@@ -154,7 +154,12 @@ export function isBackendOnline(): boolean {
 // PHASE 2: AUTHENTICATION API METHODS
 // ==========================================
 
-export async function apiCheckProvisionStatus(): Promise<{ hasAdmin: boolean; totalUsers: number }> {
+export async function apiCheckProvisionStatus(): Promise<{
+  hasSuperAdmin?: boolean;
+  hasAdmin: boolean;
+  adminCount?: number;
+  totalUsers: number;
+}> {
   const url = resolveApiUrl('/api/auth/provision-status');
   const res = await fetch(url, {
     method: 'GET',
@@ -170,6 +175,7 @@ export async function apiSetupAdmin(data: {
   employeeName: string;
   employeeCode: string;
   pin: string;
+  setupSecret?: string;
 }): Promise<{ success: boolean; user: UserAccount; token: string }> {
   const url = resolveApiUrl('/api/auth/setup-admin');
   const res = await fetch(url, {
@@ -180,7 +186,7 @@ export async function apiSetupAdmin(data: {
 
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body.error || 'Failed to setup initial Administrator.');
+    throw new Error(body.error || 'Failed to setup initial Super Admin.');
   }
 
   setAuthToken(body.token);

@@ -380,7 +380,7 @@ export default {
 
     if (url.pathname === '/api/health') {
       if (env.DB) {
-        const dbRes = await handlePalletTrackApiRequest(request, env.DB);
+        const dbRes = await handlePalletTrackApiRequest(request, env.DB, env);
         if (dbRes) return dbRes;
       }
       return new Response(
@@ -418,7 +418,7 @@ export default {
           }
         );
       }
-      const apiResponse = await handlePalletTrackApiRequest(request, env.DB);
+      const apiResponse = await handlePalletTrackApiRequest(request, env.DB, env);
       if (apiResponse) return apiResponse;
     }
 

@@ -3,6 +3,7 @@ import {
   Users,
   UserPlus,
   Shield,
+  ShieldAlert,
   UserCheck,
   HardHat,
   Search,
@@ -51,13 +52,15 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
   // Form states for Add / Edit
   const [formName, setFormName] = useState('');
   const [formCode, setFormCode] = useState('');
-  const [formRole, setFormRole] = useState<UserRole>('operator');
+  const [formRole, setFormRole] = useState<UserRole>('employee');
   const [formPin, setFormPin] = useState('');
   const [formActive, setFormActive] = useState(true);
   const [formSubmitting, setFormSubmitting] = useState(false);
 
   // Form state for Reset PIN
   const [newPin, setNewPin] = useState('');
+
+  const isCurrentUserSuperAdmin = currentUser.role === 'super_admin';
 
   const loadUsers = useCallback(async () => {
     setIsLoading(true);
@@ -66,7 +69,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
       const data = await apiGetUsers();
       setUsers(data);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to load employee accounts.');
+      setErrorMessage(err?.message || 'Failed to load user accounts.');
     } finally {
       setIsLoading(false);
     }
@@ -85,14 +88,15 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
     const matchesQuery =
       u.employeeName.toLowerCase().includes(searchQuery.toLowerCase()) ||
       u.employeeCode.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesRole = roleFilter === 'all' || u.role === roleFilter;
+    const normalizedRole = u.role === 'operator' ? 'employee' : u.role;
+    const matchesRole = roleFilter === 'all' || normalizedRole === roleFilter;
     return matchesQuery && matchesRole;
   });
 
   const handleOpenAdd = () => {
     setFormName('');
     setFormCode(`EMP-${Math.floor(100 + Math.random() * 900)}`);
-    setFormRole('operator');
+    setFormRole('employee');
     setFormPin('');
     setFormActive(true);
     setErrorMessage(null);
@@ -104,7 +108,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
     setEditingUser(user);
     setFormName(user.employeeName);
     setFormCode(user.employeeCode);
-    setFormRole(user.role);
+    setFormRole(user.role === 'operator' ? 'employee' : user.role);
     setFormActive(user.active);
     setErrorMessage(null);
     setSuccessMessage(null);
@@ -134,11 +138,11 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
         pin: formPin.trim(),
       });
 
-      setSuccessMessage(`Employee ${formName} (${formCode.toUpperCase()}) created successfully.`);
+      setSuccessMessage(`Account ${formName} (${formCode.toUpperCase()}) created with role ${formRole.toUpperCase()}.`);
       setIsAddUserOpen(false);
       await loadUsers();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to create employee.');
+      setErrorMessage(err?.message || 'Failed to create account.');
     } finally {
       setFormSubmitting(false);
     }
@@ -159,11 +163,11 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
         active: formActive,
       });
 
-      setSuccessMessage(`Updated employee ${formName}.`);
+      setSuccessMessage(`Updated account ${formName}.`);
       setEditingUser(null);
       await loadUsers();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to update employee.');
+      setErrorMessage(err?.message || 'Failed to update account.');
     } finally {
       setFormSubmitting(false);
     }
@@ -199,11 +203,11 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
 
     try {
       await apiDeleteUser(deletingUser.id);
-      setSuccessMessage(`Employee deleted while preserving all historical scan records.`);
+      setSuccessMessage(`Account deleted while preserving all historical scan records.`);
       setDeletingUser(null);
       await loadUsers();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to delete employee.');
+      setErrorMessage(err?.message || 'Failed to delete account.');
     } finally {
       setFormSubmitting(false);
     }
@@ -211,6 +215,13 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
 
   const getRoleBadge = (role: UserRole) => {
     switch (role) {
+      case 'super_admin':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-amber-950/80 border border-amber-500/40 text-amber-300">
+            <ShieldAlert className="w-3 h-3 text-amber-400" />
+            Super Admin
+          </span>
+        );
       case 'admin':
         return (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-indigo-950/80 border border-indigo-500/40 text-indigo-300">
@@ -225,16 +236,26 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
             Supervisor
           </span>
         );
+      case 'employee':
       case 'operator':
       default:
         return (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-emerald-950/80 border border-emerald-500/40 text-emerald-300">
             <HardHat className="w-3 h-3 text-emerald-400" />
-            Operator
+            Employee
           </span>
         );
     }
   };
+
+  const availableRolesForAssignment: Array<{ role: UserRole; label: string; desc: string }> = [
+    { role: 'employee', label: 'Employee', desc: 'Scanning & workshop' },
+    { role: 'supervisor', label: 'Supervisor', desc: 'Orders & operations' },
+    { role: 'admin', label: 'Admin', desc: 'Manage users & orders' },
+    ...(isCurrentUserSuperAdmin
+      ? [{ role: 'super_admin' as UserRole, label: 'Super Admin', desc: 'Unrestricted access' }]
+      : []),
+  ];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
@@ -248,14 +269,14 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-base font-bold text-white font-mono uppercase tracking-wide">
-                  Employee User Management
+                  User & Role Management
                 </h2>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-950 border border-indigo-500/40 text-indigo-300 font-mono font-bold">
-                  ADMIN ONLY
+                  MULTI-ADMIN RBAC
                 </span>
               </div>
               <p className="text-xs text-slate-400 font-sans">
-                Manage workshop accounts, assign permissions, reset PINs, and audit employee scan events.
+                Manage Super Admin, Admin, Supervisor, and Employee accounts, PINs, and audit trails.
               </p>
             </div>
           </div>
@@ -283,9 +304,9 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
 
         {/* Toolbar: Search, Filters, Add Button */}
         <div className="p-4 sm:px-5 border-b border-[#1E2D44] flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 shrink-0 bg-[#0A0F1A]/50">
-          <div className="flex items-center gap-2 flex-1">
+          <div className="flex flex-wrap items-center gap-2 flex-1">
             {/* Search Input */}
-            <div className="relative flex-1 max-w-sm">
+            <div className="relative flex-1 min-w-[180px] max-w-sm">
               <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
               <input
                 type="text"
@@ -298,18 +319,26 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
 
             {/* Role Filter Tabs */}
             <div className="flex items-center gap-1 bg-[#070A0F] p-1 rounded-lg border border-[#1E2D44]">
-              {(['all', 'admin', 'supervisor', 'operator'] as const).map((r) => (
+              {(
+                [
+                  { id: 'all', label: 'All' },
+                  { id: 'super_admin', label: 'Super Admin' },
+                  { id: 'admin', label: 'Admin' },
+                  { id: 'supervisor', label: 'Supervisor' },
+                  { id: 'employee', label: 'Employee' },
+                ] as const
+              ).map((r) => (
                 <button
-                  key={r}
+                  key={r.id}
                   type="button"
-                  onClick={() => setRoleFilter(r)}
+                  onClick={() => setRoleFilter(r.id as 'all' | UserRole)}
                   className={`px-2 py-1 text-[10px] font-mono font-bold uppercase rounded cursor-pointer transition-colors ${
-                    roleFilter === r
+                    roleFilter === r.id
                       ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  {r}
+                  {r.label}
                 </button>
               ))}
             </div>
@@ -321,7 +350,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
             className="px-3.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black font-bold font-mono text-xs uppercase tracking-wider transition-all cursor-pointer shadow-[0_0_12px_rgba(0,168,255,0.3)] flex items-center justify-center gap-1.5 shrink-0"
           >
             <UserPlus className="w-4 h-4" />
-            <span>Add Employee</span>
+            <span>Add Account</span>
           </button>
         </div>
 
@@ -330,27 +359,31 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
           {isLoading ? (
             <div className="py-12 flex flex-col items-center justify-center text-slate-400 gap-2">
               <Loader2 className="w-6 h-6 animate-spin text-cyan-400" />
-              <span className="text-xs font-mono">Loading employee accounts...</span>
+              <span className="text-xs font-mono">Loading accounts...</span>
             </div>
           ) : filteredUsers.length === 0 ? (
             <div className="py-12 text-center text-slate-500 font-mono text-xs">
-              No employee accounts found matching "{searchQuery}".
+              No accounts found matching "{searchQuery}".
             </div>
           ) : (
             <div className="border border-[#1E2D44] rounded-xl overflow-hidden bg-[#070A0F]">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-[#0E1626] border-b border-[#1E2D44] text-[10px] font-mono uppercase text-slate-400 tracking-wider">
-                    <th className="py-3 px-3.5">Employee</th>
+                    <th className="py-3 px-3.5">Account / Identifier</th>
                     <th className="py-3 px-3">Role</th>
                     <th className="py-3 px-3">Status</th>
-                    <th className="py-3 px-3 hidden md:table-cell">Activity</th>
+                    <th className="py-3 px-3 hidden md:table-cell">Audit & Activity</th>
                     <th className="py-3 px-3 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1E2D44]/60">
                   {filteredUsers.map((u) => {
                     const isSelf = u.id === currentUser.id;
+                    const isTargetSuperAdmin = u.role === 'super_admin';
+                    // Admins cannot edit, reset PIN, or delete a Super Admin
+                    const canModifyTarget = isCurrentUserSuperAdmin || !isTargetSuperAdmin;
+
                     return (
                       <tr key={u.id} className="hover:bg-white/[0.02] transition-colors">
                         <td className="py-3 px-3.5">
@@ -386,48 +419,59 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
                         <td className="py-3 px-3 hidden md:table-cell text-slate-400 font-mono text-[11px]">
                           <div>
                             <span className="text-white font-bold">{u.totalScans || 0}</span> scans
+                            {u.createdAt && (
+                              <span className="text-slate-500 text-[10px] ml-2">
+                                · Created {new Date(u.createdAt).toLocaleDateString()}
+                              </span>
+                            )}
                           </div>
-                          <div className="text-[10px] text-slate-500 truncate max-w-[150px]">
+                          <div className="text-[10px] text-slate-500 truncate max-w-[200px]">
                             {u.lastLoginAt
-                              ? `Logged in ${new Date(u.lastLoginAt).toLocaleDateString()}`
+                              ? `Last login: ${new Date(u.lastLoginAt).toLocaleDateString()}`
                               : 'Never logged in'}
                           </div>
                         </td>
 
                         <td className="py-3 px-3 text-right whitespace-nowrap">
-                          <div className="flex items-center justify-end gap-1.5">
-                            {/* Reset PIN */}
-                            <button
-                              type="button"
-                              onClick={() => handleOpenResetPin(u)}
-                              title="Reset 4-digit PIN"
-                              className="p-1.5 rounded-lg bg-white/5 hover:bg-cyan-500/20 hover:text-cyan-300 text-slate-400 transition-colors cursor-pointer"
-                            >
-                              <KeyRound className="w-3.5 h-3.5" />
-                            </button>
-
-                            {/* Edit */}
-                            <button
-                              type="button"
-                              onClick={() => handleOpenEdit(u)}
-                              title="Edit employee details"
-                              className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 hover:text-white text-slate-400 transition-colors cursor-pointer"
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-
-                            {/* Delete (if not self) */}
-                            {!isSelf && (
+                          {canModifyTarget ? (
+                            <div className="flex items-center justify-end gap-1.5">
+                              {/* Reset PIN */}
                               <button
                                 type="button"
-                                onClick={() => setDeletingUser(u)}
-                                title="Delete employee"
-                                className="p-1.5 rounded-lg bg-white/5 hover:bg-rose-500/20 hover:text-rose-300 text-slate-400 transition-colors cursor-pointer"
+                                onClick={() => handleOpenResetPin(u)}
+                                title="Reset 4-digit PIN"
+                                className="p-1.5 rounded-lg bg-white/5 hover:bg-cyan-500/20 hover:text-cyan-300 text-slate-400 transition-colors cursor-pointer"
                               >
-                                <Trash2 className="w-3.5 h-3.5" />
+                                <KeyRound className="w-3.5 h-3.5" />
                               </button>
-                            )}
-                          </div>
+
+                              {/* Edit */}
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEdit(u)}
+                                title="Edit account & role"
+                                className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 hover:text-white text-slate-400 transition-colors cursor-pointer"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+
+                              {/* Delete (if not self) */}
+                              {!isSelf && (
+                                <button
+                                  type="button"
+                                  onClick={() => setDeletingUser(u)}
+                                  title="Delete account"
+                                  className="p-1.5 rounded-lg bg-white/5 hover:bg-rose-500/20 hover:text-rose-300 text-slate-400 transition-colors cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-[10px] font-mono text-amber-400/70">
+                              Protected Super Admin
+                            </span>
+                          )}
                         </td>
                       </tr>
                     );
@@ -441,7 +485,10 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
         {/* Modal Footer */}
         <div className="p-4 bg-[#070A0F] border-t border-[#1E2D44] flex items-center justify-between text-xs font-mono text-slate-500 shrink-0">
           <div>
-            Total Employees: <span className="text-slate-300 font-bold">{users.length}</span>
+            Total Accounts: <span className="text-slate-300 font-bold">{users.length}</span> · Admins:{' '}
+            <span className="text-indigo-400 font-bold">
+              {users.filter((u) => u.role === 'super_admin' || u.role === 'admin').length}
+            </span>
           </div>
           <button
             type="button"
@@ -453,7 +500,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
         </div>
 
         {/* ------------------------------------------------------------- */}
-        {/* SUB-MODAL: Add Employee Form */}
+        {/* SUB-MODAL: Add Account Form */}
         {/* ------------------------------------------------------------- */}
         {isAddUserOpen && (
           <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
@@ -461,7 +508,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
               <div className="flex items-center justify-between pb-3 mb-4 border-b border-[#1E2D44]">
                 <h3 className="text-sm font-bold text-white font-mono uppercase flex items-center gap-2">
                   <UserPlus className="w-4 h-4 text-cyan-400" />
-                  Add New Employee
+                  Create User Account
                 </h3>
                 <button
                   onClick={() => setIsAddUserOpen(false)}
@@ -474,7 +521,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
               <form onSubmit={handleCreateSubmit} className="space-y-4">
                 <div>
                   <label className="block text-[11px] font-mono uppercase text-slate-400 mb-1">
-                    Employee Name
+                    Full Name
                   </label>
                   <input
                     type="text"
@@ -495,7 +542,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
                     required
                     value={formCode}
                     onChange={(e) => setFormCode(e.target.value.toUpperCase())}
-                    placeholder="e.g. EMP-105"
+                    placeholder="e.g. EMP-105 or ADMIN-02"
                     className="w-full px-3 py-2 bg-[#070A0F] border border-[#1E2D44] rounded-xl text-white font-mono text-xs uppercase focus:outline-none focus:border-cyan-500"
                   />
                 </div>
@@ -504,26 +551,20 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
                   <label className="block text-[11px] font-mono uppercase text-slate-400 mb-1">
                     Role & Permissions
                   </label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {(['operator', 'supervisor', 'admin'] as const).map((r) => (
+                  <div className="grid grid-cols-2 gap-2">
+                    {availableRolesForAssignment.map((r) => (
                       <button
-                        key={r}
+                        key={r.role}
                         type="button"
-                        onClick={() => setFormRole(r)}
+                        onClick={() => setFormRole(r.role)}
                         className={`p-2 rounded-xl text-left border cursor-pointer transition-all ${
-                          formRole === r
+                          formRole === r.role
                             ? 'bg-cyan-500/10 border-cyan-400 text-white'
                             : 'bg-[#070A0F] border-[#1E2D44] text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        <div className="text-[11px] font-mono font-bold uppercase">{r}</div>
-                        <div className="text-[9px] text-slate-500 mt-0.5">
-                          {r === 'operator'
-                            ? 'Scanning & verify'
-                            : r === 'supervisor'
-                            ? 'Deliveries & issues'
-                            : 'Full admin access'}
-                        </div>
+                        <div className="text-[11px] font-mono font-bold uppercase">{r.label}</div>
+                        <div className="text-[9px] text-slate-500 mt-0.5">{r.desc}</div>
                       </button>
                     ))}
                   </div>
@@ -561,7 +602,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
                     disabled={formSubmitting || formPin.length !== 4}
                     className="px-4 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black font-bold font-mono text-xs uppercase cursor-pointer disabled:opacity-40"
                   >
-                    {formSubmitting ? 'Creating...' : 'Create Employee'}
+                    {formSubmitting ? 'Creating...' : 'Create Account'}
                   </button>
                 </div>
               </form>
@@ -570,7 +611,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
         )}
 
         {/* ------------------------------------------------------------- */}
-        {/* SUB-MODAL: Edit Employee */}
+        {/* SUB-MODAL: Edit Account */}
         {/* ------------------------------------------------------------- */}
         {editingUser && (
           <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
@@ -578,7 +619,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
               <div className="flex items-center justify-between pb-3 mb-4 border-b border-[#1E2D44]">
                 <h3 className="text-sm font-bold text-white font-mono uppercase flex items-center gap-2">
                   <Edit2 className="w-4 h-4 text-cyan-400" />
-                  Edit Employee: {editingUser.employeeName}
+                  Edit Account: {editingUser.employeeName}
                 </h3>
                 <button
                   onClick={() => setEditingUser(null)}
@@ -591,7 +632,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
               <form onSubmit={handleEditSubmit} className="space-y-4">
                 <div>
                   <label className="block text-[11px] font-mono uppercase text-slate-400 mb-1">
-                    Employee Name
+                    Full Name
                   </label>
                   <input
                     type="text"
@@ -619,19 +660,19 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
                   <label className="block text-[11px] font-mono uppercase text-slate-400 mb-1">
                     Role & Permissions
                   </label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {(['operator', 'supervisor', 'admin'] as const).map((r) => (
+                  <div className="grid grid-cols-2 gap-2">
+                    {availableRolesForAssignment.map((r) => (
                       <button
-                        key={r}
+                        key={r.role}
                         type="button"
-                        onClick={() => setFormRole(r)}
+                        onClick={() => setFormRole(r.role)}
                         className={`p-2 rounded-xl text-left border cursor-pointer transition-all ${
-                          formRole === r
+                          formRole === r.role
                             ? 'bg-cyan-500/10 border-cyan-400 text-white'
                             : 'bg-[#070A0F] border-[#1E2D44] text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        <div className="text-[11px] font-mono font-bold uppercase">{r}</div>
+                        <div className="text-[11px] font-mono font-bold uppercase">{r.label}</div>
                       </button>
                     ))}
                   </div>
@@ -747,7 +788,7 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
             <div className="w-full max-w-sm bg-[#0E1626] border border-rose-500/40 rounded-2xl p-5 shadow-2xl">
               <div className="flex items-center gap-2.5 text-rose-400 text-sm font-bold font-mono uppercase mb-3">
                 <AlertTriangle className="w-5 h-5" />
-                Delete Employee Account?
+                Delete Account?
               </div>
 
               <p className="text-xs text-slate-300 leading-relaxed mb-4">

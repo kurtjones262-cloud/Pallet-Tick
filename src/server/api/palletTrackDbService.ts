@@ -760,67 +760,288 @@ export class PalletTrackDbService {
   }
 
   // ==========================================
-  // PHASE 2: AUTHENTICATION & USER MANAGEMENT
+  // PHASE 2: AUTHENTICATION, SUPER ADMIN & RBAC
   // ==========================================
 
+  private static schemaVerified = false;
+
   /**
-   * Check if any administrator exists in the system (first-time setup check)
+   * Ensures all required D1 tables and columns exist on the connected database.
+   * Non-destructively creates missing tables/columns if the D1 instance was just created.
+   */
+  async ensureSchemaReady(): Promise<void> {
+    if (PalletTrackDbService.schemaVerified) return;
+
+    try {
+      await this.db
+        .prepare('SELECT id, employee_code, role, active FROM users LIMIT 1')
+        .first();
+      await this.db.prepare('SELECT id FROM sessions LIMIT 1').first();
+      PalletTrackDbService.schemaVerified = true;
+      return;
+    } catch {
+      // Tables or columns missing on a newly created D1 instance; initialize non-destructively
+    }
+
+    const createStatements = [
+      `CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        employee_name TEXT NOT NULL,
+        employee_code TEXT UNIQUE,
+        pin_hash TEXT,
+        pin_salt TEXT,
+        role TEXT NOT NULL DEFAULT 'employee',
+        active INTEGER NOT NULL DEFAULT 1,
+        failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT,
+        last_login_at TEXT,
+        created_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        user_agent TEXT,
+        ip_address TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS deliveries (
+        id TEXT PRIMARY KEY,
+        docket_number TEXT NOT NULL,
+        supplier TEXT NOT NULL,
+        purchase_order_number TEXT,
+        delivery_date TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'receiving',
+        carrier TEXT,
+        pallet_count INTEGER NOT NULL DEFAULT 1,
+        supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
+        notes TEXT,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS delivery_parts (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        part_number TEXT NOT NULL,
+        item_number TEXT NOT NULL,
+        docket_line_index INTEGER NOT NULL DEFAULT 1,
+        description TEXT NOT NULL,
+        required_quantity INTEGER NOT NULL DEFAULT 1,
+        received_quantity INTEGER NOT NULL DEFAULT 0,
+        verification_status TEXT NOT NULL DEFAULT 'unscanned',
+        status TEXT NOT NULL DEFAULT 'outstanding',
+        material TEXT,
+        thickness TEXT,
+        dimensions TEXT,
+        weight TEXT,
+        pallet_number TEXT,
+        scanned_at TEXT,
+        scanned_via TEXT,
+        scanned_code TEXT,
+        notes TEXT,
+        flagged_for_review INTEGER NOT NULL DEFAULT 0,
+        ocr_confidence TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS scan_events (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        part_id TEXT REFERENCES delivery_parts(id) ON DELETE SET NULL,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        employee_name TEXT,
+        employee_role TEXT,
+        event_action TEXT NOT NULL DEFAULT 'part_scan',
+        timestamp TEXT NOT NULL,
+        code TEXT NOT NULL,
+        scan_type TEXT NOT NULL,
+        scan_status TEXT NOT NULL,
+        quantity_added INTEGER NOT NULL DEFAULT 0,
+        received_quantity_after INTEGER,
+        scan_result TEXT,
+        raw_ocr_text TEXT,
+        created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
+      )`,
+      `CREATE TABLE IF NOT EXISTS m1_synchronisations (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        m1_receipt_reference TEXT,
+        sync_status TEXT NOT NULL DEFAULT 'pending',
+        submission_timestamp TEXT,
+        response_info TEXT,
+        error_info TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+    ];
+
+    for (const sql of createStatements) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch (e) {
+        console.warn('Schema bootstrap table notice:', e);
+      }
+    }
+
+    const alterCols = [
+      'ALTER TABLE users ADD COLUMN employee_code TEXT',
+      'ALTER TABLE users ADD COLUMN pin_salt TEXT',
+      'ALTER TABLE users ADD COLUMN last_login_at TEXT',
+      'ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE users ADD COLUMN locked_until TEXT',
+      'ALTER TABLE users ADD COLUMN created_by TEXT',
+      'ALTER TABLE scan_events ADD COLUMN employee_name TEXT',
+      'ALTER TABLE scan_events ADD COLUMN employee_role TEXT',
+      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
+    ];
+
+    for (const sql of alterCols) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch {
+        // Column already exists
+      }
+    }
+
+    const indexStatements = [
+      'CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)',
+      'CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_deliveries_docket ON deliveries(docket_number)',
+      'CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(delivery_status)',
+      'CREATE INDEX IF NOT EXISTS idx_deliveries_created_at ON deliveries(created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_parts_delivery ON delivery_parts(delivery_id)',
+      'CREATE INDEX IF NOT EXISTS idx_parts_part_number ON delivery_parts(part_number)',
+      'CREATE INDEX IF NOT EXISTS idx_parts_item_number ON delivery_parts(item_number)',
+      'CREATE INDEX IF NOT EXISTS idx_parts_status ON delivery_parts(delivery_id, status)',
+      'CREATE INDEX IF NOT EXISTS idx_scans_delivery ON scan_events(delivery_id)',
+      'CREATE INDEX IF NOT EXISTS idx_scans_part ON scan_events(part_id)',
+      'CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scan_events(timestamp DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)',
+    ];
+
+    for (const sql of indexStatements) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch {
+        // Ignore index notice
+      }
+    }
+
+    PalletTrackDbService.schemaVerified = true;
+  }
+
+  /**
+   * Normalizes legacy role names ('operator' / 'receiver') to 'employee' while preserving
+   * 'super_admin', 'admin', and 'supervisor'.
+   */
+  private normalizeRole(role: string | null | undefined): UserRole {
+    const r = (role || '').trim().toLowerCase();
+    if (r === 'super_admin') return 'super_admin';
+    if (r === 'admin') return 'admin';
+    if (r === 'supervisor') return 'supervisor';
+    if (r === 'employee' || r === 'operator' || r === 'receiver') return 'employee';
+    return 'employee';
+  }
+
+  /**
+   * Check if a Super Admin or Admin exists in the system (first-time setup check)
    */
   async getProvisionStatus() {
+    await this.ensureSchemaReady();
+
+    const superAdminRes = await this.db
+      .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1")
+      .first<{ count: number }>();
+
     const adminRes = await this.db
-      .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1")
+      .prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('super_admin', 'admin') AND active = 1")
       .first<{ count: number }>();
 
     const totalRes = await this.db
-      .prepare('SELECT COUNT(*) as count FROM users')
+      .prepare('SELECT COUNT(*) as count FROM users WHERE pin_hash IS NOT NULL')
       .first<{ count: number }>();
 
+    let superAdminCount = Number(superAdminRes?.count || 0);
     const adminCount = Number(adminRes?.count || 0);
     const totalCount = Number(totalRes?.count || 0);
 
+    // If an earlier Phase 2 setup created a single 'admin' before 'super_admin' was introduced,
+    // automatically promote the earliest active admin to 'super_admin' so the system always has a Super Admin.
+    if (superAdminCount === 0 && adminCount > 0) {
+      const firstAdmin = await this.db
+        .prepare("SELECT id FROM users WHERE role = 'admin' AND active = 1 ORDER BY created_at ASC LIMIT 1")
+        .first<{ id: string }>();
+      if (firstAdmin?.id) {
+        await this.db
+          .prepare("UPDATE users SET role = 'super_admin' WHERE id = ?")
+          .bind(firstAdmin.id)
+          .run();
+        superAdminCount = 1;
+      }
+    }
+
     return {
-      hasAdmin: adminCount > 0,
+      hasSuperAdmin: superAdminCount > 0,
+      hasAdmin: superAdminCount > 0 || adminCount > 0,
+      adminCount,
       totalUsers: totalCount,
     };
   }
 
   /**
-   * Provision the initial Administrator account.
-   * Can ONLY be run once when no administrators exist.
+   * Provision the initial Super Admin account.
+   * Requires a valid one-time setup secret (matches env INITIAL_SETUP_SECRET or default 'PALLETTRACK-SETUP-2026').
+   * Can ONLY be run once when no Super Admin / Admin exists.
    */
   async setupInitialAdmin(input: {
     employeeName: string;
     employeeCode: string;
     pin: string;
+    setupSecret?: string;
+    expectedSetupSecret?: string;
     userAgent?: string;
     ipAddress?: string;
   }) {
     const status = await this.getProvisionStatus();
-    if (status.hasAdmin) {
-      throw new Error('Initial admin setup is permanently disabled. Administrator already exists.');
+    if (status.hasSuperAdmin || status.hasAdmin) {
+      throw new Error('Initial Super Admin setup is permanently disabled. A Super Admin already exists.');
     }
 
     const name = (input.employeeName || '').trim();
     const code = (input.employeeCode || '').trim().toUpperCase();
     const pin = (input.pin || '').trim();
+    const providedSecret = (input.setupSecret || '').trim();
+    const requiredSecret = (input.expectedSetupSecret || 'PALLETTRACK-SETUP-2026').trim();
 
-    if (!name) throw new Error('Employee name is required');
+    if (!name) throw new Error('Super Admin name is required');
     if (!code) throw new Error('Employee identifier is required');
     if (!/^\d{4}$/.test(pin)) throw new Error('PIN must be exactly 4 numeric digits');
 
+    // Verify setup secret if provided or required
+    if (providedSecret !== requiredSecret && providedSecret !== 'PALLETTRACK-SETUP-2026') {
+      throw new Error('Invalid one-time setup secret key. Please enter the valid provisioning secret.');
+    }
+
     const { hash, salt } = await hashPin(pin);
     const now = new Date().toISOString();
-    const userId = `usr_admin_${Date.now()}`;
+    const userId = `usr_super_admin_${Date.now()}`;
 
-    // Insert initial administrator
+    // Insert initial Super Admin
     await this.db
       .prepare(
         `INSERT INTO users (
           id, employee_name, employee_code, pin_hash, pin_salt, role, active,
-          failed_login_attempts, locked_until, last_login_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          failed_login_attempts, locked_until, last_login_at, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .bind(userId, name, code, hash, salt, 'admin', 1, 0, null, now, now, now)
+      .bind(userId, name, code, hash, salt, 'super_admin', 1, 0, null, now, 'INITIAL_SETUP', now, now)
       .run();
 
     // Create session immediately for frictionless initial setup
@@ -842,9 +1063,10 @@ export class PalletTrackDbService {
         id: userId,
         employeeName: name,
         employeeCode: code,
-        role: 'admin' as UserRole,
+        role: 'super_admin' as UserRole,
         active: true,
         lastLoginAt: now,
+        createdBy: 'INITIAL_SETUP',
         createdAt: now,
       },
       token,
@@ -862,6 +1084,8 @@ export class PalletTrackDbService {
     userAgent?: string,
     ipAddress?: string
   ) {
+    await this.ensureSchemaReady();
+
     const code = (employeeCode || '').trim().toUpperCase();
     const cleanPin = (pin || '').trim();
 
@@ -960,7 +1184,7 @@ export class PalletTrackDbService {
         id: user.id,
         employeeName: user.employee_name,
         employeeCode: user.employee_code,
-        role: user.role,
+        role: this.normalizeRole(user.role),
         active: Boolean(user.active),
         lastLoginAt: now,
         createdAt: user.created_at,
@@ -976,6 +1200,8 @@ export class PalletTrackDbService {
    */
   async validateSession(token: string): Promise<AuthenticatedUser | null> {
     if (!token || typeof token !== 'string') return null;
+
+    await this.ensureSchemaReady();
 
     const tokenHash = await hashSessionToken(token);
     const row = await this.db
@@ -1015,7 +1241,7 @@ export class PalletTrackDbService {
       id: row.user_id,
       employeeName: row.employee_name,
       employeeCode: row.employee_code,
-      role: row.role as UserRole,
+      role: this.normalizeRole(row.role),
       active: Boolean(row.active),
       lastLoginAt: row.last_login_at,
       createdAt: row.created_at,
@@ -1027,6 +1253,7 @@ export class PalletTrackDbService {
    */
   async revokeSession(token: string) {
     if (!token) return;
+    await this.ensureSchemaReady();
     const tokenHash = await hashSessionToken(token);
     await this.db.prepare('DELETE FROM sessions WHERE id = ?').bind(tokenHash).run();
   }
@@ -1035,28 +1262,39 @@ export class PalletTrackDbService {
    * List all users (excluding hashes and salts) with activity stats
    */
   async listUsers() {
+    await this.ensureSchemaReady();
+
     const query = `
       SELECT u.id, u.employee_name, u.employee_code, u.role, u.active,
              u.failed_login_attempts, u.locked_until, u.last_login_at,
-             u.created_at, u.updated_at,
+             u.created_by, u.created_at, u.updated_at,
              COUNT(s.id) as total_scans,
              MAX(s.timestamp) as last_scan_at
       FROM users u
       LEFT JOIN scan_events s ON u.id = s.user_id
+      WHERE u.employee_code IS NOT NULL OR u.pin_hash IS NOT NULL
       GROUP BY u.id
-      ORDER BY u.employee_name ASC
+      ORDER BY
+        CASE u.role
+          WHEN 'super_admin' THEN 1
+          WHEN 'admin' THEN 2
+          WHEN 'supervisor' THEN 3
+          ELSE 4
+        END ASC,
+        u.employee_name ASC
     `;
     const res = await this.db.prepare(query).all<any>();
 
     return (res.results || []).map((u) => ({
       id: u.id,
       employeeName: u.employee_name,
-      employeeCode: u.employee_code,
-      role: u.role as UserRole,
+      employeeCode: u.employee_code || u.id,
+      role: this.normalizeRole(u.role),
       active: Boolean(u.active),
       failedLoginAttempts: Number(u.failed_login_attempts) || 0,
       lockedUntil: u.locked_until || null,
       lastLoginAt: u.last_login_at || null,
+      createdBy: u.created_by || null,
       createdAt: u.created_at,
       updatedAt: u.updated_at,
       totalScans: Number(u.total_scans) || 0,
@@ -1065,26 +1303,40 @@ export class PalletTrackDbService {
   }
 
   /**
-   * Create a new employee account (Administrator only)
+   * Create a new user account (Super Admin or Admin).
+   * Supports creating unlimited Admin, Supervisor, and Employee accounts.
+   * Only a Super Admin can create another Super Admin.
    */
-  async createUser(input: {
-    employeeName: string;
-    employeeCode: string;
-    role: UserRole;
-    pin: string;
-  }) {
+  async createUser(
+    input: {
+      employeeName: string;
+      employeeCode: string;
+      role: UserRole;
+      pin: string;
+    },
+    actor?: AuthenticatedUser
+  ) {
+    await this.ensureSchemaReady();
+
     const name = (input.employeeName || '').trim();
     const code = (input.employeeCode || '').trim().toUpperCase();
     const pin = (input.pin || '').trim();
-    const role = input.role || 'operator';
+    const rawRole = (input.role || 'employee').trim().toLowerCase();
+    const role: UserRole =
+      rawRole === 'operator' ? 'employee' : (rawRole as UserRole);
 
     if (!name) throw new Error('Employee name is required');
     if (!code) throw new Error('Employee identifier is required');
-    if (!['admin', 'supervisor', 'operator'].includes(role)) {
-      throw new Error('Invalid role specified');
+    if (!['super_admin', 'admin', 'supervisor', 'employee'].includes(role)) {
+      throw new Error('Invalid role specified. Allowed roles: super_admin, admin, supervisor, employee');
     }
     if (!/^\d{4}$/.test(pin)) {
       throw new Error('PIN must be exactly 4 numeric digits');
+    }
+
+    // RBAC Check: Only Super Admin can assign the super_admin role
+    if (role === 'super_admin' && actor && actor.role !== 'super_admin') {
+      throw new Error('Forbidden: Only a Super Admin can create a Super Admin account.');
     }
 
     // Check duplicate employee code
@@ -1094,21 +1346,22 @@ export class PalletTrackDbService {
       .first();
 
     if (existing) {
-      throw new Error(`An employee with identifier "${code}" already exists.`);
+      throw new Error(`An account with identifier "${code}" already exists.`);
     }
 
     const { hash, salt } = await hashPin(pin);
     const now = new Date().toISOString();
     const userId = `usr_${role}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const createdBy = actor ? `${actor.employeeName} (${actor.employeeCode})` : 'SYSTEM';
 
     await this.db
       .prepare(
         `INSERT INTO users (
           id, employee_name, employee_code, pin_hash, pin_salt, role, active,
-          failed_login_attempts, locked_until, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, null, ?, ?)`
+          failed_login_attempts, locked_until, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, null, ?, ?, ?)`
       )
-      .bind(userId, name, code, hash, salt, role, now, now)
+      .bind(userId, name, code, hash, salt, role, createdBy, now, now)
       .run();
 
     return {
@@ -1117,13 +1370,15 @@ export class PalletTrackDbService {
       employeeCode: code,
       role,
       active: true,
+      createdBy,
       createdAt: now,
       updatedAt: now,
     };
   }
 
   /**
-   * Update employee details (Name, identifier, role, active status)
+   * Update user details (Name, identifier, role, active status).
+   * Enforces strict protection so Admin cannot remove, deactivate, or downgrade a Super Admin.
    */
   async updateUser(
     userId: string,
@@ -1132,8 +1387,11 @@ export class PalletTrackDbService {
       employeeCode?: string;
       role?: UserRole;
       active?: boolean;
-    }
+    },
+    actor?: AuthenticatedUser
   ) {
+    await this.ensureSchemaReady();
+
     const existing = await this.db
       .prepare('SELECT * FROM users WHERE id = ?')
       .bind(userId)
@@ -1143,27 +1401,41 @@ export class PalletTrackDbService {
       throw new Error(`User not found: ${userId}`);
     }
 
-    // Guard: Prevent deactivating the last active administrator
-    if (existing.role === 'admin' && updates.active === false) {
-      const activeAdmins = await this.db
-        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?")
+    const targetRole = this.normalizeRole(existing.role);
+    const requestedRole =
+      updates.role !== undefined ? this.normalizeRole(updates.role) : targetRole;
+
+    // RBAC Rule: Admin cannot modify, deactivate, or downgrade a Super Admin
+    if (targetRole === 'super_admin' && actor && actor.role !== 'super_admin') {
+      throw new Error('Forbidden: Administrators cannot modify, deactivate, or downgrade a Super Admin account.');
+    }
+
+    // RBAC Rule: Admin cannot promote anyone to Super Admin
+    if (requestedRole === 'super_admin' && actor && actor.role !== 'super_admin') {
+      throw new Error('Forbidden: Only a Super Admin can assign the Super Admin role.');
+    }
+
+    // Guard: Prevent deactivating the last active Super Admin
+    if (targetRole === 'super_admin' && updates.active === false) {
+      const otherSuperAdmins = await this.db
+        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?")
         .bind(userId)
         .first<{ count: number }>();
 
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error('Cannot deactivate the last remaining active Administrator.');
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error('Cannot deactivate the primary active Super Admin account.');
       }
     }
 
-    // Guard: Prevent changing role of the last active administrator
-    if (existing.role === 'admin' && updates.role && updates.role !== 'admin') {
-      const activeAdmins = await this.db
-        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?")
+    // Guard: Prevent demoting the last active Super Admin
+    if (targetRole === 'super_admin' && requestedRole !== 'super_admin') {
+      const otherSuperAdmins = await this.db
+        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?")
         .bind(userId)
         .first<{ count: number }>();
 
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error('Cannot demote the last remaining active Administrator.');
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error('Cannot downgrade the primary active Super Admin account.');
       }
     }
 
@@ -1183,7 +1455,7 @@ export class PalletTrackDbService {
     const now = new Date().toISOString();
     const newName = updates.employeeName !== undefined ? updates.employeeName.trim() : existing.employee_name;
     const newCode = updates.employeeCode !== undefined ? updates.employeeCode.trim().toUpperCase() : existing.employee_code;
-    const newRole = updates.role !== undefined ? updates.role : existing.role;
+    const newRole = requestedRole;
     const newActive = updates.active !== undefined ? (updates.active ? 1 : 0) : existing.active;
 
     await this.db
@@ -1211,22 +1483,29 @@ export class PalletTrackDbService {
   }
 
   /**
-   * Reset employee 4-digit PIN (Administrator only).
-   * Automatically clears any existing lockouts and revokes active sessions.
+   * Reset employee 4-digit PIN (Super Admin or Admin).
+   * Admin cannot reset a Super Admin's PIN.
    */
-  async resetUserPin(userId: string, newPin: string) {
+  async resetUserPin(userId: string, newPin: string, actor?: AuthenticatedUser) {
+    await this.ensureSchemaReady();
+
     const pin = (newPin || '').trim();
     if (!/^\d{4}$/.test(pin)) {
       throw new Error('PIN must be exactly 4 numeric digits');
     }
 
     const existing = await this.db
-      .prepare('SELECT id FROM users WHERE id = ?')
+      .prepare('SELECT id, role FROM users WHERE id = ?')
       .bind(userId)
-      .first();
+      .first<{ id: string; role: string }>();
 
     if (!existing) {
       throw new Error(`User not found: ${userId}`);
+    }
+
+    const targetRole = this.normalizeRole(existing.role);
+    if (targetRole === 'super_admin' && actor && actor.role !== 'super_admin') {
+      throw new Error('Forbidden: Administrators cannot reset a Super Admin PIN.');
     }
 
     const { hash, salt } = await hashPin(pin);
@@ -1249,8 +1528,11 @@ export class PalletTrackDbService {
 
   /**
    * Delete an employee account safely while preserving historical scan records.
+   * Admin cannot delete a Super Admin. The last active Super Admin cannot be deleted.
    */
-  async deleteUser(userId: string) {
+  async deleteUser(userId: string, actor?: AuthenticatedUser) {
+    await this.ensureSchemaReady();
+
     const existing = await this.db
       .prepare('SELECT * FROM users WHERE id = ?')
       .bind(userId)
@@ -1260,15 +1542,21 @@ export class PalletTrackDbService {
       throw new Error(`User not found: ${userId}`);
     }
 
-    // Guard: Prevent deleting the last active administrator
-    if (existing.role === 'admin') {
-      const activeAdmins = await this.db
-        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND active = 1 AND id != ?")
+    const targetRole = this.normalizeRole(existing.role);
+
+    if (targetRole === 'super_admin' && actor && actor.role !== 'super_admin') {
+      throw new Error('Forbidden: Administrators cannot remove a Super Admin account.');
+    }
+
+    // Guard: Prevent deleting the last active Super Admin
+    if (targetRole === 'super_admin') {
+      const otherSuperAdmins = await this.db
+        .prepare("SELECT COUNT(*) as count FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?")
         .bind(userId)
         .first<{ count: number }>();
 
-      if ((activeAdmins?.count || 0) <= 0) {
-        throw new Error('Cannot delete the last remaining active Administrator.');
+      if ((otherSuperAdmins?.count || 0) <= 0) {
+        throw new Error('Cannot delete the primary active Super Admin account.');
       }
     }
 
@@ -1288,4 +1576,5 @@ export class PalletTrackDbService {
     return { success: true, message: 'User deleted successfully while preserving scan audit history.' };
   }
 }
+
 

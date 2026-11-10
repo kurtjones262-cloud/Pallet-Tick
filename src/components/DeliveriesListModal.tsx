@@ -122,7 +122,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
             )}
 
 
-            {userRole !== 'operator' && (
+            {userRole !== 'employee' && userRole !== 'operator' && (
               <button
                 onClick={() => {
                   onClose();
@@ -243,7 +243,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                           <Archive className="w-3.5 h-3.5" />
                         )}
                       </button>
-                      {userRole !== 'operator' && (
+                      {userRole !== 'employee' && userRole !== 'operator' && (
                         <button
                           onClick={(e) => handleDelete(d.id, e)}
                           className="p-1 text-zinc-400 hover:text-red-600 transition-colors cursor-pointer"

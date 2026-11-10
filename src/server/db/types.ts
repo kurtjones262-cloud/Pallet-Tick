@@ -29,7 +29,7 @@ export interface D1Database {
   exec(query: string): Promise<{ count: number; duration: number }>;
 }
 
-export type UserRole = 'admin' | 'supervisor' | 'operator';
+export type UserRole = 'super_admin' | 'admin' | 'supervisor' | 'employee' | 'operator';
 
 export interface UserRow {
   id: string;
@@ -42,6 +42,7 @@ export interface UserRow {
   failed_login_attempts: number;
   locked_until: string | null;
   last_login_at: string | null;
+  created_by?: string | null;
   created_at: string;
   updated_at: string;
 }

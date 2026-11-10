@@ -202,21 +202,21 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
       {/* Main Login Card */}
       <div className="w-full max-w-sm mx-auto my-auto py-4">
-        {/* First-time Setup Prompt if no Admin exists */}
+        {/* First-time Setup Prompt if no Super Admin exists */}
         {!hasAdmin && (
           <div className="mb-4 p-4 rounded-xl bg-amber-950/40 border border-amber-500/40 text-amber-200">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-300 mb-1">
               <ShieldAlert className="w-4 h-4" />
-              Initial Setup Required
+              Initial Super Admin Setup Required
             </div>
             <p className="text-xs text-amber-200/90 leading-relaxed mb-3">
-              No administrator account exists yet. Create the primary administrator account to initialize PalletTrack.
+              No Super Admin account exists yet. Complete one-time provisioning to create the initial Super Admin and unlock multi-admin RBAC.
             </p>
             <button
               onClick={onOpenSetupAdmin}
               className="w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer flex items-center justify-center gap-1.5"
             >
-              <span>Setup Initial Administrator</span>
+              <span>Setup Initial Super Admin</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -382,7 +382,10 @@ export const LoginView: React.FC<LoginViewProps> = ({
           <p className="text-[11px] text-slate-500 font-mono">
             Fast 4-digit PIN authentication for workshop terminals
           </p>
-          <div className="flex items-center justify-center gap-3 mt-2 text-[10px] font-mono text-slate-400">
+          <div className="flex flex-wrap items-center justify-center gap-3 mt-2 text-[10px] font-mono text-slate-400">
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" /> Super Admin
+            </span>
             <span className="flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" /> Admin
             </span>
@@ -390,7 +393,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" /> Supervisor
             </span>
             <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Operator
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Employee
             </span>
           </div>
         </div>

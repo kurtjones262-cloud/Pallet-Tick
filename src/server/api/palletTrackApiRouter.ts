@@ -1,4 +1,4 @@
-import { D1Database, UserRole } from '../db/types.ts';
+import { D1Database } from '../db/types.ts';
 import { PalletTrackDbService, AuthenticatedUser } from './palletTrackDbService.ts';
 
 const CORS_HEADERS: Record<string, string> = {
@@ -64,9 +64,18 @@ function buildClearCookieHeader(): string {
   return `pallettrack_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
 }
 
+function isAdminRole(role?: string): boolean {
+  return role === 'super_admin' || role === 'admin';
+}
+
+function isEmployeeRole(role?: string): boolean {
+  return role === 'employee' || role === 'operator';
+}
+
 export async function handlePalletTrackApiRequest(
   request: Request,
-  db: D1Database
+  db: D1Database,
+  env?: { INITIAL_SETUP_SECRET?: string; [key: string]: unknown }
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -91,7 +100,15 @@ export async function handlePalletTrackApiRequest(
     request.headers.get('x-forwarded-for') ||
     undefined;
 
+  const expectedSetupSecret =
+    (typeof env?.INITIAL_SETUP_SECRET === 'string' && env.INITIAL_SETUP_SECRET.trim()) ||
+    (typeof process !== 'undefined' && process.env?.INITIAL_SETUP_SECRET?.trim()) ||
+    'PALLETTRACK-SETUP-2026';
+
   try {
+    // Ensure D1 schema and migrations are ready before any API query
+    await service.ensureSchemaReady();
+
     // -------------------------------------------------------------------------
     // 1. Health check with central database status
     // -------------------------------------------------------------------------
@@ -104,7 +121,9 @@ export async function handlePalletTrackApiRequest(
           app: 'PalletTrack',
           database: 'Cloudflare D1 (centralised)',
           dbConnected: Boolean(ping),
+          hasSuperAdmin: prov.hasSuperAdmin,
           hasAdmin: prov.hasAdmin,
+          adminCount: prov.adminCount,
           totalUsers: prov.totalUsers,
           timestamp: new Date().toISOString(),
         });
@@ -133,7 +152,7 @@ export async function handlePalletTrackApiRequest(
       return jsonResponse(status);
     }
 
-    // POST /api/auth/setup-admin (One-time initial Administrator provisioning)
+    // POST /api/auth/setup-admin (One-time initial Super Admin provisioning)
     if (path === '/api/auth/setup-admin' && method === 'POST') {
       const body: any = await request.json().catch(() => ({}));
       if (!body.employeeName || !body.employeeCode || !body.pin) {
@@ -147,6 +166,8 @@ export async function handlePalletTrackApiRequest(
           employeeName: body.employeeName,
           employeeCode: body.employeeCode,
           pin: body.pin,
+          setupSecret: body.setupSecret ?? 'PALLETTRACK-SETUP-2026',
+          expectedSetupSecret,
           userAgent,
           ipAddress,
         });
@@ -156,13 +177,13 @@ export async function handlePalletTrackApiRequest(
             user: result.user,
             token: result.token,
             expiresAt: result.expiresAt,
-            message: 'Initial Administrator provisioned successfully.',
+            message: 'Initial Super Admin provisioned successfully.',
           },
           201,
           { 'Set-Cookie': buildSetCookieHeader(result.token) }
         );
       } catch (err: any) {
-        return errorResponse(err.message || 'Failed to provision initial administrator', 400);
+        return errorResponse(err.message || 'Failed to provision initial Super Admin', 400);
       }
     }
 
@@ -238,11 +259,10 @@ export async function handlePalletTrackApiRequest(
     async function authenticateSession(): Promise<AuthenticatedUser | Response> {
       const token = extractToken(request);
       if (!token) {
-        // If system has no admin at all, inform client
         const prov = await service.getProvisionStatus();
         if (!prov.hasAdmin) {
           return errorResponse(
-            'Initial Administrator setup required before using PalletTrack.',
+            'Initial Super Admin setup required before using PalletTrack.',
             428,
             'SETUP_REQUIRED'
           );
@@ -266,36 +286,41 @@ export async function handlePalletTrackApiRequest(
     }
 
     // -------------------------------------------------------------------------
-    // 3. User Management Endpoints (Admin role strictly required)
+    // 3. User Management Endpoints (Super Admin and Admin roles allowed)
     // -------------------------------------------------------------------------
     if (path.startsWith('/api/users')) {
       const authResult = await authenticateSession();
       if (authResult instanceof Response) return authResult;
       const currentUser = authResult;
 
-      // Strict RBAC: Only Administrator can access User Management
-      if (currentUser.role !== 'admin') {
+      // Strict RBAC: Super Admin or Admin required to access User Management
+      if (!isAdminRole(currentUser.role)) {
         return errorResponse(
-          'Forbidden: Administrator privileges required to manage employee accounts.',
+          'Forbidden: Administrator privileges required to manage accounts.',
           403,
           'FORBIDDEN'
         );
       }
 
-      // GET /api/users - List all employees
+      // GET /api/users - List all users
       if (path === '/api/users' && method === 'GET') {
         const users = await service.listUsers();
         return jsonResponse(users);
       }
 
-      // POST /api/users - Create new employee
+      // POST /api/users - Create new user (Employee, Supervisor, Admin, or Super Admin)
       if (path === '/api/users' && method === 'POST') {
         const body: any = await request.json().catch(() => ({}));
         try {
-          const created = await service.createUser(body);
+          const created = await service.createUser(body, currentUser);
           return jsonResponse(created, 201);
         } catch (err: any) {
-          return errorResponse(err?.message || 'Failed to create employee', 400);
+          const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+          return errorResponse(
+            err?.message || 'Failed to create account',
+            isForbidden ? 403 : 400,
+            isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+          );
         }
       }
 
@@ -311,14 +336,20 @@ export async function handlePalletTrackApiRequest(
         // POST /api/users/:id/reset-pin
         if (sub === '/reset-pin' && method === 'POST') {
           const body: any = await request.json().catch(() => ({}));
-          if (!body.pin) {
+          const pinValue = body.pin ?? body.newPin;
+          if (!pinValue) {
             return errorResponse('New 4-digit PIN is required.', 400);
           }
           try {
-            const res = await service.resetUserPin(targetUserId, body.pin);
+            const res = await service.resetUserPin(targetUserId, pinValue, currentUser);
             return jsonResponse(res);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to reset PIN', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to reset PIN',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
 
@@ -326,20 +357,30 @@ export async function handlePalletTrackApiRequest(
         if ((sub === '' || sub === '/') && (method === 'PATCH' || method === 'PUT')) {
           const body: any = await request.json().catch(() => ({}));
           try {
-            const updated = await service.updateUser(targetUserId, body);
+            const updated = await service.updateUser(targetUserId, body, currentUser);
             return jsonResponse(updated);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to update user', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to update user',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
 
         // DELETE /api/users/:id
         if ((sub === '' || sub === '/') && method === 'DELETE') {
           try {
-            const deleted = await service.deleteUser(targetUserId);
+            const deleted = await service.deleteUser(targetUserId, currentUser);
             return jsonResponse(deleted);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to delete user', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to delete user',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
       }
@@ -353,9 +394,9 @@ export async function handlePalletTrackApiRequest(
       if (authResult instanceof Response) return authResult;
       const currentUser = authResult;
 
-      // Operator cannot trigger bulk migrations
-      if (currentUser.role === 'operator') {
-        return errorResponse('Forbidden: Operator role cannot trigger data migration.', 403, 'FORBIDDEN');
+      // Employees cannot trigger bulk migrations
+      if (isEmployeeRole(currentUser.role)) {
+        return errorResponse('Forbidden: Employee role cannot trigger data migration.', 403, 'FORBIDDEN');
       }
 
       const body: any = await request.json().catch(() => ({}));
@@ -379,17 +420,17 @@ export async function handlePalletTrackApiRequest(
       if (authResult instanceof Response) return authResult;
       const currentUser = authResult;
 
-      // GET /api/deliveries (All authenticated users: admin, supervisor, operator)
+      // GET /api/deliveries (All authenticated users: super_admin, admin, supervisor, employee)
       if (method === 'GET') {
         const list = await service.listDeliveries();
         return jsonResponse(list);
       }
 
-      // POST /api/deliveries (Admin and Supervisor only; Operator restricted)
+      // POST /api/deliveries (Super Admin, Admin, and Supervisor; Employee restricted)
       if (method === 'POST') {
-        if (currentUser.role === 'operator') {
+        if (isEmployeeRole(currentUser.role)) {
           return errorResponse(
-            'Forbidden: Operators cannot create new deliveries. Contact your supervisor or administrator.',
+            'Forbidden: Employees cannot create new deliveries. Contact your supervisor or administrator.',
             403,
             'FORBIDDEN'
           );
@@ -429,10 +470,10 @@ export async function handlePalletTrackApiRequest(
 
         // PUT /api/deliveries/:id or PATCH /api/deliveries/:id
         if (method === 'PUT' || method === 'PATCH') {
-          // Operators cannot modify delivery metadata or complete deliveries
-          if (currentUser.role === 'operator') {
+          // Employees cannot modify delivery metadata or complete deliveries
+          if (isEmployeeRole(currentUser.role)) {
             return errorResponse(
-              'Forbidden: Operators cannot modify delivery headers or status.',
+              'Forbidden: Employees cannot modify delivery headers or status.',
               403,
               'FORBIDDEN'
             );
@@ -461,9 +502,9 @@ export async function handlePalletTrackApiRequest(
           return errorResponse('receivedQuantity is required', 400);
         }
 
-        // Operator restriction: If operator tries to manually override quantities without scanning
-        if (currentUser.role === 'operator' && body.scannedVia === 'manual' && body.overrideAllowed === false) {
-          return errorResponse('Forbidden: Operators cannot manually override quantities.', 403, 'FORBIDDEN');
+        // Employee restriction: If employee tries to manually override quantities when forbidden
+        if (isEmployeeRole(currentUser.role) && body.scannedVia === 'manual' && body.overrideAllowed === false) {
+          return errorResponse('Forbidden: Employees cannot manually override quantities.', 403, 'FORBIDDEN');
         }
 
         // Pass authenticated employee information server-side
@@ -487,7 +528,6 @@ export async function handlePalletTrackApiRequest(
       if (subPath === '/scans') {
         if (method === 'GET') {
           const scans = await service.getScanHistory(deliveryId);
-          // If operator, can view scan history for this delivery
           return jsonResponse(scans);
         }
 

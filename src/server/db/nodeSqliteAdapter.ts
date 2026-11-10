@@ -94,10 +94,50 @@ export class NodeSqliteD1Adapter implements D1Database {
     safeAddCol('users', 'last_login_at TEXT');
     safeAddCol('users', 'failed_login_attempts INTEGER NOT NULL DEFAULT 0');
     safeAddCol('users', 'locked_until TEXT');
+    safeAddCol('users', 'created_by TEXT');
 
     safeAddCol('scan_events', 'employee_name TEXT');
     safeAddCol('scan_events', 'employee_role TEXT');
     safeAddCol('scan_events', "event_action TEXT DEFAULT 'part_scan'");
+
+    // Upgrade users table if an older local SQLite table had a restrictive role CHECK constraint
+    try {
+      const tblInfo = this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
+        .get() as { sql?: string } | undefined;
+      if (tblInfo?.sql && tblInfo.sql.includes('CHECK') && !tblInfo.sql.includes('super_admin')) {
+        this.db.exec('PRAGMA foreign_keys = OFF;');
+        this.db.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            employee_code TEXT UNIQUE,
+            pin_hash TEXT,
+            pin_salt TEXT,
+            role TEXT NOT NULL DEFAULT 'employee' CHECK (role IN ('super_admin', 'admin', 'supervisor', 'employee', 'operator')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
+            last_login_at TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO users_new (
+            id, employee_name, employee_code, pin_hash, pin_salt, role, active,
+            failed_login_attempts, locked_until, last_login_at, created_by, created_at, updated_at
+          )
+          SELECT
+            id, employee_name, employee_code, pin_hash, pin_salt,
+            CASE WHEN role IN ('receiver', 'operator') THEN 'employee' ELSE role END,
+            active, COALESCE(failed_login_attempts, 0), locked_until, last_login_at, created_by, created_at, updated_at
+          FROM users;
+          DROP TABLE users;
+          ALTER TABLE users_new RENAME TO users;
+        `);
+        this.db.exec('PRAGMA foreign_keys = ON;');
+      }
+    } catch {}
 
     try {
       this.db.exec(`

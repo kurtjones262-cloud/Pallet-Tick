@@ -4,18 +4,19 @@
 PRAGMA foreign_keys = ON;
 
 -- 1. Users Table
--- Stores warehouse personnel, receivers, and administrators
+-- Stores Super Admins, Admins, Supervisors, and Employees
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   employee_name TEXT NOT NULL,
   employee_code TEXT UNIQUE,
   pin_hash TEXT,
   pin_salt TEXT,
-  role TEXT NOT NULL DEFAULT 'operator' CHECK (role IN ('admin', 'supervisor', 'operator')),
+  role TEXT NOT NULL DEFAULT 'employee' CHECK (role IN ('super_admin', 'admin', 'supervisor', 'employee', 'operator')),
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
   failed_login_attempts INTEGER NOT NULL DEFAULT 0,
   locked_until TEXT,
   last_login_at TEXT,
+  created_by TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

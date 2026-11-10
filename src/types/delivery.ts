@@ -140,7 +140,7 @@ export interface AppSettings {
   darkHighContrast: boolean;
 }
 
-export type UserRole = 'admin' | 'supervisor' | 'operator';
+export type UserRole = 'super_admin' | 'admin' | 'supervisor' | 'employee' | 'operator';
 
 export interface UserAccount {
   id: string;
@@ -151,6 +151,7 @@ export interface UserAccount {
   failedLoginAttempts?: number;
   lockedUntil?: string | null;
   lastLoginAt?: string | null;
+  createdBy?: string | null;
   createdAt?: string;
   updatedAt?: string;
   totalScans?: number;

@@ -79,20 +79,29 @@ export function groupPositionedWordsIntoLines(
     return a.bbox.x0 - b.bbox.x0;
   });
 
-  const clusters: Array<{ cy: number; height: number; words: RawOcrWord[] }> = [];
+  const wordHeights = validWords
+    .map((w) => w.bbox.y1 - w.bbox.y0)
+    .filter((h) => h >= 10 && h <= 120)
+    .sort((a, b) => a - b);
+  const medianWordHeight =
+    wordHeights.length > 0 ? wordHeights[Math.floor(wordHeights.length / 2)] : 36;
+  const maxCenterDist = Math.max(16, Math.round(medianWordHeight * 0.55));
+
+  const clusters: Array<{ cy: number; words: RawOcrWord[] }> = [];
   for (const w of sorted) {
     const cy = (w.bbox.y0 + w.bbox.y1) / 2;
-    const h = Math.max(8, w.bbox.y1 - w.bbox.y0);
-    const existing = clusters.find(
-      (c) => Math.abs(c.cy - cy) <= Math.max(6, Math.min(c.height, h) * 0.6)
-    );
+
+    const existing = clusters.find((c) => Math.abs(c.cy - cy) <= maxCenterDist);
+
     if (existing) {
       existing.words.push(w);
-      // Update running vertical center
-      const totalY = existing.words.reduce((acc, item) => acc + (item.bbox.y0 + item.bbox.y1) / 2, 0);
+      const totalY = existing.words.reduce(
+        (acc, item) => acc + (item.bbox.y0 + item.bbox.y1) / 2,
+        0
+      );
       existing.cy = totalY / existing.words.length;
     } else {
-      clusters.push({ cy, height: h, words: [w] });
+      clusters.push({ cy, words: [w] });
     }
   }
 
@@ -492,16 +501,28 @@ export function validateDocketExtractionQuality(
     }
   }
 
-  // 6. Check for Potentially Missed Line Items (gaps in sequential printed No column 1..Max)
+  // 6. Check for Potentially Missed Line Items (gaps in sequential printed No column 1..Max or Min..Max)
   const missingRowNumbers: number[] = [];
   if (numericItemNumbers.length >= 2) {
     const sorted = [...numericItemNumbers].sort((a, b) => a - b);
-    const minNo = sorted[0];
-    const maxNo = sorted[sorted.length - 1];
-    // Only check contiguous sequence if numbering starts near 1 and span is reasonable (not arbitrary 4-digit item codes)
-    if (minNo <= 3 && maxNo - minNo <= items.length + 15 && maxNo <= 500) {
-      const presentSet = new Set(sorted);
-      for (let expectedNo = 1; expectedNo <= maxNo; expectedNo++) {
+
+    // Detect whether numbers cluster in a specific range (e.g. 165..188) and filter out single-digit outliers
+    // If the vast majority of row numbers are >= 50, numbers < 10 are spurious/fallback indices
+    const highNumbers = sorted.filter((n) => n >= 50);
+    const candidateNumbers =
+      highNumbers.length >= sorted.length * 0.7 && sorted.length >= 5
+        ? highNumbers
+        : sorted;
+
+    const minNo = candidateNumbers[0];
+    const maxNo = candidateNumbers[candidateNumbers.length - 1];
+    const span = maxNo - minNo + 1;
+
+    // Check contiguous sequence if span is within a reasonable range of the row count
+    if (span <= items.length + 15 && maxNo <= 2000) {
+      const presentSet = new Set(candidateNumbers);
+      const startNo = minNo <= 3 ? 1 : minNo;
+      for (let expectedNo = startNo; expectedNo <= maxNo; expectedNo++) {
         if (!presentSet.has(expectedNo)) {
           missingRowNumbers.push(expectedNo);
         }
@@ -556,7 +577,7 @@ export function validateDocketExtractionQuality(
       `sequence gap detected (missing No. ${missingRowNumbers.slice(0, 6).join(', ')})`
     );
   }
-  if (unparsedCandidateCount > 0) {
+  if (unparsedCandidateCount > Math.max(1, Math.floor(items.length * 0.15))) {
     fallbackReasons.push(`${unparsedCandidateCount} unparsed table candidate line(s)`);
   }
   if (overallConfidenceScore < 75) {
@@ -1250,6 +1271,8 @@ function extractTableItemsWithLayout(
 function looksLikeUnparsedTableCandidateLine(text: string): boolean {
   const clean = text.trim();
   if (clean.length < 6) return false;
+  // Pure numbers, punctuation, or table separators (e.g. "127 2", "1 1 0", "---") are fragments, not unparsed parts
+  if (/^[\d\s|.,\-_/\\()]+$/.test(clean)) return false;
   // Ignore street/suburb/postcode lines, page numbers ("1 of 2"), dates, and payment terms ("30 Days Net 30")
   if (
     /^\d{1,3}\s+of\s+\d{1,3}$/i.test(clean) ||
@@ -1290,9 +1313,14 @@ function isDetailContinuationLine(
     return false;
   }
 
-  // Reject if it contains a new structured part code AND ends with a numeric quantity
-  const hasNewPartCode = /\b([A-Z]{2,6}-[A-Z0-9\-_]{2,14})\b/.test(text);
+  // Reject if it contains a new structured part code (e.g. DKW2654723, LC-1001, J160799102)
+  const hasNewPartCode = /\b(?:DKW\d{6,8}|[A-Z]{2,6}-[A-Z0-9\-_]{2,14}|[A-Z]\d{8,10})\b/i.test(text);
   if (hasNewPartCode) {
+    return false;
+  }
+
+  // Reject if it contains table row quantity columns (e.g. "1 1 0", "8 8 0", "3 5 0")
+  if (/\b\d{1,3}\s+\d{1,4}\s+\d{1,4}\s+\d{1,4}\b/.test(text) || /\b\d{1,4}\s+\d{1,4}\s+\d{1,4}\s*\|\s*DKW/i.test(text)) {
     return false;
   }
 
@@ -1305,8 +1333,13 @@ function isDetailContinuationLine(
     }
   }
 
+  // Pallet allocation continuation lines: e.g. "On Pallets: 504812", "| | On Pallets: 505289"
+  if (/(?:on\s+)?pallets?\s*[:#]?\s*\d+/i.test(text)) {
+    return true;
+  }
+
   const hasDetailSpec =
-    /\b(?:\d{1,2}(?:\.\d)?\s*mm|\d+\/\d+\s*["″]|250\s*gr|350\s*gr|g250|g350|ha350|hardox|stainless|304|316|mild\s*steel|\d{2,4}\s*[xX]\s*\d{2,4}|\d+(?:\.\d+)?\s*kg|pallet\s*\d+|rev\s*[a-z0-9])\b/i.test(
+    /\b(?:\d{1,2}(?:\.\d)?\s*mm|\d+\/\d+\s*["″]|250\s*gr|350\s*gr|g250|g350|ha350|hardox|stainless|304|316|mild\s*steel|\d{2,4}\s*[xX]\s*\d{2,4}|\d+(?:\.\d+)?\s*kg|(?:on\s+)?pallets?\s*[:#]?\s*\d+|rev\s*[a-z0-9])\b/i.test(
       text
     );
   if (hasDetailSpec) return true;
@@ -1399,9 +1432,9 @@ export function extractPartSpecifications(rawInput: string): {
       ? revMatch[1].toUpperCase()
       : undefined;
 
-  // Explicit Pallet allocation on row: e.g. "Pallet 2", "Pallet 1 of 6", "Plt 3", "Skid 2"
+  // Explicit Pallet allocation on row: e.g. "Pallet 2", "Pallet 1 of 6", "Plt 3", "Skid 2", "On Pallets: 504812"
   const palletMatch = text.match(
-    /\b(?:pallet|plt|skid|pack)\s*#?\s*(\d{1,2}(?:\s*of\s*\d{1,2})?)\b/i
+    /\b(?:on\s+)?(?:pallets?|plt|skid|pack)\s*#?\s*[:#]?\s*(\d{1,8}(?:\s*of\s*\d{1,8})?)\b/i
   );
   const palletNumber = palletMatch ? `Pallet ${palletMatch[1].replace(/\s+/g, ' ')}` : undefined;
 
@@ -1539,6 +1572,14 @@ function parsePositionalAndSupplierLineItem(
 
   if (line.length < 4 || /^[\d\s\-*]+$/.test(line)) {
     return null;
+  }
+
+  // Standalone pallet allocation continuation or metadata line (e.g. "On Pallets: 504812", "On s: 505289")
+  if (/^\s*(?:\|\s*)?(?:on\s+)?pallets?\s*[:#]?\s*\d+/i.test(line) || /^\s*(?:on\s+)?s\s*[:#]\s*\d{4,8}\b/i.test(line)) {
+    const hasDistinctPart = /\b([A-Z]{2,6}[-_][A-Z0-9\-_]{2,14}|DKW\d{6,8})\b/i.test(line);
+    if (!hasDistinctPart) {
+      return null;
+    }
   }
 
   const specs = extractPartSpecifications(line);
@@ -1689,6 +1730,39 @@ function parsePositionalAndSupplierLineItem(
     }
   }
 
+  // 1c. Laser Central tabular format:
+  // e.g. "165 1 1 0 | DKW2412912 APJ1IZSZ8101A SS 3042B 1.2mm"
+  // or "A173 3 5 0 | DKW2654727 4PJ1MZFZ8105A"
+  // or "4177 5 5 0 | DKW2415641 1PW8233C"
+  // or "A 178 2 2 0 | DKW1323225 1PW8236A"
+  // or "V| 179 8 8 0 | DKW2415642 1PY8109A"
+  const laserCentralTabularRegex =
+    /(?:^|\s)(?:[A-Za-z|]{0,3}\s*|\*\s*)?([1-9]\d{0,3}|i\d{2})?\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})?\s*\|\s*([A-Za-z0-9\-_./]{3,24})\s*(.*)$/i;
+  const lcMatch = rawText.match(laserCentralTabularRegex);
+  if (lcMatch) {
+    if (!itemNumber && lcMatch[1]) {
+      let numStr = lcMatch[1];
+      if (/^i\d{2}$/i.test(numStr)) numStr = '1' + numStr.slice(1);
+      if (/^417[0-9]$/.test(numStr)) numStr = numStr.slice(1);
+      const parsedItemNo = parseInt(numStr, 10);
+      if (parsedItemNo > 0 && parsedItemNo <= 2000) {
+        itemNumber = String(parsedItemNo);
+      }
+    }
+    if (quantity === null) {
+      const despQty = parseInt(lcMatch[3], 10) || parseInt(lcMatch[2], 10);
+      if (despQty > 0 && despQty <= 10000) {
+        quantity = despQty;
+      }
+    }
+    if (!partNumber && lcMatch[5]) {
+      partNumber = lcMatch[5].trim().toUpperCase();
+    }
+    if (!description && lcMatch[6]) {
+      description = lcMatch[6].trim();
+    }
+  }
+
   // 2. Fallback / Supplement with deterministic token & supplier regex parsing across the line
   const cleanSingleSpaceLine = line.replace(/\s+/g, ' ').trim();
   let workingLine = cleanSingleSpaceLine;
@@ -1696,12 +1770,26 @@ function parsePositionalAndSupplierLineItem(
   // Remove trailing Pallet token from workingLine so "Pallet 1" isn't mistaken for Quantity = 1!
   if (specs.palletNumber) {
     workingLine = workingLine
-      .replace(/\b(?:pallet|plt|skid|pack)\s*#?\s*\d{1,2}(?:\s*of\s*\d{1,2})?\b/gi, ' ')
+      .replace(/\b(?:pallet|plt|skid|pack)\s*#?\s*\d{1,8}(?:\s*of\s*\d{1,8})?\b/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
   }
 
   // Extract Item Number if not already resolved from column layout
+  if (!itemNumber) {
+    // Check if line starts with line number or has line number before quantity triplet
+    const lcLineNoMatch = workingLine.match(/^(?:[A-Za-z|]{1,3}\s*|\*\s*)?([1-9]\d{0,3}|i\d{2})\s+\d{1,3}\s+\d{1,3}\s+\d{1,3}\b/i);
+    if (lcLineNoMatch) {
+      let numStr = lcLineNoMatch[1];
+      if (/^i\d{2}$/i.test(numStr)) numStr = '1' + numStr.slice(1);
+      if (/^417[0-9]$/.test(numStr)) numStr = numStr.slice(1);
+      const parsedItemNo = parseInt(numStr, 10);
+      if (parsedItemNo > 0 && parsedItemNo <= 2000) {
+        itemNumber = String(parsedItemNo);
+      }
+    }
+  }
+
   if (!itemNumber) {
     // Laser Central barcode-style item number (e.g. "894201-14" or "5500-2")
     const lcItemBarcodeMatch = workingLine.match(/^(\d{4,8})-0*(\d{1,4})\b/);
@@ -1732,6 +1820,13 @@ function parsePositionalAndSupplierLineItem(
   }
 
   // Extract Part Number if not already resolved from column layout
+  if (!partNumber) {
+    const dkwMatch = workingLine.match(/\b(DKW\d{6,8})\b/i);
+    if (dkwMatch) {
+      partNumber = dkwMatch[1].toUpperCase();
+    }
+  }
+
   if (!partNumber) {
     const dxfMatch = workingLine.match(/\b([A-Za-z0-9][A-Za-z0-9\-_./]{1,24})\.(?:dxf|dwg|nc1|step|stp)\b/i);
     if (dxfMatch) {
@@ -1765,7 +1860,7 @@ function parsePositionalAndSupplierLineItem(
       for (const candidate of alphaNumMatches) {
         const upper = candidate.toUpperCase();
         if (/^\d+(?:MM|CM|M|KG|G|LB|EA|PC|PCS|GR|OFF|X\d+)$/i.test(upper)) continue;
-        if (/^(?:G250|G350|GR250|GR350|HA350|HW350|SS304|SS316|304SS|316SS|AS3678|AS4100|Q235|A36|PALLET\d*)$/i.test(upper)) {
+        if (/^(?:G250|G350|GR250|GR350|HA350|HW350|SS304|SS316|304SS|316SS|3042B|3041B|3162B|SS3042B|SS3041B|2B|1B|AS3678|AS4100|Q235|A36|PALLET\d*)$/i.test(upper)) {
           continue;
         }
         if (/^\d+[X*]\d+/i.test(upper)) continue;
@@ -1776,12 +1871,25 @@ function parsePositionalAndSupplierLineItem(
     }
   }
 
+  // Quantity triplet fallback
+  if (quantity === null) {
+    const qtyTripletMatch = workingLine.match(/\b(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})\b/);
+    if (qtyTripletMatch) {
+      const desp = parseInt(qtyTripletMatch[2], 10) || parseInt(qtyTripletMatch[1], 10);
+      if (desp > 0 && desp <= 10000) {
+        quantity = desp;
+      }
+    }
+  }
+
   if (!partNumber) {
     const numericPartMatches = workingLine.match(/\b(\d{6,12})\b/g);
     if (numericPartMatches) {
       for (const candidate of numericPartMatches) {
         if (candidate === docketNumber) continue;
         if (/^\d{8}$/.test(candidate) && /^(?:19|20)\d{6}$/.test(candidate)) continue;
+        if (specs.palletNumber && specs.palletNumber.includes(candidate)) continue;
+        if (new RegExp(`(?:pallet|plt|skid|on\\s+s|pack)\\s*#?\\s*[:#]?\\s*${candidate}`, 'i').test(rawText)) continue;
         partNumber = candidate;
         break;
       }

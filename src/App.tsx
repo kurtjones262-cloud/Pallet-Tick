@@ -28,6 +28,7 @@ import { FirstTimeAdminSetupModal } from './components/FirstTimeAdminSetupModal'
 import { UserManagementModal } from './components/UserManagementModal';
 import {
   apiGetSession,
+  apiLogin,
   apiLogout,
   apiCheckProvisionStatus,
   getStoredUser,
@@ -104,8 +105,29 @@ export function App() {
           setCurrentUser(session.user);
         }
       } catch {
+        // In development/preview environment, if no active session exists and the user
+        // has not explicitly signed out, auto-authenticate the default terminal account
+        // so the preview opens directly into the working workspace.
+        let restoredUser: UserAccount | null = null;
+        try {
+          const explicitLogout =
+            typeof sessionStorage !== 'undefined' &&
+            sessionStorage.getItem('pallettrack_explicit_logout') === 'true';
+          if (import.meta.env.DEV && !explicitLogout) {
+            try {
+              const autoRes = await apiLogin('SUPER-01', '1234');
+              restoredUser = autoRes.user;
+            } catch {
+              const fallbackRes = await apiLogin('ADMIN-01', '1111');
+              restoredUser = fallbackRes.user;
+            }
+          }
+        } catch {
+          restoredUser = null;
+        }
+
         if (isMounted) {
-          setCurrentUser(null);
+          setCurrentUser(restoredUser);
         }
       } finally {
         if (isMounted) {
@@ -169,6 +191,9 @@ export function App() {
   };
 
   const handleLoginSuccess = (user: UserAccount) => {
+    try {
+      sessionStorage.removeItem('pallettrack_explicit_logout');
+    } catch {}
     setCurrentUser(user);
     setHasAdmin(true);
     setIsFirstTimeSetupOpen(false);
@@ -178,6 +203,9 @@ export function App() {
   };
 
   const handleLogout = async () => {
+    try {
+      sessionStorage.setItem('pallettrack_explicit_logout', 'true');
+    } catch {}
     await apiLogout();
     setCurrentUser(null);
     setActiveTab('dashboard');

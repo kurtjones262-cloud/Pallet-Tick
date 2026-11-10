@@ -335,7 +335,7 @@ export class PalletTrackDbService {
     const palletCount = Math.max(1, Number(input.palletCount) || 1);
     const supplierProfile = input.supplierProfile || 'laser_central';
     const notes = input.notes || null;
-    const createdBy = input.createdBy || 'usr_receiver_default';
+    const createdBy = input.createdBy || null;
 
     if (!docketNumber) {
       throw new Error('docketNumber is required');
@@ -704,7 +704,7 @@ export class PalletTrackDbService {
     const now = new Date().toISOString();
     const partId = input.id || `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const actorName = actor?.employeeName || 'Authorized User';
-    const actorId = actor?.id || 'usr_receiver_default';
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || 'supervisor';
 
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -994,7 +994,7 @@ export class PalletTrackDbService {
 
     const now = new Date().toISOString();
     const actorName = actor?.employeeName || 'Authorized User';
-    const actorId = actor?.id || 'usr_receiver_default';
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || 'supervisor';
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const auditMessage =
@@ -1129,7 +1129,7 @@ export class PalletTrackDbService {
 
     const now = new Date().toISOString();
     const actorName = actor?.employeeName || 'Authorized User';
-    const actorId = actor?.id || 'usr_receiver_default';
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || 'supervisor';
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const wasScannedNote = isScanned
@@ -1274,7 +1274,7 @@ export class PalletTrackDbService {
 
     const now = new Date().toISOString();
     const actorName = actor?.employeeName || 'Authorized User';
-    const actorId = actor?.id || 'usr_receiver_default';
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || 'supervisor';
     const isSupOrAdmin = this.isSupervisorOrAdmin(actor?.role);
 
@@ -1625,7 +1625,7 @@ export class PalletTrackDbService {
           scanId,
           deliveryId,
           partId,
-          input.userId || 'usr_receiver_default',
+          input.userId || null,
           now,
           scannedCode || part.part_number,
           scannedVia || 'manual',
@@ -1702,7 +1702,7 @@ export class PalletTrackDbService {
         scanId,
         deliveryId,
         input.partId || null,
-        input.userId || 'usr_receiver_default',
+        input.userId || null,
         now,
         input.code,
         input.scanType,

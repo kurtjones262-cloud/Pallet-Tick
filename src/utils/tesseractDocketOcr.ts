@@ -633,7 +633,7 @@ export async function recognizeDocketPageWithTesseract(
         const sharpMod = await import('sharp');
         const sharp = (sharpMod.default || sharpMod) as any;
         const buf = Buffer.isBuffer(imageSource) ? imageSource : Buffer.from(imageSource);
-        const { data, info } = await sharp(buf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        const { data, info } = await sharp(buf).rotate().ensureAlpha().raw().toBuffer({ resolveWithObject: true });
         const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
         const { preprocessRgbaImageBufferInPlace } = await import('./imagePreprocessing');
         const diag = preprocessRgbaImageBufferInPlace(clamped, info.width, info.height);

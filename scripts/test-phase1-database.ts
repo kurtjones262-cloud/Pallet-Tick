@@ -44,6 +44,13 @@ async function runTests() {
   }
   console.log('  ✅ Database creation test passed.\n');
 
+  // Insert test user for delivery attribution
+  const testUserId = 'test-user-001';
+  await d1.prepare(`
+    INSERT INTO users (id, employee_name, employee_code, pin_hash, role, active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+  `).bind(testUserId, 'Test Admin', 'EMP-TEST', 'hash', 'admin').run();
+
   // 2. Test Creating and Retrieving Deliveries
   console.log('Test 2: Creating and Retrieving Deliveries...');
   const created = await service.createDelivery({
@@ -54,6 +61,7 @@ async function runTests() {
     carrier: 'Direct Freight Express',
     palletCount: 2,
     supplierProfile: 'laser_central',
+    createdBy: testUserId,
     parts: [
       {
         partNumber: 'BRACKET-52048',

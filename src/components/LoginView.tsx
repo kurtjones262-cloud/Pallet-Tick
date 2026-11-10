@@ -375,6 +375,53 @@ export const LoginView: React.FC<LoginViewProps> = ({
               </>
             )}
           </button>
+
+          {/* Quick Terminal Access (One-Tap Preview / Workshop Role Switcher) */}
+          {hasAdmin && (
+            <div className="mt-4 pt-3.5 border-t border-[#1E2D44]/80">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                  Quick Terminal Access (1-Tap Login)
+                </span>
+                <span className="text-[9px] font-mono text-cyan-400/80">
+                  Auto-fills ID &amp; PIN
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {[
+                  { code: 'SUPER-01', pin: '1234', label: 'Super Admin', badgeClass: 'border-amber-500/40 text-amber-300 hover:bg-amber-950/40' },
+                  { code: 'ADMIN-01', pin: '1111', label: 'Admin', badgeClass: 'border-indigo-500/40 text-indigo-300 hover:bg-indigo-950/40' },
+                  { code: 'SUP-01', pin: '2222', label: 'Supervisor', badgeClass: 'border-cyan-500/40 text-cyan-300 hover:bg-cyan-950/40' },
+                  { code: 'EMP-01', pin: '3333', label: 'Employee', badgeClass: 'border-emerald-500/40 text-emerald-300 hover:bg-emerald-950/40' },
+                ].map((acct) => (
+                  <button
+                    key={acct.code}
+                    type="button"
+                    disabled={isLoading || isLocked}
+                    onClick={() => {
+                      setEmployeeCode(acct.code);
+                      setPin(acct.pin);
+                      setErrorMessage(null);
+                      handleLogin(acct.code, acct.pin);
+                    }}
+                    className={`px-2.5 py-1.5 rounded-lg bg-[#070A0F] border ${acct.badgeClass} transition-all cursor-pointer flex items-center justify-between text-left disabled:opacity-40`}
+                  >
+                    <div>
+                      <div className="text-[11px] font-mono font-bold text-white leading-tight">
+                        {acct.code}
+                      </div>
+                      <div className="text-[9px] font-mono opacity-80">
+                        {acct.label}
+                      </div>
+                    </div>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-slate-300">
+                      PIN {acct.pin}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Roles information help */}

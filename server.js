@@ -5,10 +5,127 @@ import path2 from "path";
 import { fileURLToPath } from "url";
 
 // src/server/docketOcr.ts
-var PRIMARY_VISION_MODEL = "gemini-3.8-flash";
-var FALLBACK_VISION_MODELS = ["gemini-3.1-flash-lite", "gemini-flash-latest"];
+var DEFAULT_PRIMARY_VISION_MODEL = "gemini-3.8-flash";
+var DEFAULT_FALLBACK_VISION_MODELS = [
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-flash-latest"
+];
+var MAX_AUTOMATIC_RETRIES = 3;
+var INITIAL_BACKOFF_MS = 2e3;
+function resolveConfiguredVisionModels(envOverride) {
+  const procEnv = typeof process !== "undefined" && process.env ? process.env : {};
+  const rawPrimary = typeof envOverride?.GEMINI_PRIMARY_MODEL === "string" && envOverride.GEMINI_PRIMARY_MODEL.trim() || typeof procEnv.GEMINI_PRIMARY_MODEL === "string" && procEnv.GEMINI_PRIMARY_MODEL.trim() || DEFAULT_PRIMARY_VISION_MODEL;
+  const rawFallbacks = typeof envOverride?.GEMINI_FALLBACK_MODEL === "string" && envOverride.GEMINI_FALLBACK_MODEL.trim() || typeof envOverride?.GEMINI_FALLBACK_MODELS === "string" && envOverride.GEMINI_FALLBACK_MODELS.trim() || typeof procEnv.GEMINI_FALLBACK_MODEL === "string" && procEnv.GEMINI_FALLBACK_MODEL.trim() || typeof procEnv.GEMINI_FALLBACK_MODELS === "string" && procEnv.GEMINI_FALLBACK_MODELS.trim() || DEFAULT_FALLBACK_VISION_MODELS.join(",");
+  const fallbackModels = rawFallbacks.split(",").map((m) => m.trim()).filter((m) => Boolean(m) && m !== rawPrimary);
+  return {
+    primaryModel: rawPrimary,
+    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_VISION_MODELS]
+  };
+}
+function logOcrEvent(level, event, meta = {}) {
+  const sanitizedMeta = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (typeof v === "string") {
+      sanitizedMeta[k] = v.replace(/key=[A-Za-z0-9_\-]+/gi, "key=[REDACTED]").slice(0, 300);
+    } else {
+      sanitizedMeta[k] = v;
+    }
+  }
+  const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+  const payload = JSON.stringify({ timestamp, component: "PalletTrack-OCR", event, ...sanitizedMeta });
+  if (level === "error") {
+    console.error(payload);
+  } else if (level === "warn") {
+    console.warn(payload);
+  } else {
+    console.log(payload);
+  }
+}
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function computeExponentialBackoffWithJitter(retryAttempt, baseDelayMs = INITIAL_BACKOFF_MS) {
+  const exponent = Math.max(0, retryAttempt - 1);
+  const exponentialDelay = baseDelayMs * Math.pow(2, exponent);
+  const jitter = Math.floor(Math.random() * 650);
+  return Math.min(2e4, exponentialDelay + jitter);
+}
+function classifyGeminiError(err) {
+  const rawMessage = String(err?.message || err || "Unknown Gemini API error").replace(
+    /key=[A-Za-z0-9_\-]+/gi,
+    "key=[REDACTED]"
+  );
+  let statusCode = Number(err?.status || err?.statusCode || err?.httpStatus || 0);
+  if (!statusCode) {
+    const codeMatch = rawMessage.match(/\b(429|500|502|503|504)\b/) || rawMessage.match(/"code"\s*:\s*(\d{3})/);
+    if (codeMatch) {
+      statusCode = parseInt(codeMatch[1], 10);
+    }
+  }
+  const isHighDemand503 = statusCode === 503 || /503|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity/i.test(
+    rawMessage
+  );
+  const isRateLimit = statusCode === 429 || /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
+  const isTemporary5xx = statusCode === 500 || statusCode === 502 || statusCode === 504 || /500|502|504|INTERNAL|DEADLINE_EXCEEDED|bad gateway|gateway timeout|timed out|AbortError|fetch failed/i.test(
+    rawMessage
+  );
+  if (!statusCode) {
+    if (isHighDemand503) statusCode = 503;
+    else if (isRateLimit) statusCode = 429;
+    else if (isTemporary5xx) statusCode = 502;
+  }
+  return {
+    statusCode: statusCode || 500,
+    isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
+    isRateLimit,
+    isHighDemand503,
+    cleanMessage: rawMessage.slice(0, 260)
+  };
+}
+function validateAndParseOcrJsonResponse(rawText, mode = "batch") {
+  const trimmed = (rawText || "").trim();
+  if (!trimmed) {
+    throw new Error("Malformed OCR response: Gemini returned an empty response body.");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (parseErr) {
+    throw new Error(
+      `Malformed OCR JSON response: Could not parse JSON output (${parseErr?.message || "syntax error"}).`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Malformed OCR response: Root JSON value must be an object.");
+  }
+  if (mode === "label") {
+    if (typeof parsed.detectedCode !== "string") {
+      throw new Error("Malformed label OCR response: missing detectedCode string field.");
+    }
+    return parsed;
+  }
+  if (!Array.isArray(parsed.items)) {
+    throw new Error('Incomplete OCR response: Missing required "items" array in JSON output.');
+  }
+  for (let i = 0; i < parsed.items.length; i++) {
+    const row = parsed.items[i];
+    if (!row || typeof row !== "object") {
+      throw new Error(`Malformed OCR item at index ${i}: item is not an object.`);
+    }
+    const hasPartOrDesc = typeof row.part === "string" && row.part.trim().length > 0 || typeof row.desc === "string" && row.desc.trim().length > 0;
+    if (!hasPartOrDesc) {
+      throw new Error(
+        `Incomplete OCR item at index ${i}: both part number and description are empty.`
+      );
+    }
+    const qtyNum = Number(row.qty);
+    if (Number.isNaN(qtyNum) || qtyNum < 0) {
+      throw new Error(`Invalid OCR item quantity at index ${i}: qty="${String(row.qty)}".`);
+    }
+  }
+  return parsed;
 }
 function parseDataUrl(dataUrl) {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -33,73 +150,123 @@ function parseCleanRowNo(raw) {
   }
   return "";
 }
-async function generateWithRateLimitProtection(ai, ThinkingLevel, parts, systemInstruction, responseSchema) {
+async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInstruction, responseSchema, mode = "batch", envOverride, baseDelayMs = INITIAL_BACKOFF_MS) {
+  const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
+  const candidateModels = [primaryModel, ...fallbackModels];
+  let totalRetryAttempts = 0;
   let lastError = null;
-  for (let round = 1; round <= 4; round++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 25e3);
-    try {
-      const response = await ai.models.generateContent({
-        model: PRIMARY_VISION_MODEL,
-        contents: { parts },
-        config: {
+  let lastStatusCode = 500;
+  for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
+    const currentModel = candidateModels[mIdx];
+    const isFallbackModel = mIdx > 0;
+    const maxRetriesForModel = MAX_AUTOMATIC_RETRIES;
+    logOcrEvent("info", isFallbackModel ? "model_fallback_selected" : "model_selected", {
+      model: currentModel,
+      isFallback: isFallbackModel,
+      mode
+    });
+    for (let retry = 0; retry <= maxRetriesForModel; retry++) {
+      const controller = new AbortController();
+      const timeoutMs = isFallbackModel ? 22e3 : 26e3;
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const config = {
           systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
           responseMimeType: "application/json",
           responseSchema,
           abortSignal: controller.signal
+        };
+        if (ThinkingLevel && (currentModel.includes("3.8") || currentModel.includes("argon"))) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
         }
-      });
-      clearTimeout(timer);
-      const text = (response.text ?? "").trim();
-      if (text) return text;
-    } catch (err) {
-      clearTimeout(timer);
-      lastError = err;
-      const errStr = String(err?.message || err || "");
-      const isRateLimit = err?.status === 429 || errStr.includes("429") || errStr.includes("RESOURCE_EXHAUSTED") || errStr.includes("quota");
-      if (isRateLimit) {
-        for (const fallbackModel of FALLBACK_VISION_MODELS) {
-          const fbController = new AbortController();
-          const fbTimer = setTimeout(() => fbController.abort(), 12e3);
-          try {
-            const fbRes = await ai.models.generateContent({
-              model: fallbackModel,
-              contents: { parts },
-              config: {
-                systemInstruction,
-                responseMimeType: "application/json",
-                responseSchema,
-                abortSignal: fbController.signal
-              }
-            });
-            clearTimeout(fbTimer);
-            const fbText = (fbRes.text ?? "").trim();
-            if (fbText) return fbText;
-          } catch {
-            clearTimeout(fbTimer);
-          }
+        const response = await ai.models.generateContent({
+          model: currentModel,
+          contents: { parts },
+          config
+        });
+        clearTimeout(timer);
+        const rawText = (response?.text ?? "").trim();
+        const validated = validateAndParseOcrJsonResponse(rawText, mode);
+        logOcrEvent("info", "extraction_succeeded", {
+          model: currentModel,
+          isFallback: isFallbackModel,
+          retryAttempts: totalRetryAttempts,
+          statusCode: 200,
+          itemsExtracted: Array.isArray(validated?.items) ? validated.items.length : 1
+        });
+        return {
+          parsed: validated,
+          modelUsed: currentModel,
+          fallbackUsed: isFallbackModel,
+          retryAttempts: totalRetryAttempts
+        };
+      } catch (err) {
+        clearTimeout(timer);
+        lastError = err;
+        const classification = classifyGeminiError(err);
+        lastStatusCode = classification.statusCode;
+        const isValidationFailure = String(err?.message || "").includes("Malformed") || String(err?.message || "").includes("Incomplete OCR") || String(err?.message || "").includes("Invalid OCR item");
+        logOcrEvent("warn", "extraction_attempt_failed", {
+          model: currentModel,
+          isFallback: isFallbackModel,
+          attempt: retry + 1,
+          maxAttemptsForModel: maxRetriesForModel + 1,
+          statusCode: classification.statusCode,
+          isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
+          reason: classification.cleanMessage
+        });
+        if (!classification.isRetryableAvailabilityError && !isValidationFailure && (classification.statusCode === 400 || classification.statusCode === 401 || classification.statusCode === 403)) {
+          const permErr = new Error(classification.cleanMessage);
+          permErr.status = classification.statusCode;
+          permErr.code = classification.statusCode === 401 || classification.statusCode === 403 ? "GEMINI_AUTH_ERROR" : "GEMINI_BAD_REQUEST";
+          throw permErr;
         }
-        if (round < 4) {
-          const delayMatch = errStr.match(/retryDelay"?\s*:\s*"?(\d+)s/i);
-          const suggestedSec = delayMatch ? parseInt(delayMatch[1], 10) : 0;
-          const waitMs = suggestedSec > 0 && suggestedSec <= 25 ? (suggestedSec + 1) * 1e3 : round * 6500;
+        if (!classification.isRetryableAvailabilityError && !isValidationFailure && classification.statusCode === 404) {
+          break;
+        }
+        if (retry < maxRetriesForModel) {
+          totalRetryAttempts++;
+          const waitMs = computeExponentialBackoffWithJitter(retry + 1, baseDelayMs);
+          logOcrEvent("info", "retrying_after_backoff", {
+            model: currentModel,
+            retryAttempt: retry + 1,
+            maxRetries: maxRetriesForModel,
+            waitMs,
+            statusCode: classification.statusCode
+          });
           await sleep(waitMs);
           continue;
         }
-      } else if (round < 3) {
-        await sleep(400 * round);
-        continue;
       }
     }
   }
-  const rawMsg = String(lastError?.message || lastError || "");
-  if (rawMsg.includes("429") || rawMsg.includes("RESOURCE_EXHAUSTED")) {
-    throw new Error(
-      'Gemini AI Free Tier rate limit (15 requests/min) reached. Please wait 30 seconds and click "Retry with Gemini AI".'
+  logOcrEvent("error", "all_models_and_retries_exhausted", {
+    primaryModel,
+    fallbackModels: fallbackModels.join(","),
+    totalRetryAttempts,
+    lastStatusCode,
+    error: String(lastError?.message || lastError || "Unknown error").slice(0, 240)
+  });
+  const finalClassification = classifyGeminiError(lastError);
+  if (finalClassification.isHighDemand503) {
+    const busyErr = new Error(
+      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retries and fallback to ${fallbackModels[0] || "secondary model"}. Your uploaded docket has been preserved \u2014 please click "Retry Extraction" in a moment.`
     );
+    busyErr.status = 503;
+    busyErr.code = "GEMINI_HIGH_DEMAND_503";
+    throw busyErr;
   }
-  throw new Error(rawMsg || "Gemini AI could not process the docket image.");
+  if (finalClassification.isRateLimit) {
+    const rateErr = new Error(
+      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retries. Your uploaded docket has been preserved \u2014 please wait a few seconds and click "Retry Extraction".`
+    );
+    rateErr.status = 429;
+    rateErr.code = "GEMINI_RATE_LIMIT_429";
+    throw rateErr;
+  }
+  throw new Error(
+    finalClassification.cleanMessage || 'Gemini AI could not extract the docket after automatic retries. Please click "Retry Extraction".'
+  );
 }
 async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages) {
   const parts = [];
@@ -147,6 +314,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. Never restart numbering at "1" on the lower half or on subsequent pages if printed row numbers continue across the document.
    - part: The Part Number, Drawing Number, Mark, Code, or DXF/Profile Name written on the row. If the table only has ONE text column (e.g. "Description" or "Part / Description"), put the part code/name in 'part' and the full text in 'desc'. NEVER put the row number in 'part'.
    - desc: The full part description or name written on the row.
+   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "01", "Rev B"), else "".
    - mat: Material grade ONLY if written on the row, else "".
    - thk: Thickness ONLY if written on the row, else "".
    - dim: Dimensions/length/size ONLY if written on the row, else "".
@@ -183,6 +351,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             no: { type: Type.STRING, description: 'Exact printed row "No".' },
             part: { type: Type.STRING, description: "Part Number, Drawing No, or Part Name." },
             desc: { type: Type.STRING, description: "Full part description." },
+            rev: { type: Type.STRING, description: "Part revision if present." },
             mat: { type: Type.STRING },
             thk: { type: Type.STRING },
             dim: { type: Type.STRING },
@@ -190,7 +359,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             qty: { type: Type.NUMBER, description: "Quantity of this part (never price)." }
           },
           required: ["no", "part", "desc", "qty"],
-          propertyOrdering: ["page", "no", "part", "desc", "mat", "thk", "dim", "wt", "qty"]
+          propertyOrdering: ["page", "no", "part", "desc", "rev", "mat", "thk", "dim", "wt", "qty"]
         }
       }
     },
@@ -209,14 +378,14 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     ]
   };
   parts.push({ text: promptText });
-  const text = await generateWithRateLimitProtection(
+  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await generateWithRetryAndFallback(
     ai,
     ThinkingLevel,
     parts,
     systemInstruction,
-    responseSchema
+    responseSchema,
+    "batch"
   );
-  const parsed = JSON.parse(text);
   return {
     docketNumber: parsed.docketNumber,
     supplier: parsed.supplier,
@@ -227,7 +396,10 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
     firstVisibleRowNo: parsed.firstVisibleRowNo,
     lastVisibleRowNo: parsed.lastVisibleRowNo,
-    items: Array.isArray(parsed.items) ? parsed.items : []
+    items: Array.isArray(parsed.items) ? parsed.items : [],
+    modelUsed,
+    fallbackUsed,
+    retryAttempts
   };
 }
 async function recoverMissingRowsBatch(ai, Type, ThinkingLevel, pagesToRecover) {
@@ -269,6 +441,7 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
             no: { type: Type.STRING, description: 'Exact printed row "No" from the missing list.' },
             part: { type: Type.STRING, description: "Part Number, Drawing No, or Part Name." },
             desc: { type: Type.STRING, description: "Full part description." },
+            rev: { type: Type.STRING },
             mat: { type: Type.STRING },
             thk: { type: Type.STRING },
             dim: { type: Type.STRING },
@@ -276,7 +449,7 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
             qty: { type: Type.NUMBER }
           },
           required: ["no", "part", "desc", "qty"],
-          propertyOrdering: ["page", "no", "part", "desc", "mat", "thk", "dim", "wt", "qty"]
+          propertyOrdering: ["page", "no", "part", "desc", "rev", "mat", "thk", "dim", "wt", "qty"]
         }
       }
     },
@@ -284,14 +457,14 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
   };
   parts.push({ text: promptText });
   try {
-    const text = await generateWithRateLimitProtection(
+    const { parsed } = await generateWithRetryAndFallback(
       ai,
       ThinkingLevel,
       parts,
       systemInstruction,
-      responseSchema
+      responseSchema,
+      "recovery"
     );
-    const parsed = JSON.parse(text);
     return Array.isArray(parsed.items) ? parsed.items : [];
   } catch {
     return [];
@@ -327,27 +500,42 @@ function normalizeRawBatchItem(it, defaultPageNumber) {
   const cleanQty = !Number.isNaN(rawQty) && rawQty >= 1 && rawQty <= 99999 ? Math.round(rawQty) : 1;
   const cleanPn = String(pn || desc.slice(0, 28) || "PART").trim().toUpperCase();
   const resolvedPage = typeof it.page === "number" && it.page >= 1 ? it.page : defaultPageNumber;
+  const cleanRev = it.rev && String(it.rev).trim() ? String(it.rev).trim() : void 0;
+  const cleanMat = it.mat && String(it.mat).trim() ? String(it.mat).trim() : void 0;
+  const cleanThk = it.thk && String(it.thk).trim() ? String(it.thk).trim() : void 0;
   return {
     cleanNo,
     item: {
       partNumber: cleanPn,
       itemNumber: cleanNo,
       description: String(desc || cleanPn).trim(),
-      material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : void 0,
-      thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : void 0,
+      revision: cleanRev,
+      material: cleanMat,
+      thickness: cleanThk,
       dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : void 0,
       weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : void 0,
       quantity: cleanQty,
       palletNumber: "Pallet 1",
       pageNumber: resolvedPage,
-      confidence: "high"
+      confidence: "high",
+      originalOcrValues: {
+        partNumber: cleanPn,
+        itemNumber: cleanNo,
+        description: String(desc || cleanPn).trim(),
+        revision: cleanRev,
+        quantity: cleanQty,
+        material: cleanMat,
+        thickness: cleanThk
+      }
     }
   };
 }
 async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, pageSlices, overrideApiKey) {
   const apiKey = overrideApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.");
+    throw new Error(
+      "Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings."
+    );
   }
   const { GoogleGenAI, Type, ThinkingLevel } = await import("@google/genai");
   const ai = new GoogleGenAI({
@@ -384,8 +572,14 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   const pageMaxNo = /* @__PURE__ */ new Map();
   let anyPrintedNoColumn = false;
   let globalMaxCandidate = 0;
+  let modelUsed = DEFAULT_PRIMARY_VISION_MODEL;
+  let fallbackUsed = false;
+  let totalRetries = 0;
   for (let bIdx = 0; bIdx < batchResponses.length; bIdx++) {
     const bRes = batchResponses[bIdx];
+    modelUsed = bRes.modelUsed || modelUsed;
+    fallbackUsed = fallbackUsed || Boolean(bRes.fallbackUsed);
+    totalRetries += bRes.retryAttempts || 0;
     const defaultPage = batches[bIdx][0].pageNumber;
     if (bRes.hasPrintedNoColumn !== false) {
       anyPrintedNoColumn = true;
@@ -418,6 +612,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
             ...existing,
             partNumber: existing.partNumber && existing.partNumber !== "PART" ? existing.partNumber : norm.item.partNumber,
             description: norm.item.description.length > existing.description.length ? norm.item.description : existing.description,
+            revision: existing.revision || norm.item.revision,
             material: existing.material || norm.item.material,
             thickness: existing.thickness || norm.item.thickness,
             dimensions: existing.dimensions || norm.item.dimensions,
@@ -529,7 +724,9 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     confidenceScore: validItems.length > 0 ? 100 : 0,
     needsManualReview: validItems.length === 0,
     extractionMethod: "ai-vision",
-    aiModelUsed: PRIMARY_VISION_MODEL,
+    aiModelUsed: modelUsed,
+    fallbackUsed,
+    retryAttempts: totalRetries,
     pagesScanned: totalPages,
     hasPrintedNoColumn: anyPrintedNoColumn,
     firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : void 0,
@@ -605,7 +802,7 @@ Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode
     required: ["detectedCode"]
   };
   try {
-    const text = await generateWithRateLimitProtection(
+    const { parsed } = await generateWithRetryAndFallback(
       ai,
       ThinkingLevel,
       [
@@ -613,9 +810,9 @@ Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode
         { text: promptText }
       ],
       "Read the barcode or part code from the image.",
-      responseSchema
+      responseSchema,
+      "label"
     );
-    const parsed = JSON.parse(text || "{}");
     return {
       detectedCode: String(parsed.detectedCode || "").trim(),
       confidence: String(parsed.confidence || "high")
@@ -711,6 +908,11 @@ var NodeSqliteD1Adapter = class {
     safeAddCol("scan_events", "employee_name TEXT");
     safeAddCol("scan_events", "employee_role TEXT");
     safeAddCol("scan_events", "event_action TEXT DEFAULT 'part_scan'");
+    safeAddCol("delivery_parts", "revision TEXT");
+    safeAddCol("delivery_parts", "manually_edited INTEGER NOT NULL DEFAULT 0");
+    safeAddCol("delivery_parts", "original_ocr_values TEXT");
+    safeAddCol("delivery_parts", "last_edited_by TEXT");
+    safeAddCol("delivery_parts", "last_edited_at TEXT");
     try {
       const tblInfo = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
       if (tblInfo?.sql && tblInfo.sql.includes("CHECK") && !tblInfo.sql.includes("super_admin")) {
@@ -885,6 +1087,14 @@ var PalletTrackDbService = class _PalletTrackDbService {
    * Helper to format delivery parts from DB row to frontend object
    */
   mapPartRow(row) {
+    let parsedOriginalOcr = void 0;
+    if (row.original_ocr_values) {
+      try {
+        parsedOriginalOcr = JSON.parse(row.original_ocr_values);
+      } catch {
+        parsedOriginalOcr = void 0;
+      }
+    }
     return {
       id: row.id,
       deliveryId: row.delivery_id,
@@ -892,6 +1102,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       itemNumber: row.item_number,
       docketLineIndex: row.docket_line_index,
       description: row.description,
+      revision: row.revision || void 0,
       quantity: row.required_quantity,
       receivedQuantity: row.received_quantity,
       verificationStatus: row.verification_status,
@@ -907,6 +1118,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
       notes: row.notes || void 0,
       flaggedForReview: Boolean(row.flagged_for_review),
       ocrConfidence: row.ocr_confidence || void 0,
+      manuallyEdited: Boolean(row.manually_edited),
+      lastEditedBy: row.last_edited_by || void 0,
+      lastEditedAt: row.last_edited_at || void 0,
+      originalOcrValues: parsedOriginalOcr,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
@@ -1066,15 +1281,23 @@ var PalletTrackDbService = class _PalletTrackDbService {
       const recQty = Math.max(0, Math.round(Number(p.receivedQuantity ?? 0)));
       const status = p.status === "received" || recQty > 0 ? "received" : "outstanding";
       const verStatus = status === "received" ? recQty === reqQty ? "verified" : "quantity_mismatch" : "unscanned";
+      const originalOcrObj = p.originalOcrValues || {
+        partNumber: p.partNumber.trim().toUpperCase(),
+        itemNumber: p.itemNumber.trim(),
+        description: p.description.trim(),
+        revision: p.revision ? String(p.revision).trim() : void 0,
+        quantity: reqQty
+      };
       stmts.push(
         this.db.prepare(
           `INSERT INTO delivery_parts (
-              id, delivery_id, part_number, item_number, docket_line_index, description,
+              id, delivery_id, part_number, item_number, docket_line_index, description, revision,
               required_quantity, received_quantity, verification_status, status,
               material, thickness, dimensions, weight, pallet_number,
               scanned_at, scanned_via, scanned_code, notes, flagged_for_review,
-              ocr_confidence, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ocr_confidence, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           partId,
           id,
@@ -1082,6 +1305,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
           p.itemNumber.trim(),
           lineIndex,
           p.description.trim(),
+          p.revision ? String(p.revision).trim() : null,
           reqQty,
           recQty,
           verStatus,
@@ -1097,6 +1321,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
           p.notes || null,
           p.flaggedForReview ? 1 : 0,
           p.ocrConfidence || null,
+          p.manuallyEdited ? 1 : 0,
+          JSON.stringify(originalOcrObj),
+          p.lastEditedBy || null,
+          p.lastEditedAt || null,
           now,
           now
         )
@@ -1174,6 +1402,568 @@ var PalletTrackDbService = class _PalletTrackDbService {
   async getDeliveryParts(deliveryId) {
     const res = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index ASC").bind(deliveryId).all();
     return (res.results || []).map((p) => this.mapPartRow(p));
+  }
+  /**
+   * Helper: Determine if an actor has supervisor or administrator privileges
+   */
+  isSupervisorOrAdmin(role) {
+    const r = (role || "").trim().toLowerCase();
+    return r === "super_admin" || r === "admin" || r === "supervisor";
+  }
+  /**
+   * Manually add a new part to an existing delivery docket with validation and audit logging
+   */
+  async addDeliveryPart(deliveryId, input, actor) {
+    const delivery = await this.db.prepare("SELECT id, delivery_status FROM deliveries WHERE id = ?").bind(deliveryId).first();
+    if (!delivery) {
+      throw new Error(`Delivery not found: ${deliveryId}`);
+    }
+    const partNumber = String(input.partNumber || "").trim().toUpperCase();
+    if (!partNumber) {
+      throw new Error("Part Number is required when adding a part.");
+    }
+    if (partNumber.length > 120) {
+      throw new Error("Part Number cannot exceed 120 characters.");
+    }
+    const rawQty = input.quantity === void 0 || input.quantity === null ? 1 : Number(input.quantity);
+    if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 1e5) {
+      throw new Error("Quantity must be a valid positive number (between 1 and 100,000).");
+    }
+    const reqQty = Math.max(1, Math.round(rawQty));
+    const existingParts = await this.db.prepare(
+      "SELECT id, part_number, item_number, docket_line_index FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC"
+    ).bind(deliveryId).all();
+    const existingList = existingParts.results || [];
+    if (!input.allowDuplicatePartNumber) {
+      const duplicatePart = existingList.find(
+        (r) => String(r.part_number || "").trim().toUpperCase() === partNumber
+      );
+      if (duplicatePart) {
+        throw new Error(
+          `Duplicate part number "${partNumber}" already exists in this delivery (Docket No. ${duplicatePart.item_number}). Edit the existing part row instead of creating a duplicate.`
+        );
+      }
+    }
+    const maxLineIndex = existingList.reduce(
+      (max, r) => Math.max(max, Number(r.docket_line_index) || 0),
+      0
+    );
+    const maxItemNum = existingList.reduce((max, r) => {
+      const parsed = parseInt(String(r.item_number || "").replace(/\D+/g, ""), 10);
+      return Number.isNaN(parsed) ? max : Math.max(max, parsed);
+    }, 0);
+    const nextIndex = maxLineIndex + 1;
+    const itemNumber = String(input.itemNumber || "").trim() || String(Math.max(nextIndex, maxItemNum + 1));
+    const description = String(input.description || "").trim() || `Part ${partNumber}`;
+    const revision = input.revision ? String(input.revision).trim() : null;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const partId = input.id || `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const actorName = actor?.employeeName || "Authorized User";
+    const actorId = actor?.id || "usr_receiver_default";
+    const actorRole = actor?.role || "supervisor";
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const auditMessage = `Manually added part ${partNumber} (No. ${itemNumber}${revision ? `, Rev ${revision}` : ""}) \u2014 "${description}" (Qty ${reqQty}) by ${actorName}`;
+    const stmts = [
+      this.db.prepare(
+        `INSERT INTO delivery_parts (
+            id, delivery_id, part_number, item_number, docket_line_index, description, revision,
+            required_quantity, received_quantity, verification_status, status,
+            material, thickness, dimensions, weight, pallet_number,
+            notes, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'unscanned', 'outstanding', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)`
+      ).bind(
+        partId,
+        deliveryId,
+        partNumber,
+        itemNumber,
+        nextIndex,
+        description,
+        revision,
+        reqQty,
+        input.material ? String(input.material).trim() : null,
+        input.thickness ? String(input.thickness).trim() : null,
+        input.dimensions ? String(input.dimensions).trim() : null,
+        input.weight ? String(input.weight).trim() : null,
+        input.palletNumber ? String(input.palletNumber).trim() : null,
+        input.notes ? String(input.notes).trim() : null,
+        actorName,
+        now,
+        now,
+        now
+      ),
+      this.db.prepare(
+        `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_added', ?, 0, ?, ?, ?, 'part_added')`
+      ).bind(scanId, deliveryId, partId, actorId, now, partNumber, reqQty, auditMessage, actorName, actorRole),
+      this.db.prepare("UPDATE deliveries SET delivery_status = 'receiving', updated_at = ? WHERE id = ?").bind(now, deliveryId)
+    ];
+    await this.db.batch(stmts);
+    const createdPartRow = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+    return {
+      status: "added",
+      part: createdPartRow ? this.mapPartRow(createdPartRow) : null,
+      delivery: updatedDelivery
+    };
+  }
+  /**
+   * Manually edit an existing part on a delivery docket.
+   * Preserves original OCR values, keeps scanning/verification status consistent if already scanned,
+   * enforces supervisor/admin RBAC when modifying already-scanned parts, and records an audit event in scan_events.
+   */
+  async updateDeliveryPart(deliveryId, partId, updates, actor) {
+    const existing = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+    if (!existing) {
+      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+    }
+    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+    const hasScanEventsRes = await this.db.prepare(
+      "SELECT COUNT(*) as count FROM scan_events WHERE delivery_id = ? AND part_id = ? AND scan_status NOT IN ('part_added', 'part_edited', 'part_deleted')"
+    ).bind(deliveryId, partId).first();
+    const hasScanHistory = Number(hasScanEventsRes?.count || 0) > 0;
+    const isScanned = existing.status === "received" || recQty > 0 || hasScanHistory;
+    if (isScanned && actor && !this.isSupervisorOrAdmin(actor.role) && !updates.supervisorApproved) {
+      throw new Error(
+        "Forbidden: Supervisor or Administrator approval is required to edit a part that has already been scanned."
+      );
+    }
+    const newPartNumber = updates.partNumber !== void 0 ? String(updates.partNumber).trim().toUpperCase() : existing.part_number;
+    if (!newPartNumber) {
+      throw new Error("Part Number cannot be empty.");
+    }
+    if (newPartNumber.length > 120) {
+      throw new Error("Part Number cannot exceed 120 characters.");
+    }
+    if (!updates.allowDuplicatePartNumber && newPartNumber !== existing.part_number) {
+      const duplicateRow = await this.db.prepare(
+        "SELECT id, item_number FROM delivery_parts WHERE delivery_id = ? AND id != ? AND UPPER(part_number) = ? LIMIT 1"
+      ).bind(deliveryId, partId, newPartNumber).first();
+      if (duplicateRow) {
+        throw new Error(
+          `Duplicate part number "${newPartNumber}" already exists in this delivery (Docket No. ${duplicateRow.item_number}).`
+        );
+      }
+    }
+    const newItemNumber = updates.itemNumber !== void 0 ? String(updates.itemNumber).trim() || existing.item_number : existing.item_number;
+    const newDescription = updates.description !== void 0 ? String(updates.description).trim() : existing.description;
+    const newRevision = updates.revision !== void 0 ? updates.revision ? String(updates.revision).trim() : null : existing.revision || null;
+    let newReqQty = existing.required_quantity;
+    if (updates.quantity !== void 0 && updates.quantity !== null) {
+      const parsedQty = Number(updates.quantity);
+      if (!Number.isFinite(parsedQty) || parsedQty < 1 || parsedQty > 1e5) {
+        throw new Error("Quantity must be a positive number (between 1 and 100,000).");
+      }
+      newReqQty = Math.max(1, Math.round(parsedQty));
+    }
+    const newMaterial = updates.material !== void 0 ? updates.material ? String(updates.material).trim() : null : existing.material;
+    const newThickness = updates.thickness !== void 0 ? updates.thickness ? String(updates.thickness).trim() : null : existing.thickness;
+    const newDimensions = updates.dimensions !== void 0 ? updates.dimensions ? String(updates.dimensions).trim() : null : existing.dimensions;
+    const newWeight = updates.weight !== void 0 ? updates.weight ? String(updates.weight).trim() : null : existing.weight;
+    const newPalletNumber = updates.palletNumber !== void 0 ? updates.palletNumber !== null && String(updates.palletNumber).trim() !== "" ? String(updates.palletNumber).trim() : null : existing.pallet_number;
+    const newNotes = updates.notes !== void 0 ? updates.notes ? String(updates.notes).trim() : null : existing.notes;
+    let originalOcrJson = existing.original_ocr_values;
+    if (!originalOcrJson) {
+      originalOcrJson = JSON.stringify({
+        partNumber: existing.part_number,
+        itemNumber: existing.item_number,
+        description: existing.description,
+        revision: existing.revision || void 0,
+        quantity: existing.required_quantity
+      });
+    }
+    const changesSummary = [];
+    if (newPartNumber !== existing.part_number) {
+      changesSummary.push(`Part#: ${existing.part_number} \u2192 ${newPartNumber}`);
+    }
+    if (newItemNumber !== existing.item_number) {
+      changesSummary.push(`No: ${existing.item_number} \u2192 ${newItemNumber}`);
+    }
+    if (newDescription !== existing.description) {
+      changesSummary.push(`Desc: "${existing.description}" \u2192 "${newDescription}"`);
+    }
+    if ((newRevision || "") !== (existing.revision || "")) {
+      changesSummary.push(`Rev: ${existing.revision || "\u2014"} \u2192 ${newRevision || "\u2014"}`);
+    }
+    if (newReqQty !== existing.required_quantity) {
+      changesSummary.push(
+        `Qty: ${existing.required_quantity} \u2192 ${newReqQty}${recQty > 0 ? ` (Received: ${recQty})` : ""}`
+      );
+    }
+    if ((newPalletNumber || "") !== (existing.pallet_number || "")) {
+      changesSummary.push(`Pallet: ${existing.pallet_number || "\u2014"} \u2192 ${newPalletNumber || "\u2014"}`);
+    }
+    if ((newMaterial || "") !== (existing.material || "")) {
+      changesSummary.push(`Mat: ${existing.material || "\u2014"} \u2192 ${newMaterial || "\u2014"}`);
+    }
+    if ((newThickness || "") !== (existing.thickness || "")) {
+      changesSummary.push(`Thk: ${existing.thickness || "\u2014"} \u2192 ${newThickness || "\u2014"}`);
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const actorName = actor?.employeeName || "Authorized User";
+    const actorId = actor?.id || "usr_receiver_default";
+    const actorRole = actor?.role || "supervisor";
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const auditMessage = changesSummary.length > 0 ? `Manually edited part ${newPartNumber} (No. ${newItemNumber}): ${changesSummary.join("; ")} by ${actorName}` : `Saved part ${newPartNumber} (No. ${newItemNumber}) by ${actorName}`;
+    const stmts = [
+      this.db.prepare(
+        `UPDATE delivery_parts
+           SET part_number = ?, item_number = ?, description = ?, revision = ?,
+               required_quantity = ?,
+               status = CASE WHEN status = 'received' OR received_quantity > 0 THEN 'received' ELSE 'outstanding' END,
+               verification_status = CASE
+                 WHEN status = 'received' OR received_quantity > 0 THEN
+                   CASE WHEN received_quantity = ? THEN 'verified' ELSE 'quantity_mismatch' END
+                 ELSE 'unscanned'
+               END,
+               material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
+               notes = ?, manually_edited = 1, original_ocr_values = ?,
+               last_edited_by = ?, last_edited_at = ?, updated_at = ?
+           WHERE delivery_id = ? AND id = ?`
+      ).bind(
+        newPartNumber,
+        newItemNumber,
+        newDescription,
+        newRevision,
+        newReqQty,
+        newReqQty,
+        newMaterial,
+        newThickness,
+        newDimensions,
+        newWeight,
+        newPalletNumber,
+        newNotes,
+        originalOcrJson,
+        actorName,
+        now,
+        now,
+        deliveryId,
+        partId
+      ),
+      this.db.prepare(
+        `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_edited', 0, ?, ?, ?, ?, 'part_edited')`
+      ).bind(
+        scanId,
+        deliveryId,
+        partId,
+        actorId,
+        now,
+        newPartNumber,
+        recQty,
+        auditMessage,
+        actorName,
+        actorRole
+      ),
+      this.db.prepare(
+        `UPDATE deliveries
+           SET delivery_status = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM delivery_parts
+               WHERE delivery_id = ? AND (status != 'received' OR verification_status != 'verified')
+             ) THEN 'receiving'
+             ELSE delivery_status
+           END,
+           updated_at = ?
+           WHERE id = ?`
+      ).bind(deliveryId, now, deliveryId)
+    ];
+    await this.db.batch(stmts);
+    const updatedPartRow = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+    return {
+      status: "updated",
+      part: updatedPartRow ? this.mapPartRow(updatedPartRow) : null,
+      delivery: updatedDelivery
+    };
+  }
+  /**
+   * Delete a part from a delivery docket and record an audit trail entry in scan_events.
+   * Historical scan events for the deleted part remain intact (part_id set to NULL).
+   */
+  async deleteDeliveryPart(deliveryId, partId, actor, options) {
+    const existing = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+    if (!existing) {
+      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+    }
+    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+    const hasScanEventsRes = await this.db.prepare(
+      "SELECT COUNT(*) as count FROM scan_events WHERE delivery_id = ? AND part_id = ? AND scan_status NOT IN ('part_added', 'part_edited', 'part_deleted')"
+    ).bind(deliveryId, partId).first();
+    const hasScanHistory = Number(hasScanEventsRes?.count || 0) > 0;
+    const isScanned = existing.status === "received" || recQty > 0 || hasScanHistory;
+    if (isScanned && actor && !this.isSupervisorOrAdmin(actor.role) && !options?.supervisorApproved) {
+      throw new Error(
+        "Forbidden: Supervisor or Administrator approval is required to delete a part that has already been scanned."
+      );
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const actorName = actor?.employeeName || "Authorized User";
+    const actorId = actor?.id || "usr_receiver_default";
+    const actorRole = actor?.role || "supervisor";
+    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const wasScannedNote = isScanned ? ` [Was already scanned: ${recQty}/${existing.required_quantity}]` : "";
+    const auditMessage = `Deleted part ${existing.part_number} (No. ${existing.item_number}${existing.revision ? `, Rev ${existing.revision}` : ""}) \u2014 "${existing.description}" (Qty ${existing.required_quantity})${wasScannedNote} by ${actorName}`;
+    const stmts = [
+      this.db.prepare("UPDATE scan_events SET part_id = NULL WHERE delivery_id = ? AND part_id = ?").bind(deliveryId, partId),
+      this.db.prepare("DELETE FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId),
+      this.db.prepare(
+        `INSERT INTO scan_events (
+            id, delivery_id, part_id, user_id, timestamp, code,
+            scan_type, scan_status, quantity_added, received_quantity_after,
+            scan_result, employee_name, employee_role, event_action
+          ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, ?, ?, ?, ?, 'part_deleted')`
+      ).bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole),
+      this.db.prepare("UPDATE deliveries SET updated_at = ? WHERE id = ?").bind(now, deliveryId)
+    ];
+    await this.db.batch(stmts);
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+    return {
+      status: "deleted",
+      deletedPartId: partId,
+      delivery: updatedDelivery
+    };
+  }
+  /**
+   * Batch save an entire delivery's parts list atomically in a single D1 transaction
+   * (supports multi-row inline edits, additions, and deletions).
+   */
+  async batchSaveDeliveryParts(deliveryId, partsInput, actor) {
+    const delivery = await this.db.prepare("SELECT id FROM deliveries WHERE id = ?").bind(deliveryId).first();
+    if (!delivery) {
+      throw new Error(`Delivery not found: ${deliveryId}`);
+    }
+    if (!Array.isArray(partsInput)) {
+      throw new Error("parts array is required");
+    }
+    const existingRowsRes = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index ASC").bind(deliveryId).all();
+    const existingRows = existingRowsRes.results || [];
+    const existingById = new Map(existingRows.map((r) => [r.id, r]));
+    const incomingIds = /* @__PURE__ */ new Set();
+    const seenPartNumbers = /* @__PURE__ */ new Set();
+    for (let i = 0; i < partsInput.length; i++) {
+      const p = partsInput[i];
+      const cleanPartNo = String(p?.partNumber || "").trim().toUpperCase();
+      if (!cleanPartNo) {
+        throw new Error(`Row ${i + 1}: All parts must have a non-empty Part Number.`);
+      }
+      if (cleanPartNo.length > 120) {
+        throw new Error(`Row ${i + 1}: Part Number cannot exceed 120 characters.`);
+      }
+      const q = Number(p.quantity ?? 1);
+      if (!Number.isFinite(q) || q < 1 || q > 1e5) {
+        throw new Error(
+          `Row ${i + 1}: Invalid quantity for part ${cleanPartNo}: must be between 1 and 100,000.`
+        );
+      }
+      if (!p.allowDuplicatePartNumber && seenPartNumbers.has(cleanPartNo)) {
+        throw new Error(
+          `Duplicate part number "${cleanPartNo}" found in the parts list. Each part row should have a unique part number.`
+        );
+      }
+      seenPartNumbers.add(cleanPartNo);
+      if (p.id) incomingIds.add(p.id);
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const actorName = actor?.employeeName || "Authorized User";
+    const actorId = actor?.id || "usr_receiver_default";
+    const actorRole = actor?.role || "supervisor";
+    const isSupOrAdmin = this.isSupervisorOrAdmin(actor?.role);
+    const stmts = [];
+    for (const existing of existingRows) {
+      if (!incomingIds.has(existing.id)) {
+        const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+        const isScanned = existing.status === "received" || recQty > 0;
+        if (isScanned && actor && !isSupOrAdmin) {
+          throw new Error(
+            `Forbidden: Supervisor or Administrator approval is required to delete scanned part ${existing.part_number}.`
+          );
+        }
+        const scanId = `ev_${Date.now()}_del_${Math.random().toString(36).slice(2, 6)}`;
+        const wasScannedNote = isScanned ? ` [Was already scanned: ${recQty}/${existing.required_quantity}]` : "";
+        const auditMessage = `Deleted part ${existing.part_number} (No. ${existing.item_number}${existing.revision ? `, Rev ${existing.revision}` : ""}) \u2014 "${existing.description}" (Qty ${existing.required_quantity})${wasScannedNote} by ${actorName}`;
+        stmts.push(
+          this.db.prepare("UPDATE scan_events SET part_id = NULL WHERE delivery_id = ? AND part_id = ?").bind(deliveryId, existing.id),
+          this.db.prepare("DELETE FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, existing.id),
+          this.db.prepare(
+            `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, ?, ?, ?, ?, 'part_deleted')`
+          ).bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole)
+        );
+      }
+    }
+    for (let idx = 0; idx < partsInput.length; idx++) {
+      const item = partsInput[idx];
+      const existing = item.id ? existingById.get(item.id) : void 0;
+      if (existing) {
+        const cleanPartNo = String(item.partNumber).trim().toUpperCase();
+        const cleanItemNo = String(item.itemNumber ?? existing.item_number).trim() || existing.item_number;
+        const cleanDesc = String(item.description ?? existing.description).trim();
+        const cleanRev = item.revision ? String(item.revision).trim() : null;
+        const cleanQty = Math.max(1, Math.round(Number(item.quantity ?? existing.required_quantity)));
+        const cleanPallet = item.palletNumber !== void 0 && item.palletNumber !== null && String(item.palletNumber).trim() !== "" ? String(item.palletNumber).trim() : null;
+        const cleanMat = item.material ? String(item.material).trim() : null;
+        const cleanThk = item.thickness ? String(item.thickness).trim() : null;
+        const cleanDim = item.dimensions ? String(item.dimensions).trim() : existing.dimensions;
+        const cleanWt = item.weight ? String(item.weight).trim() : existing.weight;
+        const cleanNotes = item.notes !== void 0 ? item.notes ? String(item.notes).trim() : null : existing.notes;
+        const hasChanged = cleanPartNo !== existing.part_number || cleanItemNo !== existing.item_number || cleanDesc !== existing.description || (cleanRev || "") !== (existing.revision || "") || cleanQty !== existing.required_quantity || (cleanPallet || "") !== (existing.pallet_number || "") || (cleanMat || "") !== (existing.material || "") || (cleanThk || "") !== (existing.thickness || "");
+        if (hasChanged) {
+          const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+          const isScanned = existing.status === "received" || recQty > 0;
+          if (isScanned && actor && !isSupOrAdmin && !item.supervisorApproved) {
+            throw new Error(
+              `Forbidden: Supervisor or Administrator approval is required to edit scanned part ${existing.part_number}.`
+            );
+          }
+          let originalOcrJson = existing.original_ocr_values;
+          if (!originalOcrJson) {
+            originalOcrJson = JSON.stringify({
+              partNumber: existing.part_number,
+              itemNumber: existing.item_number,
+              description: existing.description,
+              revision: existing.revision || void 0,
+              quantity: existing.required_quantity
+            });
+          }
+          const changesSummary = [];
+          if (cleanPartNo !== existing.part_number) changesSummary.push(`Part#: ${existing.part_number} \u2192 ${cleanPartNo}`);
+          if (cleanItemNo !== existing.item_number) changesSummary.push(`No: ${existing.item_number} \u2192 ${cleanItemNo}`);
+          if (cleanDesc !== existing.description) changesSummary.push(`Desc: "${existing.description}" \u2192 "${cleanDesc}"`);
+          if ((cleanRev || "") !== (existing.revision || "")) changesSummary.push(`Rev: ${existing.revision || "\u2014"} \u2192 ${cleanRev || "\u2014"}`);
+          if (cleanQty !== existing.required_quantity) {
+            changesSummary.push(
+              `Qty: ${existing.required_quantity} \u2192 ${cleanQty}${recQty > 0 ? ` (Received: ${recQty})` : ""}`
+            );
+          }
+          if ((cleanPallet || "") !== (existing.pallet_number || "")) changesSummary.push(`Pallet: ${existing.pallet_number || "\u2014"} \u2192 ${cleanPallet || "\u2014"}`);
+          if ((cleanMat || "") !== (existing.material || "")) changesSummary.push(`Mat: ${existing.material || "\u2014"} \u2192 ${cleanMat || "\u2014"}`);
+          if ((cleanThk || "") !== (existing.thickness || "")) changesSummary.push(`Thk: ${existing.thickness || "\u2014"} \u2192 ${cleanThk || "\u2014"}`);
+          const scanId = `ev_${Date.now()}_upd_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+          const auditMessage = `Manually edited part ${cleanPartNo} (No. ${cleanItemNo}): ${changesSummary.join("; ")} by ${actorName}`;
+          stmts.push(
+            this.db.prepare(
+              `UPDATE delivery_parts
+                 SET part_number = ?, item_number = ?, description = ?, revision = ?,
+                     required_quantity = ?,
+                     status = CASE WHEN status = 'received' OR received_quantity > 0 THEN 'received' ELSE 'outstanding' END,
+                     verification_status = CASE
+                       WHEN status = 'received' OR received_quantity > 0 THEN
+                         CASE WHEN received_quantity = ? THEN 'verified' ELSE 'quantity_mismatch' END
+                       ELSE 'unscanned'
+                     END,
+                     material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
+                     notes = ?, manually_edited = 1, original_ocr_values = ?,
+                     last_edited_by = ?, last_edited_at = ?, updated_at = ?
+                 WHERE delivery_id = ? AND id = ?`
+            ).bind(
+              cleanPartNo,
+              cleanItemNo,
+              cleanDesc,
+              cleanRev,
+              cleanQty,
+              cleanQty,
+              cleanMat,
+              cleanThk,
+              cleanDim,
+              cleanWt,
+              cleanPallet,
+              cleanNotes,
+              originalOcrJson,
+              actorName,
+              now,
+              now,
+              deliveryId,
+              existing.id
+            ),
+            this.db.prepare(
+              `INSERT INTO scan_events (
+                  id, delivery_id, part_id, user_id, timestamp, code,
+                  scan_type, scan_status, quantity_added, received_quantity_after,
+                  scan_result, employee_name, employee_role, event_action
+                ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_edited', 0, ?, ?, ?, ?, 'part_edited')`
+            ).bind(scanId, deliveryId, existing.id, actorId, now, cleanPartNo, recQty, auditMessage, actorName, actorRole)
+          );
+        }
+      } else {
+        const cleanPartNo = String(item.partNumber).trim().toUpperCase();
+        const cleanItemNo = String(item.itemNumber || idx + 1).trim();
+        const cleanDesc = String(item.description || "").trim() || `Part ${cleanPartNo}`;
+        const cleanRev = item.revision ? String(item.revision).trim() : null;
+        const cleanQty = Math.max(1, Math.round(Number(item.quantity ?? 1)));
+        const partId = item.id || `part_${deliveryId}_manual_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        const scanId = `ev_${Date.now()}_add_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        const auditMessage = `Manually added part ${cleanPartNo} (No. ${cleanItemNo}${cleanRev ? `, Rev ${cleanRev}` : ""}) \u2014 "${cleanDesc}" (Qty ${cleanQty}) by ${actorName}`;
+        stmts.push(
+          this.db.prepare(
+            `INSERT INTO delivery_parts (
+                id, delivery_id, part_number, item_number, docket_line_index, description, revision,
+                required_quantity, received_quantity, verification_status, status,
+                material, thickness, dimensions, weight, pallet_number,
+                notes, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'unscanned', 'outstanding', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)`
+          ).bind(
+            partId,
+            deliveryId,
+            cleanPartNo,
+            cleanItemNo,
+            idx + 1,
+            cleanDesc,
+            cleanRev,
+            cleanQty,
+            item.material ? String(item.material).trim() : null,
+            item.thickness ? String(item.thickness).trim() : null,
+            item.dimensions ? String(item.dimensions).trim() : null,
+            item.weight ? String(item.weight).trim() : null,
+            item.palletNumber ? String(item.palletNumber).trim() : null,
+            item.notes ? String(item.notes).trim() : null,
+            actorName,
+            now,
+            now,
+            now
+          ),
+          this.db.prepare(
+            `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_added', ?, 0, ?, ?, ?, 'part_added')`
+          ).bind(scanId, deliveryId, partId, actorId, now, cleanPartNo, cleanQty, auditMessage, actorName, actorRole)
+        );
+      }
+    }
+    if (stmts.length > 0) {
+      stmts.push(
+        this.db.prepare(
+          `UPDATE deliveries
+             SET delivery_status = CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM delivery_parts
+                 WHERE delivery_id = ? AND (status != 'received' OR verification_status != 'verified')
+               ) THEN 'receiving'
+               ELSE delivery_status
+             END,
+             updated_at = ?
+             WHERE id = ?`
+        ).bind(deliveryId, now, deliveryId)
+      );
+      await this.db.batch(stmts);
+    }
+    const updatedDelivery = await this.getDeliveryById(deliveryId);
+    return {
+      status: "batch_saved",
+      delivery: updatedDelivery
+    };
   }
   /**
    * Update received quantity for a specific part with atomic scan logging and strict duplicate protection
@@ -1377,6 +2167,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     try {
       await this.db.prepare("SELECT id, employee_code, role, active FROM users LIMIT 1").first();
       await this.db.prepare("SELECT id FROM sessions LIMIT 1").first();
+      await this.db.prepare("SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at FROM delivery_parts LIMIT 1").first();
       _PalletTrackDbService.schemaVerified = true;
       return;
     } catch {
@@ -1428,6 +2219,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
         item_number TEXT NOT NULL,
         docket_line_index INTEGER NOT NULL DEFAULT 1,
         description TEXT NOT NULL,
+        revision TEXT,
         required_quantity INTEGER NOT NULL DEFAULT 1,
         received_quantity INTEGER NOT NULL DEFAULT 0,
         verification_status TEXT NOT NULL DEFAULT 'unscanned',
@@ -1443,6 +2235,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
         notes TEXT,
         flagged_for_review INTEGER NOT NULL DEFAULT 0,
         ocr_confidence TEXT,
+        manually_edited INTEGER NOT NULL DEFAULT 0,
+        original_ocr_values TEXT,
+        last_edited_by TEXT,
+        last_edited_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
@@ -1492,7 +2288,12 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "ALTER TABLE users ADD COLUMN created_by TEXT",
       "ALTER TABLE scan_events ADD COLUMN employee_name TEXT",
       "ALTER TABLE scan_events ADD COLUMN employee_role TEXT",
-      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'"
+      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
+      "ALTER TABLE delivery_parts ADD COLUMN revision TEXT",
+      "ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT",
+      "ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT",
+      "ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT"
     ];
     for (const sql of alterCols) {
       try {
@@ -2323,9 +3124,54 @@ async function handlePalletTrackApiRequest(request, db, env) {
           return jsonResponse(updated);
         }
       }
-      if (subPath === "/parts" && method === "GET") {
-        const parts = await service.getDeliveryParts(deliveryId);
-        return jsonResponse(parts);
+      if (subPath === "/parts" || subPath === "/parts/") {
+        if (method === "GET") {
+          const parts = await service.getDeliveryParts(deliveryId);
+          return jsonResponse(parts);
+        }
+        if (method === "POST") {
+          const body = await request.json().catch(() => ({}));
+          if (!body || !String(body.partNumber || "").trim()) {
+            return errorResponse("Part Number is required when adding a part.", 400);
+          }
+          try {
+            const added = await service.addDeliveryPart(deliveryId, body, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role
+            });
+            return jsonResponse(added, 201);
+          } catch (err) {
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to add part to delivery",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
+          }
+        }
+        if (method === "PUT") {
+          const body = await request.json().catch(() => ({}));
+          const partsArray = Array.isArray(body) ? body : body?.parts;
+          if (!Array.isArray(partsArray)) {
+            return errorResponse('Expected an array of parts in "parts" field.', 400);
+          }
+          try {
+            const saved = await service.batchSaveDeliveryParts(deliveryId, partsArray, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role
+            });
+            return jsonResponse(saved, 200);
+          } catch (err) {
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to save parts list",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
+          }
+        }
       }
       const partReceiveMatch = subPath.match(/^\/parts\/([^/]+)\/(?:receive|quantity)$/);
       if (partReceiveMatch && (method === "POST" || method === "PUT")) {
@@ -2350,12 +3196,58 @@ async function handlePalletTrackApiRequest(request, db, env) {
         }
         return jsonResponse(result, 200);
       }
-      if (subPath === "/scans") {
-        if (method === "GET") {
+      const partItemMatch = subPath.match(/^\/parts\/([^/]+)\/?$/);
+      if (partItemMatch) {
+        const partId = decodeURIComponent(partItemMatch[1]);
+        if (method === "PATCH" || method === "PUT") {
+          const body = await request.json().catch(() => ({}));
+          try {
+            const updated = await service.updateDeliveryPart(deliveryId, partId, body, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role
+            });
+            return jsonResponse(updated, 200);
+          } catch (err) {
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to update part",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
+          }
+        }
+        if (method === "DELETE") {
+          try {
+            const deleted = await service.deleteDeliveryPart(deliveryId, partId, {
+              id: currentUser.id,
+              employeeName: currentUser.employeeName,
+              role: currentUser.role
+            });
+            return jsonResponse(deleted, 200);
+          } catch (err) {
+            const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+            return errorResponse(
+              err?.message || "Failed to delete part",
+              isForbidden ? 403 : 400,
+              isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+            );
+          }
+        }
+      }
+      if (subPath === "/scans" || subPath.startsWith("/scans/")) {
+        if (method === "DELETE" || method === "PUT" || method === "PATCH") {
+          return errorResponse(
+            "Forbidden: Audit scan history is immutable and cannot be modified or erased.",
+            403,
+            "AUDIT_HISTORY_IMMUTABLE"
+          );
+        }
+        if (subPath === "/scans" && method === "GET") {
           const scans = await service.getScanHistory(deliveryId);
           return jsonResponse(scans);
         }
-        if (method === "POST") {
+        if (subPath === "/scans" && method === "POST") {
           const body = await request.json().catch(() => ({}));
           if (!body.code || !body.scanType) {
             return errorResponse("code and scanType are required", 400);
@@ -2395,7 +3287,7 @@ app.use(express.json({ limit: "35mb" }));
 app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "camera=*, microphone=*, geolocation=*");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -2406,7 +3298,7 @@ app.use(express.static(path2.resolve(__dirname, "public")));
 app.use("/tesseract", express.static(path2.resolve(__dirname, "node_modules/tesseract.js/dist")));
 var localDb = getLocalDevDatabase();
 app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/users") || req.path === "/api/health") {
+  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path === "/api/health") {
     try {
       const url = `${req.protocol}://${req.get("host") || "localhost:3000"}${req.originalUrl}`;
       const headers = new Headers();
@@ -2505,9 +3397,14 @@ app.post("/api/extract-docket", async (req, res) => {
     const rawMsg = err?.message || String(err || "");
     console.error("Gemini AI docket extraction error:", rawMsg);
     const isMissingKey = rawMsg.includes("GEMINI_API_KEY");
-    return res.status(isMissingKey ? 503 : 500).json({
+    const isRateLimited = err?.status === 429 || err?.code === "GEMINI_RATE_LIMIT_429" || rawMsg.includes("429") || rawMsg.includes("RESOURCE_EXHAUSTED");
+    const isHighDemand = !isMissingKey && (err?.status === 503 || err?.code === "GEMINI_HIGH_DEMAND_503" || rawMsg.includes("503") || rawMsg.toLowerCase().includes("high demand") || rawMsg.toLowerCase().includes("overloaded"));
+    const httpStatus = isMissingKey ? 503 : isHighDemand ? 503 : isRateLimited ? 429 : 500;
+    const errorCode = isMissingKey ? "MISSING_GEMINI_API_KEY" : isHighDemand ? "GEMINI_HIGH_DEMAND_503" : isRateLimited ? "GEMINI_RATE_LIMIT_429" : err?.code || "AI_EXTRACTION_FAILED";
+    return res.status(httpStatus).json({
       error: isMissingKey ? "Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings." : rawMsg || "Gemini AI docket extraction failed.",
-      code: isMissingKey ? "MISSING_GEMINI_API_KEY" : "AI_EXTRACTION_FAILED"
+      code: errorCode,
+      retryable: !isMissingKey
     });
   }
 });

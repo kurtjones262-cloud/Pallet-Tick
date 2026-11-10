@@ -507,7 +507,12 @@ export async function handlePalletTrackApiRequest(
             });
             return jsonResponse(added, 201);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to add part to delivery', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to add part to delivery',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
 
@@ -525,7 +530,12 @@ export async function handlePalletTrackApiRequest(
             });
             return jsonResponse(saved, 200);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to save parts list', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to save parts list',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
       }
@@ -577,7 +587,12 @@ export async function handlePalletTrackApiRequest(
             });
             return jsonResponse(updated, 200);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to update part', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to update part',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
 
@@ -590,26 +605,39 @@ export async function handlePalletTrackApiRequest(
             });
             return jsonResponse(deleted, 200);
           } catch (err: any) {
-            return errorResponse(err?.message || 'Failed to delete part', 400);
+            const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+            return errorResponse(
+              err?.message || 'Failed to delete part',
+              isForbidden ? 403 : 400,
+              isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+            );
           }
         }
       }
 
       // GET /api/deliveries/:id/scans
       // POST /api/deliveries/:id/scans
-      if (subPath === '/scans') {
-        if (method === 'GET') {
+      if (subPath === '/scans' || subPath.startsWith('/scans/')) {
+        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH') {
+          return errorResponse(
+            'Forbidden: Audit scan history is immutable and cannot be modified or erased.',
+            403,
+            'AUDIT_HISTORY_IMMUTABLE'
+          );
+        }
+
+        if (subPath === '/scans' && method === 'GET') {
           const scans = await service.getScanHistory(deliveryId);
           return jsonResponse(scans);
         }
 
-        if (method === 'POST') {
+        if (subPath === '/scans' && method === 'POST') {
           const body: any = await request.json().catch(() => ({}));
           if (!body.code || !body.scanType) {
             return errorResponse('code and scanType are required', 400);
           }
 
-          // Attach authenticated employee identity from session
+          // Attach authenticated employee identity from session (never trust frontend employeeName/userId)
           const scanPayload = {
             ...body,
             userId: currentUser.id,

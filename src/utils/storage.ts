@@ -1515,9 +1515,18 @@ export function addPartToDelivery(
     throw new Error('Part Number is required when adding a part.');
   }
 
+  const duplicatePart = delivery.parts.find(
+    (p) => String(p.partNumber || '').trim().toUpperCase() === cleanPartNumber
+  );
+  if (duplicatePart) {
+    throw new Error(
+      `Duplicate part number "${cleanPartNumber}" already exists in this delivery (No. ${duplicatePart.itemNumber}). Edit the existing part row instead of creating a duplicate.`
+    );
+  }
+
   const rawQty = input.quantity === undefined || input.quantity === null ? 1 : Number(input.quantity);
-  if (Number.isNaN(rawQty) || rawQty < 1) {
-    throw new Error('Quantity must be at least 1.');
+  if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 100000) {
+    throw new Error('Quantity must be a valid positive number (at least 1).');
   }
   const reqQty = Math.max(1, Math.round(rawQty));
 
@@ -1660,6 +1669,15 @@ export function editPartInDelivery(
     throw new Error('Part Number cannot be empty.');
   }
 
+  const duplicateRow = delivery.parts.find(
+    (p) => p.id !== partId && String(p.partNumber || '').trim().toUpperCase() === newPartNumber
+  );
+  if (duplicateRow) {
+    throw new Error(
+      `Duplicate part number "${newPartNumber}" already exists in this delivery (No. ${duplicateRow.itemNumber}).`
+    );
+  }
+
   const newItemNumber =
     updates.itemNumber !== undefined
       ? String(updates.itemNumber).trim() || existing.itemNumber
@@ -1676,8 +1694,8 @@ export function editPartInDelivery(
   let newReqQty = Math.max(1, existing.quantity ?? 1);
   if (updates.quantity !== undefined && updates.quantity !== null) {
     const parsed = Number(updates.quantity);
-    if (Number.isNaN(parsed) || parsed < 1) {
-      throw new Error('Quantity must be at least 1.');
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100000) {
+      throw new Error('Quantity must be a valid positive number (at least 1).');
     }
     newReqQty = Math.max(1, Math.round(parsed));
   }
@@ -1949,16 +1967,22 @@ export function saveDeliveryPartsBatch(
   const actor = getActiveActorInfo();
   const newAuditEvents: ScanEvent[] = [];
 
-  // Validate all rows first
+  // Validate all rows first (including duplicate part number check)
+  const seenBatchParts = new Set<string>();
   for (let i = 0; i < editedParts.length; i++) {
     const row = editedParts[i];
-    if (!String(row.partNumber || '').trim()) {
+    const cleanPartNo = String(row.partNumber || '').trim().toUpperCase();
+    if (!cleanPartNo) {
       throw new Error(`Row ${i + 1}: Part Number is required.`);
     }
     const q = Number(row.quantity ?? 1);
-    if (Number.isNaN(q) || q < 1) {
-      throw new Error(`Row ${i + 1} (${row.partNumber}): Quantity must be at least 1.`);
+    if (!Number.isFinite(q) || q < 1 || q > 100000) {
+      throw new Error(`Row ${i + 1} (${cleanPartNo}): Quantity must be at least 1.`);
     }
+    if (seenBatchParts.has(cleanPartNo)) {
+      throw new Error(`Duplicate part number "${cleanPartNo}" found in the parts list.`);
+    }
+    seenBatchParts.add(cleanPartNo);
   }
 
   const incomingIds = new Set(editedParts.map((p) => p.id).filter(Boolean) as string[]);

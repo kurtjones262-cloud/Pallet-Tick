@@ -538,6 +538,14 @@ export class PalletTrackDbService {
   }
 
   /**
+   * Helper: Determine if an actor has supervisor or administrator privileges
+   */
+  private isSupervisorOrAdmin(role?: string): boolean {
+    const r = (role || '').trim().toLowerCase();
+    return r === 'super_admin' || r === 'admin' || r === 'supervisor';
+  }
+
+  /**
    * Manually add a new part to an existing delivery docket with validation and audit logging
    */
   async addDeliveryPart(
@@ -555,11 +563,12 @@ export class PalletTrackDbService {
       weight?: string;
       palletNumber?: string | number;
       notes?: string;
+      allowDuplicatePartNumber?: boolean;
     },
     actor?: { id?: string; employeeName?: string; role?: string }
   ) {
     const delivery = await this.db
-      .prepare('SELECT id FROM deliveries WHERE id = ?')
+      .prepare('SELECT id, delivery_status FROM deliveries WHERE id = ?')
       .bind(deliveryId)
       .first<DeliveryRow>();
 
@@ -573,23 +582,42 @@ export class PalletTrackDbService {
     if (!partNumber) {
       throw new Error('Part Number is required when adding a part.');
     }
+    if (partNumber.length > 120) {
+      throw new Error('Part Number cannot exceed 120 characters.');
+    }
 
     const rawQty = input.quantity === undefined || input.quantity === null ? 1 : Number(input.quantity);
-    if (Number.isNaN(rawQty) || rawQty < 1) {
-      throw new Error('Quantity must be a valid positive number (at least 1).');
+    if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 100000) {
+      throw new Error('Quantity must be a valid positive number (between 1 and 100,000).');
     }
     const reqQty = Math.max(1, Math.round(rawQty));
 
     const existingParts = await this.db
-      .prepare('SELECT item_number, docket_line_index FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC')
+      .prepare(
+        'SELECT id, part_number, item_number, docket_line_index FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC'
+      )
       .bind(deliveryId)
-      .all<{ item_number: string; docket_line_index: number }>();
+      .all<{ id: string; part_number: string; item_number: string; docket_line_index: number }>();
 
-    const maxLineIndex = (existingParts.results || []).reduce(
+    const existingList = existingParts.results || [];
+
+    // Prevent accidental duplicate part numbers in the same delivery unless explicitly allowed
+    if (!input.allowDuplicatePartNumber) {
+      const duplicatePart = existingList.find(
+        (r) => String(r.part_number || '').trim().toUpperCase() === partNumber
+      );
+      if (duplicatePart) {
+        throw new Error(
+          `Duplicate part number "${partNumber}" already exists in this delivery (Docket No. ${duplicatePart.item_number}). Edit the existing part row instead of creating a duplicate.`
+        );
+      }
+    }
+
+    const maxLineIndex = existingList.reduce(
       (max, r) => Math.max(max, Number(r.docket_line_index) || 0),
       0
     );
-    const maxItemNum = (existingParts.results || []).reduce((max, r) => {
+    const maxItemNum = existingList.reduce((max, r) => {
       const parsed = parseInt(String(r.item_number || '').replace(/\D+/g, ''), 10);
       return Number.isNaN(parsed) ? max : Math.max(max, parsed);
     }, 0);
@@ -609,6 +637,7 @@ export class PalletTrackDbService {
       revision ? `, Rev ${revision}` : ''
     }) — "${description}" (Qty ${reqQty}) by ${actorName}`;
 
+    // Adding an unscanned part means the delivery now has an outstanding item; ensure status is 'receiving'
     const stmts = [
       this.db
         .prepare(
@@ -650,7 +679,7 @@ export class PalletTrackDbService {
         )
         .bind(scanId, deliveryId, partId, actorId, now, partNumber, reqQty, auditMessage, actorName, actorRole),
       this.db
-        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .prepare("UPDATE deliveries SET delivery_status = 'receiving', updated_at = ? WHERE id = ?")
         .bind(now, deliveryId),
     ];
 
@@ -673,7 +702,7 @@ export class PalletTrackDbService {
   /**
    * Manually edit an existing part on a delivery docket.
    * Preserves original OCR values, keeps scanning/verification status consistent if already scanned,
-   * and records an audit event in scan_events.
+   * enforces supervisor/admin RBAC when modifying already-scanned parts, and records an audit event in scan_events.
    */
   async updateDeliveryPart(
     deliveryId: string,
@@ -690,6 +719,8 @@ export class PalletTrackDbService {
       weight?: string | null;
       palletNumber?: string | number | null;
       notes?: string | null;
+      allowDuplicatePartNumber?: boolean;
+      supervisorApproved?: boolean;
     },
     actor?: { id?: string; employeeName?: string; role?: string }
   ) {
@@ -702,12 +733,48 @@ export class PalletTrackDbService {
       throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
     }
 
+    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+    const hasScanEventsRes = await this.db
+      .prepare(
+        "SELECT COUNT(*) as count FROM scan_events WHERE delivery_id = ? AND part_id = ? AND scan_status NOT IN ('part_added', 'part_edited', 'part_deleted')"
+      )
+      .bind(deliveryId, partId)
+      .first<{ count: number }>();
+    const hasScanHistory = Number(hasScanEventsRes?.count || 0) > 0;
+    const isScanned = existing.status === 'received' || recQty > 0 || hasScanHistory;
+
+    // Require Supervisor or Admin privileges (or explicit supervisor approval) to edit a part that has already been scanned
+    if (isScanned && actor && !this.isSupervisorOrAdmin(actor.role) && !updates.supervisorApproved) {
+      throw new Error(
+        'Forbidden: Supervisor or Administrator approval is required to edit a part that has already been scanned.'
+      );
+    }
+
     const newPartNumber =
       updates.partNumber !== undefined
         ? String(updates.partNumber).trim().toUpperCase()
         : existing.part_number;
     if (!newPartNumber) {
       throw new Error('Part Number cannot be empty.');
+    }
+    if (newPartNumber.length > 120) {
+      throw new Error('Part Number cannot exceed 120 characters.');
+    }
+
+    // Check for accidental duplicate partNumber against other rows in the same delivery
+    if (!updates.allowDuplicatePartNumber && newPartNumber !== existing.part_number) {
+      const duplicateRow = await this.db
+        .prepare(
+          'SELECT id, item_number FROM delivery_parts WHERE delivery_id = ? AND id != ? AND UPPER(part_number) = ? LIMIT 1'
+        )
+        .bind(deliveryId, partId, newPartNumber)
+        .first<{ id: string; item_number: string }>();
+
+      if (duplicateRow) {
+        throw new Error(
+          `Duplicate part number "${newPartNumber}" already exists in this delivery (Docket No. ${duplicateRow.item_number}).`
+        );
+      }
     }
 
     const newItemNumber =
@@ -730,8 +797,8 @@ export class PalletTrackDbService {
     let newReqQty = existing.required_quantity;
     if (updates.quantity !== undefined && updates.quantity !== null) {
       const parsedQty = Number(updates.quantity);
-      if (Number.isNaN(parsedQty) || parsedQty < 1) {
-        throw new Error('Quantity must be a positive number (at least 1).');
+      if (!Number.isFinite(parsedQty) || parsedQty < 1 || parsedQty > 100000) {
+        throw new Error('Quantity must be a positive number (between 1 and 100,000).');
       }
       newReqQty = Math.max(1, Math.round(parsedQty));
     }
@@ -785,16 +852,6 @@ export class PalletTrackDbService {
       });
     }
 
-    // Keep scanning & verification status consistent with pallet scanning and outstanding quantities
-    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
-    const isScanned = existing.status === 'received' || recQty > 0;
-    const newStatus = isScanned ? 'received' : 'outstanding';
-    const newVerificationStatus = isScanned
-      ? recQty === newReqQty
-        ? 'verified'
-        : 'quantity_mismatch'
-      : 'unscanned';
-
     const changesSummary: string[] = [];
     if (newPartNumber !== existing.part_number) {
       changesSummary.push(`Part#: ${existing.part_number} → ${newPartNumber}`);
@@ -809,7 +866,11 @@ export class PalletTrackDbService {
       changesSummary.push(`Rev: ${existing.revision || '—'} → ${newRevision || '—'}`);
     }
     if (newReqQty !== existing.required_quantity) {
-      changesSummary.push(`Qty: ${existing.required_quantity} → ${newReqQty}`);
+      changesSummary.push(
+        `Qty: ${existing.required_quantity} → ${newReqQty}${
+          recQty > 0 ? ` (Received: ${recQty})` : ''
+        }`
+      );
     }
     if ((newPalletNumber || '') !== (existing.pallet_number || '')) {
       changesSummary.push(`Pallet: ${existing.pallet_number || '—'} → ${newPalletNumber || '—'}`);
@@ -831,12 +892,19 @@ export class PalletTrackDbService {
         ? `Manually edited part ${newPartNumber} (No. ${newItemNumber}): ${changesSummary.join('; ')} by ${actorName}`
         : `Saved part ${newPartNumber} (No. ${newItemNumber}) by ${actorName}`;
 
+    // Compute status and verification_status in SQL against live received_quantity to prevent scan/edit race conditions
     const stmts: any[] = [
       this.db
         .prepare(
           `UPDATE delivery_parts
            SET part_number = ?, item_number = ?, description = ?, revision = ?,
-               required_quantity = ?, verification_status = ?, status = ?,
+               required_quantity = ?,
+               status = CASE WHEN status = 'received' OR received_quantity > 0 THEN 'received' ELSE 'outstanding' END,
+               verification_status = CASE
+                 WHEN status = 'received' OR received_quantity > 0 THEN
+                   CASE WHEN received_quantity = ? THEN 'verified' ELSE 'quantity_mismatch' END
+                 ELSE 'unscanned'
+               END,
                material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
                notes = ?, manually_edited = 1, original_ocr_values = ?,
                last_edited_by = ?, last_edited_at = ?, updated_at = ?
@@ -848,8 +916,7 @@ export class PalletTrackDbService {
           newDescription,
           newRevision,
           newReqQty,
-          newVerificationStatus,
-          newStatus,
+          newReqQty,
           newMaterial,
           newThickness,
           newDimensions,
@@ -884,8 +951,19 @@ export class PalletTrackDbService {
           actorRole
         ),
       this.db
-        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
-        .bind(now, deliveryId),
+        .prepare(
+          `UPDATE deliveries
+           SET delivery_status = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM delivery_parts
+               WHERE delivery_id = ? AND (status != 'received' OR verification_status != 'verified')
+             ) THEN 'receiving'
+             ELSE delivery_status
+           END,
+           updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(deliveryId, now, deliveryId),
     ];
 
     await this.db.batch(stmts);
@@ -906,11 +984,13 @@ export class PalletTrackDbService {
 
   /**
    * Delete a part from a delivery docket and record an audit trail entry in scan_events.
+   * Historical scan events for the deleted part remain intact (part_id set to NULL).
    */
   async deleteDeliveryPart(
     deliveryId: string,
     partId: string,
-    actor?: { id?: string; employeeName?: string; role?: string }
+    actor?: { id?: string; employeeName?: string; role?: string },
+    options?: { supervisorApproved?: boolean }
   ) {
     const existing = await this.db
       .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
@@ -921,15 +1001,30 @@ export class PalletTrackDbService {
       throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
     }
 
+    const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+    const hasScanEventsRes = await this.db
+      .prepare(
+        "SELECT COUNT(*) as count FROM scan_events WHERE delivery_id = ? AND part_id = ? AND scan_status NOT IN ('part_added', 'part_edited', 'part_deleted')"
+      )
+      .bind(deliveryId, partId)
+      .first<{ count: number }>();
+    const hasScanHistory = Number(hasScanEventsRes?.count || 0) > 0;
+    const isScanned = existing.status === 'received' || recQty > 0 || hasScanHistory;
+
+    if (isScanned && actor && !this.isSupervisorOrAdmin(actor.role) && !options?.supervisorApproved) {
+      throw new Error(
+        'Forbidden: Supervisor or Administrator approval is required to delete a part that has already been scanned.'
+      );
+    }
+
     const now = new Date().toISOString();
     const actorName = actor?.employeeName || 'Authorized User';
     const actorId = actor?.id || 'usr_receiver_default';
     const actorRole = actor?.role || 'supervisor';
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const wasScannedNote =
-      existing.status === 'received' || existing.received_quantity > 0
-        ? ` [Was already scanned: ${existing.received_quantity}/${existing.required_quantity}]`
-        : '';
+    const wasScannedNote = isScanned
+      ? ` [Was already scanned: ${recQty}/${existing.required_quantity}]`
+      : '';
     const auditMessage = `Deleted part ${existing.part_number} (No. ${existing.item_number}${
       existing.revision ? `, Rev ${existing.revision}` : ''
     }) — "${existing.description}" (Qty ${existing.required_quantity})${wasScannedNote} by ${actorName}`;
@@ -947,9 +1042,9 @@ export class PalletTrackDbService {
             id, delivery_id, part_id, user_id, timestamp, code,
             scan_type, scan_status, quantity_added, received_quantity_after,
             scan_result, employee_name, employee_role, event_action
-          ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, 0, ?, ?, ?, 'part_deleted')`
+          ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, ?, ?, ?, ?, 'part_deleted')`
         )
-        .bind(scanId, deliveryId, actorId, now, existing.part_number, auditMessage, actorName, actorRole),
+        .bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole),
       this.db
         .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
         .bind(now, deliveryId),
@@ -967,7 +1062,8 @@ export class PalletTrackDbService {
   }
 
   /**
-   * Batch save an entire delivery's parts list (supports multi-row inline edits, additions, and deletions).
+   * Batch save an entire delivery's parts list atomically in a single D1 transaction
+   * (supports multi-row inline edits, additions, and deletions).
    */
   async batchSaveDeliveryParts(
     deliveryId: string,
@@ -985,6 +1081,8 @@ export class PalletTrackDbService {
       weight?: string | null;
       palletNumber?: string | number | null;
       notes?: string | null;
+      allowDuplicatePartNumber?: boolean;
+      supervisorApproved?: boolean;
     }>,
     actor?: { id?: string; employeeName?: string; role?: string }
   ) {
@@ -1008,32 +1106,89 @@ export class PalletTrackDbService {
     const existingRows = existingRowsRes.results || [];
     const existingById = new Map<string, DeliveryPartRow>(existingRows.map((r) => [r.id, r]));
 
+    // Pre-validate every part in the batch before executing any database statements
     const incomingIds = new Set<string>();
-    for (const p of partsInput) {
-      if (!String(p.partNumber || '').trim()) {
-        throw new Error('All parts must have a non-empty Part Number.');
+    const seenPartNumbers = new Set<string>();
+
+    for (let i = 0; i < partsInput.length; i++) {
+      const p = partsInput[i];
+      const cleanPartNo = String(p?.partNumber || '')
+        .trim()
+        .toUpperCase();
+      if (!cleanPartNo) {
+        throw new Error(`Row ${i + 1}: All parts must have a non-empty Part Number.`);
+      }
+      if (cleanPartNo.length > 120) {
+        throw new Error(`Row ${i + 1}: Part Number cannot exceed 120 characters.`);
       }
       const q = Number(p.quantity ?? 1);
-      if (Number.isNaN(q) || q < 1) {
-        throw new Error(`Invalid quantity for part ${p.partNumber}: must be at least 1.`);
+      if (!Number.isFinite(q) || q < 1 || q > 100000) {
+        throw new Error(
+          `Row ${i + 1}: Invalid quantity for part ${cleanPartNo}: must be between 1 and 100,000.`
+        );
       }
+      if (!p.allowDuplicatePartNumber && seenPartNumbers.has(cleanPartNo)) {
+        throw new Error(
+          `Duplicate part number "${cleanPartNo}" found in the parts list. Each part row should have a unique part number.`
+        );
+      }
+      seenPartNumbers.add(cleanPartNo);
       if (p.id) incomingIds.add(p.id);
     }
 
-    // 1. Delete any existing parts removed in the batch
+    const now = new Date().toISOString();
+    const actorName = actor?.employeeName || 'Authorized User';
+    const actorId = actor?.id || 'usr_receiver_default';
+    const actorRole = actor?.role || 'supervisor';
+    const isSupOrAdmin = this.isSupervisorOrAdmin(actor?.role);
+
+    const stmts: any[] = [];
+
+    // 1. Prepare deletion statements for any existing parts removed in the batch
     for (const existing of existingRows) {
       if (!incomingIds.has(existing.id)) {
-        await this.deleteDeliveryPart(deliveryId, existing.id, actor);
+        const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+        const isScanned = existing.status === 'received' || recQty > 0;
+        if (isScanned && actor && !isSupOrAdmin) {
+          throw new Error(
+            `Forbidden: Supervisor or Administrator approval is required to delete scanned part ${existing.part_number}.`
+          );
+        }
+        const scanId = `ev_${Date.now()}_del_${Math.random().toString(36).slice(2, 6)}`;
+        const wasScannedNote = isScanned
+          ? ` [Was already scanned: ${recQty}/${existing.required_quantity}]`
+          : '';
+        const auditMessage = `Deleted part ${existing.part_number} (No. ${existing.item_number}${
+          existing.revision ? `, Rev ${existing.revision}` : ''
+        }) — "${existing.description}" (Qty ${existing.required_quantity})${wasScannedNote} by ${actorName}`;
+
+        stmts.push(
+          this.db
+            .prepare('UPDATE scan_events SET part_id = NULL WHERE delivery_id = ? AND part_id = ?')
+            .bind(deliveryId, existing.id),
+          this.db
+            .prepare('DELETE FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+            .bind(deliveryId, existing.id),
+          this.db
+            .prepare(
+              `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, ?, ?, ?, ?, 'part_deleted')`
+            )
+            .bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole)
+        );
       }
     }
 
-    // 2. Update existing parts that changed or add new parts
+    // 2. Prepare UPDATE or INSERT statements for all parts in the batch
     for (let idx = 0; idx < partsInput.length; idx++) {
       const item = partsInput[idx];
       const existing = item.id ? existingById.get(item.id) : undefined;
       if (existing) {
         const cleanPartNo = String(item.partNumber).trim().toUpperCase();
-        const cleanItemNo = String(item.itemNumber ?? existing.item_number).trim();
+        const cleanItemNo = String(item.itemNumber ?? existing.item_number).trim() || existing.item_number;
         const cleanDesc = String(item.description ?? existing.description).trim();
         const cleanRev = item.revision ? String(item.revision).trim() : null;
         const cleanQty = Math.max(1, Math.round(Number(item.quantity ?? existing.required_quantity)));
@@ -1043,6 +1198,9 @@ export class PalletTrackDbService {
             : null;
         const cleanMat = item.material ? String(item.material).trim() : null;
         const cleanThk = item.thickness ? String(item.thickness).trim() : null;
+        const cleanDim = item.dimensions ? String(item.dimensions).trim() : existing.dimensions;
+        const cleanWt = item.weight ? String(item.weight).trim() : existing.weight;
+        const cleanNotes = item.notes !== undefined ? (item.notes ? String(item.notes).trim() : null) : existing.notes;
 
         const hasChanged =
           cleanPartNo !== existing.part_number ||
@@ -1055,45 +1213,164 @@ export class PalletTrackDbService {
           (cleanThk || '') !== (existing.thickness || '');
 
         if (hasChanged) {
-          await this.updateDeliveryPart(
-            deliveryId,
-            existing.id,
-            {
-              partNumber: cleanPartNo,
-              itemNumber: cleanItemNo,
-              description: cleanDesc,
-              revision: cleanRev,
-              quantity: cleanQty,
-              palletNumber: cleanPallet,
-              material: cleanMat,
-              thickness: cleanThk,
-              dimensions: item.dimensions,
-              weight: item.weight,
-              notes: item.notes,
-            },
-            actor
+          const recQty = Math.max(0, Number(existing.received_quantity) || 0);
+          const isScanned = existing.status === 'received' || recQty > 0;
+          if (isScanned && actor && !isSupOrAdmin && !item.supervisorApproved) {
+            throw new Error(
+              `Forbidden: Supervisor or Administrator approval is required to edit scanned part ${existing.part_number}.`
+            );
+          }
+
+          let originalOcrJson = existing.original_ocr_values;
+          if (!originalOcrJson) {
+            originalOcrJson = JSON.stringify({
+              partNumber: existing.part_number,
+              itemNumber: existing.item_number,
+              description: existing.description,
+              revision: existing.revision || undefined,
+              quantity: existing.required_quantity,
+            });
+          }
+
+          const changesSummary: string[] = [];
+          if (cleanPartNo !== existing.part_number) changesSummary.push(`Part#: ${existing.part_number} → ${cleanPartNo}`);
+          if (cleanItemNo !== existing.item_number) changesSummary.push(`No: ${existing.item_number} → ${cleanItemNo}`);
+          if (cleanDesc !== existing.description) changesSummary.push(`Desc: "${existing.description}" → "${cleanDesc}"`);
+          if ((cleanRev || '') !== (existing.revision || '')) changesSummary.push(`Rev: ${existing.revision || '—'} → ${cleanRev || '—'}`);
+          if (cleanQty !== existing.required_quantity) {
+            changesSummary.push(
+              `Qty: ${existing.required_quantity} → ${cleanQty}${recQty > 0 ? ` (Received: ${recQty})` : ''}`
+            );
+          }
+          if ((cleanPallet || '') !== (existing.pallet_number || '')) changesSummary.push(`Pallet: ${existing.pallet_number || '—'} → ${cleanPallet || '—'}`);
+          if ((cleanMat || '') !== (existing.material || '')) changesSummary.push(`Mat: ${existing.material || '—'} → ${cleanMat || '—'}`);
+          if ((cleanThk || '') !== (existing.thickness || '')) changesSummary.push(`Thk: ${existing.thickness || '—'} → ${cleanThk || '—'}`);
+
+          const scanId = `ev_${Date.now()}_upd_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+          const auditMessage = `Manually edited part ${cleanPartNo} (No. ${cleanItemNo}): ${changesSummary.join('; ')} by ${actorName}`;
+
+          stmts.push(
+            this.db
+              .prepare(
+                `UPDATE delivery_parts
+                 SET part_number = ?, item_number = ?, description = ?, revision = ?,
+                     required_quantity = ?,
+                     status = CASE WHEN status = 'received' OR received_quantity > 0 THEN 'received' ELSE 'outstanding' END,
+                     verification_status = CASE
+                       WHEN status = 'received' OR received_quantity > 0 THEN
+                         CASE WHEN received_quantity = ? THEN 'verified' ELSE 'quantity_mismatch' END
+                       ELSE 'unscanned'
+                     END,
+                     material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
+                     notes = ?, manually_edited = 1, original_ocr_values = ?,
+                     last_edited_by = ?, last_edited_at = ?, updated_at = ?
+                 WHERE delivery_id = ? AND id = ?`
+              )
+              .bind(
+                cleanPartNo,
+                cleanItemNo,
+                cleanDesc,
+                cleanRev,
+                cleanQty,
+                cleanQty,
+                cleanMat,
+                cleanThk,
+                cleanDim,
+                cleanWt,
+                cleanPallet,
+                cleanNotes,
+                originalOcrJson,
+                actorName,
+                now,
+                now,
+                deliveryId,
+                existing.id
+              ),
+            this.db
+              .prepare(
+                `INSERT INTO scan_events (
+                  id, delivery_id, part_id, user_id, timestamp, code,
+                  scan_type, scan_status, quantity_added, received_quantity_after,
+                  scan_result, employee_name, employee_role, event_action
+                ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_edited', 0, ?, ?, ?, ?, 'part_edited')`
+              )
+              .bind(scanId, deliveryId, existing.id, actorId, now, cleanPartNo, recQty, auditMessage, actorName, actorRole)
           );
         }
       } else {
-        await this.addDeliveryPart(
-          deliveryId,
-          {
-            id: item.id,
-            partNumber: item.partNumber,
-            itemNumber: item.itemNumber || String(idx + 1),
-            description: item.description,
-            revision: item.revision || undefined,
-            quantity: item.quantity ?? 1,
-            palletNumber: item.palletNumber || undefined,
-            material: item.material || undefined,
-            thickness: item.thickness || undefined,
-            dimensions: item.dimensions || undefined,
-            weight: item.weight || undefined,
-            notes: item.notes || undefined,
-          },
-          actor
+        const cleanPartNo = String(item.partNumber).trim().toUpperCase();
+        const cleanItemNo = String(item.itemNumber || idx + 1).trim();
+        const cleanDesc = String(item.description || '').trim() || `Part ${cleanPartNo}`;
+        const cleanRev = item.revision ? String(item.revision).trim() : null;
+        const cleanQty = Math.max(1, Math.round(Number(item.quantity ?? 1)));
+        const partId = item.id || `part_${deliveryId}_manual_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        const scanId = `ev_${Date.now()}_add_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        const auditMessage = `Manually added part ${cleanPartNo} (No. ${cleanItemNo}${
+          cleanRev ? `, Rev ${cleanRev}` : ''
+        }) — "${cleanDesc}" (Qty ${cleanQty}) by ${actorName}`;
+
+        stmts.push(
+          this.db
+            .prepare(
+              `INSERT INTO delivery_parts (
+                id, delivery_id, part_number, item_number, docket_line_index, description, revision,
+                required_quantity, received_quantity, verification_status, status,
+                material, thickness, dimensions, weight, pallet_number,
+                notes, manually_edited, original_ocr_values, last_edited_by, last_edited_at,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'unscanned', 'outstanding', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)`
+            )
+            .bind(
+              partId,
+              deliveryId,
+              cleanPartNo,
+              cleanItemNo,
+              idx + 1,
+              cleanDesc,
+              cleanRev,
+              cleanQty,
+              item.material ? String(item.material).trim() : null,
+              item.thickness ? String(item.thickness).trim() : null,
+              item.dimensions ? String(item.dimensions).trim() : null,
+              item.weight ? String(item.weight).trim() : null,
+              item.palletNumber ? String(item.palletNumber).trim() : null,
+              item.notes ? String(item.notes).trim() : null,
+              actorName,
+              now,
+              now,
+              now
+            ),
+          this.db
+            .prepare(
+              `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_added', ?, 0, ?, ?, ?, 'part_added')`
+            )
+            .bind(scanId, deliveryId, partId, actorId, now, cleanPartNo, cleanQty, auditMessage, actorName, actorRole)
         );
       }
+    }
+
+    if (stmts.length > 0) {
+      stmts.push(
+        this.db
+          .prepare(
+            `UPDATE deliveries
+             SET delivery_status = CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM delivery_parts
+                 WHERE delivery_id = ? AND (status != 'received' OR verification_status != 'verified')
+               ) THEN 'receiving'
+               ELSE delivery_status
+             END,
+             updated_at = ?
+             WHERE id = ?`
+          )
+          .bind(deliveryId, now, deliveryId)
+      );
+      await this.db.batch(stmts);
     }
 
     const updatedDelivery = await this.getDeliveryById(deliveryId);

@@ -23,7 +23,11 @@ interface EventContext {
 }
 
 const DEFAULT_PRIMARY_MODEL = 'gemini-3.8-flash';
-const DEFAULT_FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+const DEFAULT_FALLBACK_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-flash-latest',
+] as const;
 const MAX_AUTOMATIC_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 2000;
 
@@ -307,7 +311,7 @@ Rules:
     for (let mIdx = 0; mIdx < candidateModels.length && !parsed; mIdx++) {
       const model = candidateModels[mIdx];
       const isFallback = mIdx > 0;
-      const maxRetries = isFallback ? 2 : MAX_AUTOMATIC_RETRIES;
+      const maxRetries = MAX_AUTOMATIC_RETRIES;
 
       logPagesOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
         model,
@@ -342,7 +346,7 @@ Rules:
             status === 503 ||
             status === 429 ||
             status >= 500 ||
-            /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|Malformed|Incomplete OCR/i.test(msg);
+            /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
 
           logPagesOcrEvent('warn', 'extraction_attempt_failed', {
             model,
@@ -355,6 +359,9 @@ Rules:
           });
 
           if (!isRetryable && (status === 400 || status === 401 || status === 403)) {
+            throw err;
+          }
+          if (!isRetryable && status === 404) {
             break;
           }
 

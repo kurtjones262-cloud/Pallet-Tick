@@ -67,7 +67,11 @@ export interface ExtractedDocketResult {
 }
 
 export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-3.8-flash';
-export const DEFAULT_FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
+export const DEFAULT_FALLBACK_VISION_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-flash-latest',
+] as const;
 
 export const MAX_AUTOMATIC_RETRIES = 3;
 export const INITIAL_BACKOFF_MS = 2000;
@@ -344,14 +348,15 @@ interface BatchExtractionResponse {
  * 4. Strict validation of extracted JSON data before accepting results
  * 5. Safe operational logging without exposing API keys or document contents
  */
-async function generateWithRetryAndFallback(
+export async function generateWithRetryAndFallback(
   ai: any,
   ThinkingLevel: any,
   parts: any[],
   systemInstruction: string,
   responseSchema: any,
   mode: 'batch' | 'recovery' | 'label' = 'batch',
-  envOverride?: Record<string, unknown>
+  envOverride?: Record<string, unknown>,
+  baseDelayMs: number = INITIAL_BACKOFF_MS
 ): Promise<{
   parsed: any;
   modelUsed: string;
@@ -368,9 +373,8 @@ async function generateWithRetryAndFallback(
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const currentModel = candidateModels[mIdx];
     const isFallbackModel = mIdx > 0;
-    // Primary model gets initial attempt + up to 3 automatic retries (4 attempts total).
-    // Each fallback model gets initial attempt + up to 2 automatic retries.
-    const maxRetriesForModel = isFallbackModel ? 2 : MAX_AUTOMATIC_RETRIES;
+    // Maximum of 3 automatic retries per model (initial attempt + up to 3 automatic retries)
+    const maxRetriesForModel = MAX_AUTOMATIC_RETRIES;
 
     logOcrEvent('info', isFallbackModel ? 'model_fallback_selected' : 'model_selected', {
       model: currentModel,
@@ -392,7 +396,7 @@ async function generateWithRetryAndFallback(
         };
 
         // Only attach ThinkingLevel.MEDIUM on Gemini 3.8 / 4 primary models
-        if (currentModel.includes('3.8') || currentModel.includes('argon')) {
+        if (ThinkingLevel && (currentModel.includes('3.8') || currentModel.includes('argon'))) {
           config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
         }
 
@@ -403,7 +407,7 @@ async function generateWithRetryAndFallback(
         });
         clearTimeout(timer);
 
-        const rawText = (response.text ?? '').trim();
+        const rawText = (response?.text ?? '').trim();
         const validated = validateAndParseOcrJsonResponse(rawText, mode);
 
         logOcrEvent('info', 'extraction_succeeded', {
@@ -426,8 +430,10 @@ async function generateWithRetryAndFallback(
         const classification = classifyGeminiError(err);
         lastStatusCode = classification.statusCode;
 
-        const isValidationFailure = String(err?.message || '').includes('Malformed') ||
-          String(err?.message || '').includes('Incomplete OCR');
+        const isValidationFailure =
+          String(err?.message || '').includes('Malformed') ||
+          String(err?.message || '').includes('Incomplete OCR') ||
+          String(err?.message || '').includes('Invalid OCR item');
 
         logOcrEvent('warn', 'extraction_attempt_failed', {
           model: currentModel,
@@ -439,18 +445,36 @@ async function generateWithRetryAndFallback(
           reason: classification.cleanMessage,
         });
 
-        // If it's a permanent client error (e.g. 400 Invalid API Key or 403 Permission Denied), do not retry same model
+        // Permanent client/credential errors (400 Invalid API Key / Malformed Request, 401 Unauthorized, 403 Forbidden)
+        // must immediately abort without entering retry loops or calling fallback models with the same bad request/key.
         if (
           !classification.isRetryableAvailabilityError &&
           !isValidationFailure &&
-          (classification.statusCode === 400 || classification.statusCode === 401 || classification.statusCode === 403)
+          (classification.statusCode === 400 ||
+            classification.statusCode === 401 ||
+            classification.statusCode === 403)
+        ) {
+          const permErr: any = new Error(classification.cleanMessage);
+          permErr.status = classification.statusCode;
+          permErr.code =
+            classification.statusCode === 401 || classification.statusCode === 403
+              ? 'GEMINI_AUTH_ERROR'
+              : 'GEMINI_BAD_REQUEST';
+          throw permErr;
+        }
+
+        // Model not found (404): do not retry the same 404 model; immediately advance to the next fallback model.
+        if (
+          !classification.isRetryableAvailabilityError &&
+          !isValidationFailure &&
+          classification.statusCode === 404
         ) {
           break;
         }
 
         if (retry < maxRetriesForModel) {
           totalRetryAttempts++;
-          const waitMs = computeExponentialBackoffWithJitter(retry + 1, INITIAL_BACKOFF_MS);
+          const waitMs = computeExponentialBackoffWithJitter(retry + 1, baseDelayMs);
           logOcrEvent('info', 'retrying_after_backoff', {
             model: currentModel,
             retryAttempt: retry + 1,

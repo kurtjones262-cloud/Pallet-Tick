@@ -22,6 +22,8 @@ export interface ExtractedDocketItem {
   pageNumber?: number;
   confidence: 'high' | 'medium' | 'low';
   notes?: string;
+  validationFlags?: string[];
+  bbox?: { x0: number; y0: number; x1: number; y1: number };
   manuallyEdited?: boolean;
   lastEditedBy?: string;
   lastEditedAt?: string;
@@ -56,11 +58,20 @@ export interface ExtractedDocketResult {
   rawTextSummary?: string;
   confidenceScore: number; // 0 - 100
   needsManualReview: boolean;
-  extractionMethod?: 'ai-vision' | 'offline-ocr' | 'pdf-text';
+  extractionMethod?: 'tesseract-ocr' | 'ai-vision' | 'offline-ocr' | 'pdf-text';
+  extractionEngineLabel?: string;
   aiModelUsed?: string;
   fallbackUsed?: boolean;
+  geminiFallbackReason?: string;
   retryAttempts?: number;
   pagesScanned?: number;
+  pagesFromCache?: number;
+  processingTimeMs?: number;
+  ocrTimeMs?: number;
+  parseTimeMs?: number;
+  validationFlags?: string[];
+  missingRowNumbers?: number[];
+  flaggedRowCount?: number;
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: number;
   lastVisibleRowNo?: number;

@@ -76,13 +76,13 @@ export async function extractPagesFromPdfFile(
     onPageProgress?.(pageNum, numPages);
     const page = await pdfDoc.getPage(pageNum);
 
-    // 1. Extract selectable digital text items and reconstruct horizontal table lines
+    // 1. Extract selectable digital text items and reconstruct horizontal table lines with X/Y coordinates
     const selectableLines: RawOcrLine[] = [];
     let rawText = '';
 
     try {
       const textContent = await page.getTextContent();
-      const rawItems: Array<{ str: string; x: number; y: number; width: number }> = [];
+      const rawItems: Array<{ str: string; x: number; y: number; width: number; height: number }> = [];
 
       for (const item of textContent.items || []) {
         const str = String(item.str || '');
@@ -90,8 +90,9 @@ export async function extractPagesFromPdfFile(
         const transform = Array.isArray(item.transform) ? item.transform : [1, 0, 0, 1, 0, 0];
         const x = Number(transform[4]) || 0;
         const y = Number(transform[5]) || 0;
-        const w = Number(item.width) || str.length * 5;
-        rawItems.push({ str, x, y, width: w });
+        const w = Number(item.width) || str.length * 5.5;
+        const h = Number(item.height) || Math.abs(Number(transform[3])) || 10;
+        rawItems.push({ str, x, y, width: w, height: h });
       }
 
       // Sort top-to-bottom (descending Y in PDF coordinate space), then left-to-right (ascending X)
@@ -117,6 +118,26 @@ export async function extractPagesFromPdfFile(
         cluster.items.sort((a, b) => a.x - b.x);
         let lineText = '';
         let prevEndX: number | null = null;
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+
+        const lineWords = cluster.items.map((token) => {
+          const x0 = Math.round(token.x);
+          const x1 = Math.round(token.x + token.width);
+          const y0 = Math.round(token.y);
+          const y1 = Math.round(token.y + token.height);
+          if (x0 < minX) minX = x0;
+          if (x1 > maxX) maxX = x1;
+          if (y0 < minY) minY = y0;
+          if (y1 > maxY) maxY = y1;
+          return {
+            text: token.str.trim(),
+            confidence: 98,
+            bbox: { x0, y0, x1, y1 },
+          };
+        });
 
         for (const token of cluster.items) {
           if (prevEndX !== null) {
@@ -136,6 +157,12 @@ export async function extractPagesFromPdfFile(
           selectableLines.push({
             text: cleanedLine,
             confidence: 98,
+            pageNumber: pageNum,
+            bbox:
+              minX < Infinity
+                ? { x0: minX, y0: minY, x1: maxX, y1: maxY }
+                : undefined,
+            words: lineWords,
           });
         }
       }

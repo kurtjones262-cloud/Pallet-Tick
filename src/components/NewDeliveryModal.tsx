@@ -282,7 +282,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
       totalPages: capturedPages.length,
       stage: 'preparing',
       percent: 5,
-      statusText: 'Analyzing delivery docket for individual parts...',
+      statusText: 'Running Tesseract.js primary docket extraction...',
     });
 
     try {
@@ -294,13 +294,24 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           setOcrProgress(update);
         },
         false,
-        pageTextHints
+        pageTextHints,
+        {
+          supplierHint: selectedSupplierRule,
+        }
       );
 
       setIsProcessing(false);
+      const detectedSupplier = output.extractedData.supplier;
+      const resolvedSupplier =
+        detectedSupplier &&
+        detectedSupplier !== 'Laser Cutting Supplier' &&
+        detectedSupplier !== 'Steel Processing Supplier'
+          ? detectedSupplier
+          : SUPPLIER_RULES[selectedSupplierRule].name;
+
       setReviewData({
         ...output.extractedData,
-        supplier: SUPPLIER_RULES[selectedSupplierRule].name,
+        supplier: resolvedSupplier,
       });
     } catch (err: any) {
       console.error('Docket extraction error:', err);
@@ -347,7 +358,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 </h3>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-[3px] bg-emerald-50 text-[#059669] font-mono text-[10px] font-semibold border border-emerald-200">
                   <Sparkles className="w-2.5 h-2.5" />
-                  <span>Gemini AI Active</span>
+                  <span>Tesseract OCR · Gemini Fallback</span>
                 </span>
               </div>
               <button
@@ -413,12 +424,13 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   </div>
 
                   <span className="text-[11px] font-mono uppercase tracking-widest text-[#059669] font-semibold mb-1">
-                    Gemini AI &amp; PDF Compiler · Compiling Parts List
+                    Tesseract.js Primary OCR · Gemini AI Fallback
                   </span>
 
                   <h4
                     className={`text-sm font-bold mb-1 ${
-                      (ocrProgress?.statusText || '').toLowerCase().includes('retrying')
+                      (ocrProgress?.statusText || '').toLowerCase().includes('retrying') ||
+                      (ocrProgress?.statusText || '').toLowerCase().includes('fallback')
                         ? 'text-amber-700 bg-amber-50 border border-amber-200 px-3 py-1 rounded-[4px]'
                         : 'text-[#18181B]'
                     }`}
@@ -427,7 +439,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   </h4>
 
                   <p className="text-xs text-zinc-500 max-w-xs leading-relaxed mb-5">
-                    Identifying every individual part number, item code, description, revision, material, thickness, dimensions, and quantity into a compiled checklist.
+                    Extracting positioned words, column coordinates, and supplier table lines (Laser Central &amp; GCI) with automatic Gemini fallback verification.
                   </p>
 
                   {/* Progress Bar */}

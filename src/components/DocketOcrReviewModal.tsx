@@ -10,7 +10,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Sparkles,
-  WifiOff,
   FileText,
   RefreshCw,
 } from 'lucide-react';
@@ -108,6 +107,17 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   const [isRetryingOcr, setIsRetryingOcr] = useState(false);
   const [retryOcrStatus, setRetryOcrStatus] = useState<string | null>(null);
   const [retryOcrError, setRetryOcrError] = useState<string | null>(null);
+  const [activeExtractionMeta, setActiveExtractionMeta] = useState({
+    extractionMethod: extractedData.extractionMethod,
+    extractionEngineLabel: extractedData.extractionEngineLabel,
+    aiModelUsed: extractedData.aiModelUsed,
+    fallbackUsed: extractedData.fallbackUsed,
+    geminiFallbackReason: extractedData.geminiFallbackReason,
+    processingTimeMs: extractedData.processingTimeMs,
+    pagesFromCache: extractedData.pagesFromCache,
+    missingRowNumbers: extractedData.missingRowNumbers || [],
+    validationFlags: extractedData.validationFlags || [],
+  });
 
   const getActorLabel = () => {
     const u = getStoredUser();
@@ -229,14 +239,19 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   };
 
   /**
-   * Re-runs Gemini OCR extraction on the attached docket pages while preserving
-   * any rows that were manually edited or added by the user (`manuallyEdited: true`).
+   * Re-runs docket extraction (Tesseract-first by default, or forced Gemini AI fallback)
+   * on the attached docket pages while preserving any rows that were manually edited
+   * or added by the user (`manuallyEdited: true`).
    */
-  const handleRerunOcrPreservingManualEdits = async () => {
+  const handleRerunOcrPreservingManualEdits = async (forceGemini = false) => {
     if (attachedPages.length === 0 || isRetryingOcr) return;
     setIsRetryingOcr(true);
     setRetryOcrError(null);
-    setRetryOcrStatus('Re-running Gemini OCR while preserving your manual edits...');
+    setRetryOcrStatus(
+      forceGemini
+        ? 'Running Gemini AI extraction while preserving your manual edits...'
+        : 'Re-running Tesseract.js OCR while preserving your manual edits...'
+    );
 
     try {
       const imagesToProcess = attachedPages.map((p) => p.dataUrl);
@@ -247,7 +262,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           setRetryOcrStatus(update.statusText);
         },
         false,
-        pageTextHints
+        pageTextHints,
+        {
+          supplierHint: supplierRule,
+          forceGemini,
+        }
       );
 
       const freshItems = output.extractedData.items || [];
@@ -292,10 +311,21 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       }
 
       setItems(merged);
+      setActiveExtractionMeta({
+        extractionMethod: output.extractedData.extractionMethod,
+        extractionEngineLabel: output.extractedData.extractionEngineLabel,
+        aiModelUsed: output.extractedData.aiModelUsed,
+        fallbackUsed: output.extractedData.fallbackUsed,
+        geminiFallbackReason: output.extractedData.geminiFallbackReason,
+        processingTimeMs: output.extractedData.processingTimeMs,
+        pagesFromCache: output.extractedData.pagesFromCache,
+        missingRowNumbers: output.extractedData.missingRowNumbers || [],
+        validationFlags: output.extractedData.validationFlags || [],
+      });
       setRetryOcrStatus(null);
     } catch (err: any) {
       setRetryOcrError(
-        err?.message || 'Gemini OCR retry failed. Your existing parts and manual edits are preserved.'
+        err?.message || 'Docket OCR retry failed. Your existing parts and manual edits are preserved.'
       );
       setRetryOcrStatus(null);
     } finally {
@@ -416,20 +446,33 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <h3 className="font-bold text-sm text-[#18181B]">
                 Compiled Docket Parts List ({items.length} Part Rows · {totalExpandedParts} Total Quantities)
               </h3>
-              {extractedData.extractionMethod === 'ai-vision' ? (
-                <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
-                  <Sparkles className="w-2.5 h-2.5" />
-                  <span>Compiled by Gemini AI</span>
+              {activeExtractionMeta.extractionMethod === 'ai-vision' ? (
+                <span className="font-mono text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
+                  <Sparkles className="w-2.5 h-2.5 text-amber-600" />
+                  <span>
+                    {activeExtractionMeta.extractionEngineLabel ||
+                      `Gemini AI Fallback (${activeExtractionMeta.aiModelUsed || 'gemini-3.8-flash'})`}
+                  </span>
                 </span>
-              ) : extractedData.extractionMethod === 'pdf-text' ? (
+              ) : activeExtractionMeta.extractionMethod === 'pdf-text' ? (
                 <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
                   <FileText className="w-2.5 h-2.5" />
-                  <span>Extracted from PDF</span>
+                  <span>
+                    {activeExtractionMeta.extractionEngineLabel || 'Tesseract.js OCR + PDF Layout'}
+                  </span>
                 </span>
               ) : (
-                <span className="font-mono text-[10px] font-semibold text-zinc-700 bg-zinc-100 border border-zinc-300 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
-                  <WifiOff className="w-2.5 h-2.5" />
-                  <span>On-Device OCR</span>
+                <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
+                  <Check className="w-2.5 h-2.5" />
+                  <span>{activeExtractionMeta.extractionEngineLabel || 'Tesseract.js OCR'}</span>
+                </span>
+              )}
+              {typeof activeExtractionMeta.processingTimeMs === 'number' && (
+                <span className="font-mono text-[10px] text-zinc-500 bg-zinc-100 border border-zinc-200 px-1.5 py-0.5 rounded-[3px]">
+                  {activeExtractionMeta.processingTimeMs}ms
+                  {activeExtractionMeta.pagesFromCache
+                    ? ` · ${activeExtractionMeta.pagesFromCache} cached`
+                    : ''}
                 </span>
               )}
               {manuallyEditedCount > 0 && (
@@ -448,13 +491,24 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <>
                 <button
                   type="button"
-                  onClick={handleRerunOcrPreservingManualEdits}
+                  onClick={() => handleRerunOcrPreservingManualEdits(false)}
                   disabled={isRetryingOcr}
                   className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-                  title="Re-run Gemini OCR extraction while preserving any rows you have manually edited or added"
+                  title="Re-run Tesseract.js OCR extraction while preserving any rows you have manually edited or added"
                 >
                   <RefreshCw className={`w-3 h-3 ${isRetryingOcr ? 'animate-spin text-[#059669]' : ''}`} />
                   <span className="hidden sm:inline">Re-run OCR (Keep Edits)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleRerunOcrPreservingManualEdits(true)}
+                  disabled={isRetryingOcr}
+                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-emerald-50 border border-emerald-200 text-[#059669] hover:bg-emerald-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                  title="Run Gemini AI fallback extraction while preserving any rows you have manually edited or added"
+                >
+                  <Sparkles className="w-3 h-3" />
+                  <span className="hidden md:inline">Use Gemini AI (Keep Edits)</span>
                 </button>
 
                 <button
@@ -480,6 +534,34 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Gemini Fallback Notice Banner */}
+        {activeExtractionMeta.geminiFallbackReason && (
+          <div className="px-4 py-2 bg-amber-50/90 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>
+                <strong>Gemini AI Fallback Used:</strong> {activeExtractionMeta.geminiFallbackReason}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Missing Row Sequence Warning Banner */}
+        {activeExtractionMeta.missingRowNumbers.length > 0 && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>
+                <strong>Sequence Check:</strong> Potential missing docket row number(s):{' '}
+                <span className="font-mono font-bold">
+                  {activeExtractionMeta.missingRowNumbers.map((n) => `#${n}`).join(', ')}
+                </span>
+                . Please verify against the docket or click <strong>+ Add Part</strong>.
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* Status / Error Banners */}
         {retryOcrStatus && (

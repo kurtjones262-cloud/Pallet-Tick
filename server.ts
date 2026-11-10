@@ -77,7 +77,7 @@ app.use(async (req, res, next) => {
         body,
       });
 
-      const webRes = await handlePalletTrackApiRequest(webReq, localDb);
+      const webRes = await handlePalletTrackApiRequest(webReq, localDb, process.env as any);
       if (webRes) {
         res.status(webRes.status);
         webRes.headers.forEach((val, key) => {

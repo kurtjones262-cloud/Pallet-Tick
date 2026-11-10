@@ -25,7 +25,7 @@ export const FirstTimeAdminSetupModal: React.FC<FirstTimeAdminSetupModalProps> =
 }) => {
   const [employeeName, setEmployeeName] = useState('Operations Super Admin');
   const [employeeCode, setEmployeeCode] = useState('SUPER-01');
-  const [setupSecret, setSetupSecret] = useState('PALLETTRACK-SETUP-2026');
+  const [setupSecret, setSetupSecret] = useState('');
   const [pin, setPin] = useState('');
   const [confirmPin, setConfirmPin] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -129,17 +129,18 @@ export const FirstTimeAdminSetupModal: React.FC<FirstTimeAdminSetupModalProps> =
             </label>
             <div className="relative">
               <input
-                type="text"
+                type="password"
+                autoComplete="off"
                 required
                 value={setupSecret}
                 onChange={(e) => setSetupSecret(e.target.value)}
-                placeholder="PALLETTRACK-SETUP-2026"
+                placeholder="Enter server INITIAL_SETUP_SECRET"
                 className="w-full px-3 py-2 bg-[#070A0F] border border-amber-500/40 rounded-xl text-amber-200 font-mono text-xs focus:outline-none focus:border-amber-400"
               />
               <KeyRound className="absolute right-3 top-2.5 w-4 h-4 text-amber-400/70" />
             </div>
             <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
-              Default provisioning key: PALLETTRACK-SETUP-2026 (or custom INITIAL_SETUP_SECRET)
+              Must match the strong INITIAL_SETUP_SECRET configured in your Worker / server secrets
             </span>
           </div>
 

@@ -100,10 +100,13 @@ export async function handlePalletTrackApiRequest(
     request.headers.get('x-forwarded-for') ||
     undefined;
 
+  // Never fall back to a hardcoded default setup secret; fail closed if unconfigured
   const expectedSetupSecret =
-    (typeof env?.INITIAL_SETUP_SECRET === 'string' && env.INITIAL_SETUP_SECRET.trim()) ||
-    (typeof process !== 'undefined' && process.env?.INITIAL_SETUP_SECRET?.trim()) ||
-    'PALLETTRACK-SETUP-2026';
+    (env && typeof env === 'object' && 'INITIAL_SETUP_SECRET' in env
+      ? String(env.INITIAL_SETUP_SECRET ?? '').trim()
+      : typeof process !== 'undefined' && process.env?.INITIAL_SETUP_SECRET
+      ? String(process.env.INITIAL_SETUP_SECRET).trim()
+      : '');
 
   try {
     // Ensure D1 schema and migrations are ready before any API query
@@ -158,7 +161,8 @@ export async function handlePalletTrackApiRequest(
       if (!body.employeeName || !body.employeeCode || !body.pin) {
         return errorResponse(
           'Missing required fields: employeeName, employeeCode, and 4-digit pin are required.',
-          400
+          400,
+          'MISSING_FIELDS'
         );
       }
       try {
@@ -166,7 +170,7 @@ export async function handlePalletTrackApiRequest(
           employeeName: body.employeeName,
           employeeCode: body.employeeCode,
           pin: body.pin,
-          setupSecret: body.setupSecret ?? 'PALLETTRACK-SETUP-2026',
+          setupSecret: typeof body.setupSecret === 'string' ? body.setupSecret : '',
           expectedSetupSecret,
           userAgent,
           ipAddress,
@@ -183,7 +187,21 @@ export async function handlePalletTrackApiRequest(
           { 'Set-Cookie': buildSetCookieHeader(result.token) }
         );
       } catch (err: any) {
-        return errorResponse(err.message || 'Failed to provision initial Super Admin', 400);
+        const statusCode =
+          typeof err?.status === 'number'
+            ? err.status
+            : err?.code === 'SETUP_SECRET_NOT_CONFIGURED' || err?.code === 'SETUP_SECRET_WEAK'
+            ? 503
+            : err?.code === 'SETUP_RATE_LIMITED'
+            ? 429
+            : err?.code === 'SETUP_ALREADY_COMPLETED' || err?.code === 'INVALID_SETUP_SECRET'
+            ? 403
+            : 400;
+        return errorResponse(
+          err?.message || 'Failed to provision initial Super Admin',
+          statusCode,
+          err?.code || 'SETUP_FAILED'
+        );
       }
     }
 
@@ -257,16 +275,17 @@ export async function handlePalletTrackApiRequest(
     // Helper: Session Authentication Guard for Protected Routes
     // -------------------------------------------------------------------------
     async function authenticateSession(): Promise<AuthenticatedUser | Response> {
+      const prov = await service.getProvisionStatus();
+      if (!prov.hasAdmin) {
+        return errorResponse(
+          'Initial Super Admin setup required before using PalletTrack.',
+          428,
+          'SETUP_REQUIRED'
+        );
+      }
+
       const token = extractToken(request);
       if (!token) {
-        const prov = await service.getProvisionStatus();
-        if (!prov.hasAdmin) {
-          return errorResponse(
-            'Initial Super Admin setup required before using PalletTrack.',
-            428,
-            'SETUP_REQUIRED'
-          );
-        }
         return errorResponse(
           'Authentication required. Please log in with your 4-digit PIN.',
           401,

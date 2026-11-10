@@ -101,3 +101,23 @@ export async function hashSessionToken(token: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', enc.encode(token.trim()));
   return bufToHex(hashBuffer);
 }
+
+/**
+ * Verifies the one-time initial setup secret using SHA-256 digest + constant-time comparison
+ * so neither secret length nor character prefixes can be inferred via timing side-channels.
+ */
+export async function verifySetupSecretConstantTime(
+  providedSecret: string,
+  expectedSecret: string
+): Promise<boolean> {
+  const a = (providedSecret || '').trim();
+  const b = (expectedSecret || '').trim();
+  if (!a || !b) return false;
+  const enc = new TextEncoder();
+  const [hashA, hashB] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(a)),
+    crypto.subtle.digest('SHA-256', enc.encode(b)),
+  ]);
+  return timingSafeEqual(bufToHex(hashA), bufToHex(hashB));
+}
+

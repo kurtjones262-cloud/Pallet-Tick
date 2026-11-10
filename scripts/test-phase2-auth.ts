@@ -27,12 +27,15 @@ async function runPhase2AuthTests() {
     }
   }
 
+  const TEST_SETUP_SECRET = 'test-only-strong-setup-secret-9941!';
+
   // Helper to make mock Request to API Router
   async function callApi(
     path: string,
     method: string,
     body?: any,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
+    envOverride?: Record<string, string | undefined>
   ): Promise<{ status: number; body: any; headers: Headers }> {
     const reqHeaders = new Headers({
       'Content-Type': 'application/json',
@@ -43,9 +46,11 @@ async function runPhase2AuthTests() {
       headers: reqHeaders,
       body: body ? JSON.stringify(body) : undefined,
     });
-    const res = await handlePalletTrackApiRequest(req, db, {
-      INITIAL_SETUP_SECRET: 'PALLETTRACK-SETUP-2026',
-    });
+    const envObj =
+      envOverride !== undefined
+        ? envOverride
+        : { INITIAL_SETUP_SECRET: TEST_SETUP_SECRET };
+    const res = await handlePalletTrackApiRequest(req, db, envObj);
     if (!res) {
       throw new Error(`Route not handled: ${method} ${path}`);
     }
@@ -57,7 +62,7 @@ async function runPhase2AuthTests() {
   await db.exec("DELETE FROM sessions;");
   await db.exec("DELETE FROM users;");
 
-  console.log('--- 1. Initial Super Admin Provisioning & One-Time Secret ---');
+  console.log('--- 1. Initial Super Admin Provisioning, Fail-Closed Secret & Rate Limiting ---');
   // Check provision status when empty
   const provRes = await callApi('/api/auth/provision-status', 'GET');
   assert(provRes.status === 200, 'GET /api/auth/provision-status returns 200');
@@ -66,41 +71,124 @@ async function runPhase2AuthTests() {
   const superAdminCode = 'SUPER-01';
   const superAdminPin = '1234';
 
-  // 1a. Attempt setup with WRONG secret -> must be rejected
-  const badSecretSetupRes = await callApi('/api/auth/setup-admin', 'POST', {
+  // 1a. Fail closed when INITIAL_SETUP_SECRET is missing/empty (503)
+  const missingSecretEnvRes = await callApi(
+    '/api/auth/setup-admin',
+    'POST',
+    {
+      employeeName: 'Primary Super Admin',
+      employeeCode: superAdminCode,
+      pin: superAdminPin,
+      setupSecret: TEST_SETUP_SECRET,
+    },
+    undefined,
+    { INITIAL_SETUP_SECRET: '' }
+  );
+  assert(
+    missingSecretEnvRes.status === 503 &&
+      missingSecretEnvRes.body.code === 'SETUP_SECRET_NOT_CONFIGURED',
+    'Fails closed (503 SETUP_SECRET_NOT_CONFIGURED) when INITIAL_SETUP_SECRET is not configured'
+  );
+
+  // 1b. Fail closed when INITIAL_SETUP_SECRET is weak (<12 chars) or legacy placeholder (503)
+  const weakSecretEnvRes = await callApi(
+    '/api/auth/setup-admin',
+    'POST',
+    {
+      employeeName: 'Primary Super Admin',
+      employeeCode: superAdminCode,
+      pin: superAdminPin,
+      setupSecret: 'short-key',
+    },
+    undefined,
+    { INITIAL_SETUP_SECRET: 'short-key' }
+  );
+  assert(
+    weakSecretEnvRes.status === 503 && weakSecretEnvRes.body.code === 'SETUP_SECRET_WEAK',
+    'Fails closed (503 SETUP_SECRET_WEAK) when INITIAL_SETUP_SECRET is shorter than 12 chars'
+  );
+
+  // 1c. Verify setup process cannot be bypassed through alternative API routes (even with forged Bearer token)
+  const bypassUsersRes = await callApi(
+    '/api/users',
+    'POST',
+    { employeeName: 'Bypass Admin', employeeCode: 'BYPASS-01', role: 'super_admin', pin: '1234' },
+    { Authorization: 'Bearer forged_token_value' }
+  );
+  assert(
+    bypassUsersRes.status === 428 && bypassUsersRes.body.code === 'SETUP_REQUIRED',
+    'Alternative route POST /api/users cannot bypass initial setup (428 SETUP_REQUIRED)'
+  );
+
+  // 1d. Attempt setup with WRONG secret -> must be rejected (403) and rate-limited after 5 attempts (429)
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const badSecretSetupRes = await callApi('/api/auth/setup-admin', 'POST', {
+      employeeName: 'Primary Super Admin',
+      employeeCode: superAdminCode,
+      pin: superAdminPin,
+      setupSecret: `WRONG-SECRET-ATTEMPT-${attempt}`,
+    });
+    if (attempt === 1) {
+      assert(
+        badSecretSetupRes.status === 403 &&
+          badSecretSetupRes.body.code === 'INVALID_SETUP_SECRET' &&
+          !JSON.stringify(badSecretSetupRes.body).includes(TEST_SETUP_SECRET),
+        'Initial setup with invalid setupSecret rejected (403) without leaking expected secret'
+      );
+    }
+  }
+
+  // 5th failed setup attempt must trigger 429 SETUP_RATE_LIMITED
+  const fifthBadSetupRes = await callApi('/api/auth/setup-admin', 'POST', {
     employeeName: 'Primary Super Admin',
     employeeCode: superAdminCode,
     pin: superAdminPin,
-    setupSecret: 'WRONG-SECRET-KEY',
+    setupSecret: 'WRONG-SECRET-ATTEMPT-5',
   });
   assert(
-    badSecretSetupRes.status === 400 &&
-      String(badSecretSetupRes.body.error || '').includes('Invalid one-time setup secret'),
-    'Initial setup with invalid setupSecret rejected (400)'
+    fifthBadSetupRes.status === 429 && fifthBadSetupRes.body.code === 'SETUP_RATE_LIMITED',
+    '5th failed setup secret attempt triggers rate-limit lockout (429 SETUP_RATE_LIMITED)'
   );
 
-  // 1b. Provision initial Super Admin with valid one-time setupSecret
+  // Even a valid setupSecret must be rejected while setup rate-limit lockout is active
+  const lockedSetupRes = await callApi('/api/auth/setup-admin', 'POST', {
+    employeeName: 'Primary Super Admin',
+    employeeCode: superAdminCode,
+    pin: superAdminPin,
+    setupSecret: TEST_SETUP_SECRET,
+  });
+  assert(
+    lockedSetupRes.status === 429 && lockedSetupRes.body.code === 'SETUP_RATE_LIMITED',
+    'Setup endpoint remains locked (429) during 15-minute cooldown even with valid secret'
+  );
+
+  // Clear setup guard row to proceed with valid Super Admin provisioning
+  await db.prepare("DELETE FROM users WHERE id = '__system_setup_guard__'").run();
+
+  // 1e. Provision initial Super Admin with valid strong setupSecret
   const setupRes = await callApi('/api/auth/setup-admin', 'POST', {
     employeeName: 'Primary Super Admin',
     employeeCode: superAdminCode,
     pin: superAdminPin,
-    setupSecret: 'PALLETTRACK-SETUP-2026',
+    setupSecret: TEST_SETUP_SECRET,
   });
   assert(setupRes.status === 201, 'POST /api/auth/setup-admin provisions initial Super Admin (201)');
   assert(setupRes.body.user?.role === 'super_admin', 'First provisioned account has role = super_admin');
   assert(Boolean(setupRes.body.token), 'Initial Super Admin setup returns session token');
   const superAdminId = setupRes.body.user.id;
 
-  // 1c. Attempting a second setup-admin MUST be permanently rejected
+  // 1f. Attempting a second setup-admin MUST be permanently rejected (403 SETUP_ALREADY_COMPLETED)
   const dupSetupRes = await callApi('/api/auth/setup-admin', 'POST', {
     employeeName: 'Second Super Admin Attempt',
     employeeCode: 'SUPER-02',
     pin: '9999',
-    setupSecret: 'PALLETTRACK-SETUP-2026',
+    setupSecret: TEST_SETUP_SECRET,
   });
   assert(
-    dupSetupRes.status === 400 && dupSetupRes.body.error.includes('permanently disabled'),
-    'Subsequent setup-admin permanently disabled once Super Admin exists (400)'
+    dupSetupRes.status === 403 &&
+      dupSetupRes.body.code === 'SETUP_ALREADY_COMPLETED' &&
+      dupSetupRes.body.error.includes('permanently disabled'),
+    'Subsequent setup-admin permanently disabled once Super Admin exists (403 SETUP_ALREADY_COMPLETED)'
   );
 
   console.log('\n--- 2. PIN Login Authentication ---');

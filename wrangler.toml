@@ -16,8 +16,9 @@ database_name = "pallettrack-db"
 database_id = "e18c4d0a-cb04-4b4b-8f5d-35b4430fbdbb"
 migrations_dir = "migrations"
 
-# Cloudflare Worker Environment Secrets:
-# Configure GEMINI_API_KEY in the Cloudflare dashboard under:
-# Workers & Pages -> Settings -> Variables and Secrets -> Add secret: GEMINI_API_KEY
-# Or via CLI: wrangler secret put GEMINI_API_KEY
-
+# Cloudflare Worker Environment Secrets (never commit plaintext secrets to wrangler.toml):
+# 1. Configure GEMINI_API_KEY:
+#    npx wrangler secret put GEMINI_API_KEY
+# 2. Configure INITIAL_SETUP_SECRET (required for one-time first Super Admin provisioning, min 12 chars):
+#    npx wrangler secret put INITIAL_SETUP_SECRET
+# (Or configure under Cloudflare Dashboard -> Workers & Pages -> pallet-tick -> Settings -> Variables and Secrets)

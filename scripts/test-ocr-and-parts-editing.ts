@@ -11,6 +11,7 @@ import {
 import { validateClientExtractedDocketResult } from '../src/utils/offlineOcr.ts';
 import { NodeSqliteD1Adapter } from '../src/server/db/nodeSqliteAdapter.ts';
 import { handlePalletTrackApiRequest } from '../src/server/api/palletTrackApiRouter.ts';
+import { PalletTrackDbService } from '../src/server/api/palletTrackDbService.ts';
 
 async function runTests() {
   console.log('==================================================================');
@@ -231,12 +232,19 @@ async function runTests() {
   console.log('  ✅ PASS: Migrations 0001 -> 0002 -> 0003 -> 0004 apply cleanly without destroying existing records');
   passed += 3;
 
+  // Verify concurrent ensureSchemaReady() calls on migDb resolve safely via per-DB Promise mutex
+  const concurrentServices = Array.from({ length: 8 }, () => new PalletTrackDbService(migDb));
+  await Promise.all(concurrentServices.map((s) => s.ensureSchemaReady()));
+  console.log('  ✅ PASS: Concurrent ensureSchemaReady() calls resolved safely via per-DB Promise mutex without conflict');
+  passed += 1;
+
   // ---------------------------------------------------------------------------
   // SECTION 3: Manual Parts Editing CRUD, Validation & Duplicate Prevention
   // ---------------------------------------------------------------------------
   console.log('\n--- 3. Manual Parts List Editing CRUD, Validation & Duplicate Prevention ---');
   const schemaSql = fs.readFileSync(path.resolve(process.cwd(), 'schema.sql'), 'utf-8');
   const db = new NodeSqliteD1Adapter(':memory:', schemaSql);
+  const TEST_SETUP_SECRET = 'test-only-strong-setup-secret-9941!';
 
   async function apiCall(pathStr: string, method: string, body?: any, token?: string) {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -246,7 +254,9 @@ async function runTests() {
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    const res = await handlePalletTrackApiRequest(req, db);
+    const res = await handlePalletTrackApiRequest(req, db, {
+      INITIAL_SETUP_SECRET: TEST_SETUP_SECRET,
+    });
     assert(res, `Expected response for ${method} ${pathStr}`);
     const data: any = await res.json();
     return { status: res.status, data };
@@ -257,7 +267,7 @@ async function runTests() {
     employeeName: 'Sarah Connor',
     employeeCode: 'SUPER01',
     pin: '4826',
-    setupSecret: 'PALLETTRACK-SETUP-2026',
+    setupSecret: TEST_SETUP_SECRET,
   });
   assert.equal(setupRes.status, 201);
   const superAdminToken = setupRes.data.token;
@@ -349,8 +359,42 @@ async function runTests() {
     String(badDuplicateAdd.data.error).includes('Duplicate part number'),
     'Should block adding accidental duplicate part number'
   );
-  console.log('  ✅ PASS: Validation blocks empty part numbers, zero/negative quantities, and accidental duplicate parts');
-  passed += 3;
+
+  // Verify legitimate multi-line docket entries with same partNumber but distinct Revision or Pallet allocation are allowed
+  const splitRevisionAdd = await apiCall(
+    `/api/deliveries/${deliveryId}/parts`,
+    'POST',
+    {
+      partNumber: 'LC-1001-OCR',
+      description: 'Side Gusset Plate (Rev B)',
+      revision: 'B',
+      palletNumber: 'Pallet 1',
+      quantity: 2,
+    },
+    supervisorToken
+  );
+  assert.equal(splitRevisionAdd.status, 201, 'Same partNumber with distinct Revision (Rev B vs Rev A) must be permitted');
+
+  const splitPalletAdd = await apiCall(
+    `/api/deliveries/${deliveryId}/parts`,
+    'POST',
+    {
+      partNumber: 'LC-1001-OCR',
+      description: 'Side Gusset Plate (Pallet 2 Split)',
+      revision: 'A',
+      palletNumber: 'Pallet 2',
+      quantity: 2,
+    },
+    supervisorToken
+  );
+  assert.equal(splitPalletAdd.status, 201, 'Same partNumber with distinct Pallet allocation (Pallet 2 vs Pallet 1) must be permitted');
+
+  // Clean up the 2 temporary split rows so subsequent part count assertions remain exact
+  await apiCall(`/api/deliveries/${deliveryId}/parts/${splitRevisionAdd.data.part.id}`, 'DELETE', undefined, supervisorToken);
+  await apiCall(`/api/deliveries/${deliveryId}/parts/${splitPalletAdd.data.part.id}`, 'DELETE', undefined, supervisorToken);
+
+  console.log('  ✅ PASS: Validation blocks accidental duplicates while permitting distinct Revision / Pallet split lines');
+  passed += 5;
 
   // Add a valid missing part (+ Add Part)
   const addPartRes = await apiCall(

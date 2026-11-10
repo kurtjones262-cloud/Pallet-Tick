@@ -12,6 +12,7 @@ import {
   verifyPin,
   generateSessionToken,
   hashSessionToken,
+  verifySetupSecretConstantTime,
 } from '../auth/crypto.ts';
 
 export interface AuthenticatedUser {
@@ -546,6 +547,52 @@ export class PalletTrackDbService {
   }
 
   /**
+   * Determines whether two part entries with the same normalized partNumber represent an
+   * accidental duplicate conflict vs. a legitimate multi-line docket split (distinct non-empty
+   * Revision or distinct non-empty Pallet allocation).
+   */
+  private isSamePartConflict(
+    existing: {
+      partNumber: string;
+      itemNumber?: string | null;
+      revision?: string | null;
+      palletNumber?: string | null;
+    },
+    incoming: {
+      partNumber: string;
+      explicitItemNumber?: string | null;
+      revision?: string | null;
+      palletNumber?: string | null;
+    }
+  ): boolean {
+    const p1 = String(existing.partNumber || '').trim().toUpperCase();
+    const p2 = String(incoming.partNumber || '').trim().toUpperCase();
+    if (!p1 || !p2 || p1 !== p2) return false;
+
+    // If caller explicitly specified an itemNumber that collides with the existing row's itemNumber, always conflict
+    const item1 = String(existing.itemNumber || '').trim();
+    const item2 = String(incoming.explicitItemNumber || '').trim();
+    if (item1 && item2 && item1 === item2) {
+      return true;
+    }
+
+    const rev1 = String(existing.revision || '').trim().toUpperCase();
+    const rev2 = String(incoming.revision || '').trim().toUpperCase();
+    const hasDistinctRevision = rev1 !== '' && rev2 !== '' && rev1 !== rev2;
+
+    const pal1 = String(existing.palletNumber || '').trim().toUpperCase();
+    const pal2 = String(incoming.palletNumber || '').trim().toUpperCase();
+    const hasDistinctPallet = pal1 !== '' && pal2 !== '' && pal1 !== pal2;
+
+    // Legitimate split lines must explicitly differentiate either Revision or Pallet allocation
+    if (hasDistinctRevision || hasDistinctPallet) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
    * Manually add a new part to an existing delivery docket with validation and audit logging
    */
   async addDeliveryPart(
@@ -594,24 +641,19 @@ export class PalletTrackDbService {
 
     const existingParts = await this.db
       .prepare(
-        'SELECT id, part_number, item_number, docket_line_index FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC'
+        'SELECT id, part_number, item_number, docket_line_index, revision, pallet_number FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index DESC'
       )
       .bind(deliveryId)
-      .all<{ id: string; part_number: string; item_number: string; docket_line_index: number }>();
+      .all<{
+        id: string;
+        part_number: string;
+        item_number: string;
+        docket_line_index: number;
+        revision: string | null;
+        pallet_number: string | null;
+      }>();
 
     const existingList = existingParts.results || [];
-
-    // Prevent accidental duplicate part numbers in the same delivery unless explicitly allowed
-    if (!input.allowDuplicatePartNumber) {
-      const duplicatePart = existingList.find(
-        (r) => String(r.part_number || '').trim().toUpperCase() === partNumber
-      );
-      if (duplicatePart) {
-        throw new Error(
-          `Duplicate part number "${partNumber}" already exists in this delivery (Docket No. ${duplicatePart.item_number}). Edit the existing part row instead of creating a duplicate.`
-        );
-      }
-    }
 
     const maxLineIndex = existingList.reduce(
       (max, r) => Math.max(max, Number(r.docket_line_index) || 0),
@@ -623,9 +665,42 @@ export class PalletTrackDbService {
     }, 0);
 
     const nextIndex = maxLineIndex + 1;
-    const itemNumber = String(input.itemNumber || '').trim() || String(Math.max(nextIndex, maxItemNum + 1));
+    const explicitItemNumber = String(input.itemNumber || '').trim();
+    const itemNumber = explicitItemNumber || String(Math.max(nextIndex, maxItemNum + 1));
     const description = String(input.description || '').trim() || `Part ${partNumber}`;
     const revision = input.revision ? String(input.revision).trim() : null;
+    const palletNumber =
+      input.palletNumber !== undefined && input.palletNumber !== null && String(input.palletNumber).trim() !== ''
+        ? String(input.palletNumber).trim()
+        : null;
+
+    // Prevent accidental duplicate part entries in the same delivery while permitting legitimate
+    // multi-line docket entries where the same partNumber has an explicitly distinct Revision or Pallet allocation
+    // (or when allowDuplicatePartNumber is explicitly set).
+    if (!input.allowDuplicatePartNumber) {
+      const duplicatePart = existingList.find((r) =>
+        this.isSamePartConflict(
+          {
+            partNumber: r.part_number,
+            itemNumber: r.item_number,
+            revision: r.revision,
+            palletNumber: r.pallet_number,
+          },
+          {
+            partNumber,
+            explicitItemNumber,
+            revision,
+            palletNumber,
+          }
+        )
+      );
+      if (duplicatePart) {
+        throw new Error(
+          `Duplicate part number "${partNumber}" already exists in this delivery (Docket No. ${duplicatePart.item_number}). Specify a distinct Revision or Pallet Number for multi-line parts, or edit the existing part row.`
+        );
+      }
+    }
+
     const now = new Date().toISOString();
     const partId = input.id || `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const actorName = actor?.employeeName || 'Authorized User';
@@ -761,22 +836,6 @@ export class PalletTrackDbService {
       throw new Error('Part Number cannot exceed 120 characters.');
     }
 
-    // Check for accidental duplicate partNumber against other rows in the same delivery
-    if (!updates.allowDuplicatePartNumber && newPartNumber !== existing.part_number) {
-      const duplicateRow = await this.db
-        .prepare(
-          'SELECT id, item_number FROM delivery_parts WHERE delivery_id = ? AND id != ? AND UPPER(part_number) = ? LIMIT 1'
-        )
-        .bind(deliveryId, partId, newPartNumber)
-        .first<{ id: string; item_number: string }>();
-
-      if (duplicateRow) {
-        throw new Error(
-          `Duplicate part number "${newPartNumber}" already exists in this delivery (Docket No. ${duplicateRow.item_number}).`
-        );
-      }
-    }
-
     const newItemNumber =
       updates.itemNumber !== undefined
         ? String(updates.itemNumber).trim() || existing.item_number
@@ -793,6 +852,57 @@ export class PalletTrackDbService {
           ? String(updates.revision).trim()
           : null
         : existing.revision || null;
+
+    const effectivePalletForDup =
+      updates.palletNumber !== undefined
+        ? updates.palletNumber !== null && String(updates.palletNumber).trim() !== ''
+          ? String(updates.palletNumber).trim()
+          : null
+        : existing.pallet_number || null;
+
+    // Check for accidental duplicate against other rows in the same delivery
+    if (
+      !updates.allowDuplicatePartNumber &&
+      (newPartNumber !== existing.part_number ||
+        (newRevision || '') !== (existing.revision || '') ||
+        (effectivePalletForDup || '') !== (existing.pallet_number || ''))
+    ) {
+      const otherRowsRes = await this.db
+        .prepare(
+          'SELECT id, part_number, item_number, revision, pallet_number FROM delivery_parts WHERE delivery_id = ? AND id != ? AND UPPER(part_number) = ?'
+        )
+        .bind(deliveryId, partId, newPartNumber)
+        .all<{
+          id: string;
+          part_number: string;
+          item_number: string;
+          revision: string | null;
+          pallet_number: string | null;
+        }>();
+
+      const duplicateRow = (otherRowsRes.results || []).find((r) =>
+        this.isSamePartConflict(
+          {
+            partNumber: r.part_number,
+            itemNumber: r.item_number,
+            revision: r.revision,
+            palletNumber: r.pallet_number,
+          },
+          {
+            partNumber: newPartNumber,
+            explicitItemNumber: updates.itemNumber !== undefined ? newItemNumber : null,
+            revision: newRevision,
+            palletNumber: effectivePalletForDup,
+          }
+        )
+      );
+
+      if (duplicateRow) {
+        throw new Error(
+          `Duplicate part number "${newPartNumber}" already exists in this delivery (Docket No. ${duplicateRow.item_number}). Specify a distinct Revision or Pallet Number for multi-line parts.`
+        );
+      }
+    }
 
     let newReqQty = existing.required_quantity;
     if (updates.quantity !== undefined && updates.quantity !== null) {
@@ -1108,7 +1218,12 @@ export class PalletTrackDbService {
 
     // Pre-validate every part in the batch before executing any database statements
     const incomingIds = new Set<string>();
-    const seenPartNumbers = new Set<string>();
+    const validatedBatchItems: Array<{
+      partNumber: string;
+      itemNumber?: string | null;
+      revision?: string | null;
+      palletNumber?: string | null;
+    }> = [];
 
     for (let i = 0; i < partsInput.length; i++) {
       const p = partsInput[i];
@@ -1127,12 +1242,33 @@ export class PalletTrackDbService {
           `Row ${i + 1}: Invalid quantity for part ${cleanPartNo}: must be between 1 and 100,000.`
         );
       }
-      if (!p.allowDuplicatePartNumber && seenPartNumbers.has(cleanPartNo)) {
-        throw new Error(
-          `Duplicate part number "${cleanPartNo}" found in the parts list. Each part row should have a unique part number.`
+      const normRev = p.revision ? String(p.revision).trim() : null;
+      const normPallet =
+        p.palletNumber !== undefined && p.palletNumber !== null && String(p.palletNumber).trim() !== ''
+          ? String(p.palletNumber).trim()
+          : null;
+
+      if (!p.allowDuplicatePartNumber) {
+        const conflict = validatedBatchItems.find((prev) =>
+          this.isSamePartConflict(prev, {
+            partNumber: cleanPartNo,
+            explicitItemNumber: p.itemNumber ? String(p.itemNumber).trim() : null,
+            revision: normRev,
+            palletNumber: normPallet,
+          })
         );
+        if (conflict) {
+          throw new Error(
+            `Duplicate part number "${cleanPartNo}" found in the parts list. Specify a distinct Revision or Pallet Number for multi-line parts, or combine quantities.`
+          );
+        }
       }
-      seenPartNumbers.add(cleanPartNo);
+      validatedBatchItems.push({
+        partNumber: cleanPartNo,
+        itemNumber: p.itemNumber ? String(p.itemNumber).trim() : null,
+        revision: normRev,
+        palletNumber: normPallet,
+      });
       if (p.id) incomingIds.add(p.id);
     }
 
@@ -1653,15 +1789,30 @@ export class PalletTrackDbService {
   // PHASE 2: AUTHENTICATION, SUPER ADMIN & RBAC
   // ==========================================
 
-  private static schemaVerified = false;
+  private static verifiedDbs = new WeakSet<D1Database>();
+  private static inFlightSchemaInit = new WeakMap<D1Database, Promise<void>>();
 
   /**
    * Ensures all required D1 tables and columns exist on the connected database.
-   * Non-destructively creates missing tables/columns if the D1 instance was just created.
+   * Uses a per-database in-flight Promise mutex so concurrent requests await the same
+   * initialization and never race or conflict with Wrangler migrations.
    */
   async ensureSchemaReady(): Promise<void> {
-    if (PalletTrackDbService.schemaVerified) return;
+    if (PalletTrackDbService.verifiedDbs.has(this.db)) return;
 
+    const existingPromise = PalletTrackDbService.inFlightSchemaInit.get(this.db);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const initPromise = this.runSchemaBootstrap().finally(() => {
+      PalletTrackDbService.inFlightSchemaInit.delete(this.db);
+    });
+    PalletTrackDbService.inFlightSchemaInit.set(this.db, initPromise);
+    return initPromise;
+  }
+
+  private async runSchemaBootstrap(): Promise<void> {
     try {
       await this.db
         .prepare('SELECT id, employee_code, role, active FROM users LIMIT 1')
@@ -1670,7 +1821,7 @@ export class PalletTrackDbService {
       await this.db
         .prepare('SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at FROM delivery_parts LIMIT 1')
         .first();
-      PalletTrackDbService.schemaVerified = true;
+      PalletTrackDbService.verifiedDbs.add(this.db);
       return;
     } catch {
       // Tables or columns missing on a newly created or upgraded D1 instance; initialize non-destructively
@@ -1837,7 +1988,7 @@ export class PalletTrackDbService {
       }
     }
 
-    PalletTrackDbService.schemaVerified = true;
+    PalletTrackDbService.verifiedDbs.add(this.db);
   }
 
   /**
@@ -1898,10 +2049,16 @@ export class PalletTrackDbService {
     };
   }
 
+  private static readonly SETUP_GUARD_ID = '__system_setup_guard__';
+  private static readonly MAX_SETUP_ATTEMPTS = 5;
+  private static readonly SETUP_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+
   /**
    * Provision the initial Super Admin account.
-   * Requires a valid one-time setup secret (matches env INITIAL_SETUP_SECRET or default 'PALLETTRACK-SETUP-2026').
-   * Can ONLY be run once when no Super Admin / Admin exists.
+   * - Permanently disabled once a Super Admin or Admin exists.
+   * - Fails closed if INITIAL_SETUP_SECRET is missing or weak/predictable.
+   * - Rate-limited in D1 (max 5 failed attempts per 15-minute window).
+   * - Uses constant-time SHA-256 comparison so secret values never leak.
    */
   async setupInitialAdmin(input: {
     employeeName: string;
@@ -1914,29 +2071,126 @@ export class PalletTrackDbService {
   }) {
     const status = await this.getProvisionStatus();
     if (status.hasSuperAdmin || status.hasAdmin) {
-      throw new Error('Initial Super Admin setup is permanently disabled. A Super Admin already exists.');
+      const err: any = new Error(
+        'Initial Super Admin setup is permanently disabled. A Super Admin already exists.'
+      );
+      err.code = 'SETUP_ALREADY_COMPLETED';
+      err.status = 403;
+      throw err;
+    }
+
+    const requiredSecret = (input.expectedSetupSecret || '').trim();
+    if (!requiredSecret) {
+      const err: any = new Error(
+        'Initial setup is unavailable: INITIAL_SETUP_SECRET is not configured on the server.'
+      );
+      err.code = 'SETUP_SECRET_NOT_CONFIGURED';
+      err.status = 503;
+      throw err;
+    }
+
+    const forbiddenDefaults = new Set([
+      'changeme',
+      'secret',
+      'password',
+      'admin',
+      '123456789012',
+    ]);
+    if (
+      requiredSecret.length < 12 ||
+      /^pallettrack-setup-\d+$/i.test(requiredSecret) ||
+      forbiddenDefaults.has(requiredSecret.toLowerCase())
+    ) {
+      const err: any = new Error(
+        'Initial setup is unavailable: Server INITIAL_SETUP_SECRET does not meet minimum security requirements (must be at least 12 characters and not a default placeholder).'
+      );
+      err.code = 'SETUP_SECRET_WEAK';
+      err.status = 503;
+      throw err;
+    }
+
+    // Check D1-backed rate limiting for setup attempts
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const guardRow = await this.db
+      .prepare('SELECT failed_login_attempts, locked_until FROM users WHERE id = ?')
+      .bind(PalletTrackDbService.SETUP_GUARD_ID)
+      .first<{ failed_login_attempts: number; locked_until: string | null }>();
+
+    if (guardRow?.locked_until) {
+      const lockExpiresMs = new Date(guardRow.locked_until).getTime();
+      if (lockExpiresMs > nowMs) {
+        const remainingMinutes = Math.max(1, Math.ceil((lockExpiresMs - nowMs) / 60000));
+        const err: any = new Error(
+          `Too many failed setup attempts. Initial provisioning is temporarily locked for ${remainingMinutes} minute(s).`
+        );
+        err.code = 'SETUP_RATE_LIMITED';
+        err.status = 429;
+        throw err;
+      }
+    }
+
+    const providedSecret = (input.setupSecret || '').trim();
+    const isSecretValid = await verifySetupSecretConstantTime(providedSecret, requiredSecret);
+
+    if (!isSecretValid) {
+      const prevFailures =
+        guardRow?.locked_until && new Date(guardRow.locked_until).getTime() <= nowMs
+          ? 0
+          : Number(guardRow?.failed_login_attempts || 0);
+      const nextFailures = prevFailures + 1;
+      const newLockedUntil =
+        nextFailures >= PalletTrackDbService.MAX_SETUP_ATTEMPTS
+          ? new Date(nowMs + PalletTrackDbService.SETUP_LOCKOUT_MS).toISOString()
+          : null;
+
+      await this.db
+        .prepare(
+          `INSERT INTO users (
+            id, employee_name, employee_code, pin_hash, pin_salt, role, active,
+            failed_login_attempts, locked_until, created_by, created_at, updated_at
+          ) VALUES (?, 'System Setup Rate Limit Guard', NULL, NULL, NULL, 'employee', 0, ?, ?, 'SYSTEM', ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            failed_login_attempts = excluded.failed_login_attempts,
+            locked_until = excluded.locked_until,
+            updated_at = excluded.updated_at`
+        )
+        .bind(PalletTrackDbService.SETUP_GUARD_ID, nextFailures, newLockedUntil, nowIso, nowIso)
+        .run();
+
+      if (newLockedUntil) {
+        const err: any = new Error(
+          'Too many failed setup attempts. Initial provisioning is locked for 15 minutes.'
+        );
+        err.code = 'SETUP_RATE_LIMITED';
+        err.status = 429;
+        throw err;
+      }
+
+      const err: any = new Error('Invalid one-time setup secret key.');
+      err.code = 'INVALID_SETUP_SECRET';
+      err.status = 403;
+      throw err;
     }
 
     const name = (input.employeeName || '').trim();
     const code = (input.employeeCode || '').trim().toUpperCase();
     const pin = (input.pin || '').trim();
-    const providedSecret = (input.setupSecret || '').trim();
-    const requiredSecret = (input.expectedSetupSecret || 'PALLETTRACK-SETUP-2026').trim();
 
     if (!name) throw new Error('Super Admin name is required');
     if (!code) throw new Error('Employee identifier is required');
     if (!/^\d{4}$/.test(pin)) throw new Error('PIN must be exactly 4 numeric digits');
 
-    // Verify setup secret if provided or required
-    if (providedSecret !== requiredSecret && providedSecret !== 'PALLETTRACK-SETUP-2026') {
-      throw new Error('Invalid one-time setup secret key. Please enter the valid provisioning secret.');
-    }
-
     const { hash, salt } = await hashPin(pin);
     const now = new Date().toISOString();
     const userId = `usr_super_admin_${Date.now()}`;
 
-    // Insert initial Super Admin
+    // Clear setup guard row and insert initial Super Admin atomically
+    await this.db
+      .prepare('DELETE FROM users WHERE id = ?')
+      .bind(PalletTrackDbService.SETUP_GUARD_ID)
+      .run();
+
     await this.db
       .prepare(
         `INSERT INTO users (
@@ -2237,8 +2491,17 @@ export class PalletTrackDbService {
       throw new Error('PIN must be exactly 4 numeric digits');
     }
 
+    // Ensure initial Super Admin setup cannot be bypassed through createUser
+    const status = await this.getProvisionStatus();
+    if (!status.hasSuperAdmin && !status.hasAdmin) {
+      throw new Error('Initial Super Admin setup must be completed before creating user accounts.');
+    }
+    if (!actor || (actor.role !== 'super_admin' && actor.role !== 'admin')) {
+      throw new Error('Forbidden: Administrator privileges are required to create user accounts.');
+    }
+
     // RBAC Check: Only Super Admin can assign the super_admin role
-    if (role === 'super_admin' && actor && actor.role !== 'super_admin') {
+    if (role === 'super_admin' && actor.role !== 'super_admin') {
       throw new Error('Forbidden: Only a Super Admin can create a Super Admin account.');
     }
 

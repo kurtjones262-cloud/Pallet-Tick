@@ -852,26 +852,794 @@ async function runTests() {
     );
 
     // -------------------------------------------------------------------------
-    // TEST 6: Runtime Diagnostics, Document Luminance Normalization & PDF Raster OCR
+    // TEST 6: Complete Regression & Browser Execution Path Suite (Groups A - E)
     // -------------------------------------------------------------------------
-    console.log('\n6. Testing Runtime Diagnostics, Luminance Normalization & PDF Raster OCR...');
+    console.log('\n6. Running Complete Regression Suite (Groups A, B, C, D, E & Browser Path)...');
 
-    const { normalizeDocumentLuminances } = await import('../src/utils/imagePreprocessing');
-    // Simulate a 1600x2200 document page with 1.2% black text strokes and 98.8% white background
-    const totalPixels = 100000;
-    const simLum = new Uint8Array(totalPixels);
-    const simHist = new Uint32Array(256);
-    const darkCount = Math.floor(totalPixels * 0.012);
-    for (let i = 0; i < totalPixels; i++) {
-      const v = i < darkCount ? 0 : 255;
-      simLum[i] = v;
-      simHist[v]++;
-    }
-    const normCheck = normalizeDocumentLuminances(simLum, simHist);
-    assert(
-      normCheck.pLow <= 90 && normCheck.pHigh >= 170 && normCheck.whitePixelRatioAfter > 0.95,
-      `Sparse text (<2% area) normalization preserves white background (pLow=${normCheck.pLow}, pHigh=${normCheck.pHigh}, whiteRatio=${normCheck.whitePixelRatioAfter})`
+    const {
+      computeHistogramPercentile,
+      normalizeDocumentLuminances,
+      preprocessRgbaImageBufferInPlace,
+      preprocessDocketImage,
+    } = await import('../src/utils/imagePreprocessing');
+    const {
+      detectTableColumnLayout,
+      mergeComplementaryParsedItems,
+      preserveManualEditsDuringReprocess,
+    } = await import('../src/utils/docketParser');
+    const { setDocketTesseractWorkerFactoryForTesting } = await import(
+      '../src/utils/tesseractDocketOcr'
     );
+
+    // =========================================================================
+    // GROUP A: Image Preprocessing Regression Tests
+    // =========================================================================
+    console.log('\n  [Group A] Image Preprocessing Histogram & Contrast Stretch...');
+
+    const buildSyntheticRgba = (
+      totalPx: number,
+      pixelLuminanceFn: (idx: number) => number
+    ): Uint8ClampedArray => {
+      const rgba = new Uint8ClampedArray(totalPx * 4);
+      for (let i = 0; i < totalPx; i++) {
+        const lum = Math.max(0, Math.min(255, Math.round(pixelLuminanceFn(i))));
+        const off = i * 4;
+        rgba[off] = lum;
+        rgba[off + 1] = lum;
+        rgba[off + 2] = lum;
+        rgba[off + 3] = 255;
+      }
+      return rgba;
+    };
+
+    // A1: Predominantly white document (< 1% dark pixels: 0.5% black text, 99.5% white paper)
+    {
+      const totalPx = 100000;
+      const darkPx = Math.floor(totalPx * 0.005);
+      const rgba = buildSyntheticRgba(totalPx, (i) => (i < darkPx ? 15 : 252));
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        diag.pLow < 252 && diag.pHigh >= 250 && diag.whitePixelRatioAfter >= 0.98 && !diag.safeguardTriggered,
+        `[A1] Predominantly white doc (<1% dark pixels): pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter}`
+      );
+      // Verify text pixels stayed dark (0) and paper pixels stayed white (255)
+      assert(
+        rgba[0] <= 20 && rgba[(totalPx - 1) * 4] >= 250,
+        `[A1] Text pixels remain dark (${rgba[0]}) and paper pixels remain white (${rgba[(totalPx - 1) * 4]})`
+      );
+    }
+
+    // A2: Sparse document (2% dark pixels)
+    {
+      const totalPx = 100000;
+      const darkPx = Math.floor(totalPx * 0.02);
+      const rgba = buildSyntheticRgba(totalPx, (i) => (i < darkPx ? 20 : 250));
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        diag.pLow <= 30 && diag.pHigh >= 245 && diag.whitePixelRatioAfter >= 0.96,
+        `[A2] 2% dark pixels doc: computeHistogramPercentile stops at first bin (pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter})`
+      );
+    }
+
+    // A3: Normal printed document (8% dark text on white background)
+    {
+      const totalPx = 100000;
+      const darkPx = Math.floor(totalPx * 0.08);
+      const rgba = buildSyntheticRgba(totalPx, (i) => (i < darkPx ? 25 : 245));
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        diag.pLow <= 35 && diag.pHigh >= 240 && diag.whitePixelRatioAfter >= 0.9,
+        `[A3] Normal printed document (8% text): pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter}`
+      );
+    }
+
+    // A4: Low-contrast text (faint gray ink 135 on off-white paper 195)
+    {
+      const totalPx = 100000;
+      const darkPx = Math.floor(totalPx * 0.05);
+      const rgba = buildSyntheticRgba(totalPx, (i) => (i < darkPx ? 135 : 195));
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        rgba[0] < 40 && rgba[(totalPx - 1) * 4] >= 245 && diag.whitePixelRatioAfter >= 0.9,
+        `[A4] Low-contrast text stretched cleanly: darkInk=${rgba[0]}, paper=${rgba[(totalPx - 1) * 4]}, whiteRatio=${diag.whitePixelRatioAfter}`
+      );
+    }
+
+    // A5: Photographed document with shadows (background gradient 165..235, dark text 30)
+    {
+      const totalPx = 100000;
+      const darkPx = Math.floor(totalPx * 0.04);
+      const rgba = buildSyntheticRgba(totalPx, (i) => {
+        if (i < darkPx) return 30;
+        return 165 + ((i % 70));
+      });
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        rgba[0] <= 25 && diag.whitePixelRatioAfter >= 0.7 && !diag.safeguardTriggered,
+        `[A5] Shadowed photo normalized without blackening background: text=${rgba[0]}, whiteRatio=${diag.whitePixelRatioAfter}`
+      );
+    }
+
+    // A6: Predominantly dark background document (light text 235 on dark background 20)
+    {
+      const totalPx = 100000;
+      const textPx = Math.floor(totalPx * 0.04);
+      const rgba = buildSyntheticRgba(totalPx, (i) => (i < textPx ? 235 : 20));
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        diag.invertedDarkDocument === true &&
+          diag.whitePixelRatioAfter >= 0.9 &&
+          rgba[0] <= 30 &&
+          rgba[(totalPx - 1) * 4] >= 245,
+        `[A6] Dark background document auto-inverted to dark text (${rgba[0]}) on white background (${rgba[(totalPx - 1) * 4]}), whiteRatio=${diag.whitePixelRatioAfter}`
+      );
+    }
+
+    // A7: Uniform image division-by-zero safeguard
+    {
+      const totalPx = 10000;
+      const rgba = buildSyntheticRgba(totalPx, () => 240);
+      const diag = preprocessRgbaImageBufferInPlace(rgba);
+      assert(
+        diag.pHigh > diag.pLow && rgba[0] === 255,
+        `[A7] Division-by-zero prevented on uniform image (pLow=${diag.pLow}, pHigh=${diag.pHigh})`
+      );
+    }
+
+    // =========================================================================
+    // GROUP B: PDF Extraction & Complementary Merging Regression Tests
+    // =========================================================================
+    console.log('\n  [Group B] PDF Extraction (Selectable, Scanned, Partially Selectable, Multi-Page, Quotes/Inches)...');
+
+    // B1 & B3: Partially selectable PDF where native PDF text has rows 1-2 and scanned image (Tesseract) has rows 1-3
+    {
+      clearDocketOcrPageCache();
+      const partialPdfSelectableLines = buildPositionedTableLines([
+        {
+          pageNumber: 1,
+          y0: 40,
+          cells: [{ text: 'LASER CENTRAL PTY LTD', x0: 40, x1: 260 }],
+        },
+        {
+          pageNumber: 1,
+          y0: 68,
+          cells: [{ text: 'DELIVERY DOCKET: LC-30991', x0: 40, x1: 260 }],
+        },
+        {
+          pageNumber: 1,
+          y0: 140,
+          cells: [
+            { text: 'No', x0: 40, x1: 68 },
+            { text: 'Part Number', x0: 85, x1: 210 },
+            { text: 'Description', x0: 275, x1: 450 },
+            { text: 'Qty', x0: 615, x1: 660 },
+          ],
+        },
+        {
+          pageNumber: 1,
+          y0: 170,
+          cells: [
+            { text: '1', x0: 42, x1: 58 },
+            { text: 'LC-8801-A', x0: 85, x1: 195 },
+            { text: 'MAIN BOOM BRACKET', x0: 275, x1: 445 },
+            { text: '4', x0: 620, x1: 645 },
+          ],
+        },
+        {
+          pageNumber: 1,
+          y0: 198,
+          cells: [
+            { text: '2', x0: 42, x1: 58 },
+            { text: 'LC-8802-B', x0: 85, x1: 195 },
+            { text: 'PIVOT MOUNT PLATE', x0: 275, x1: 445 },
+            { text: '12', x0: 620, x1: 645 },
+          ],
+        },
+      ]);
+
+      // Pass the real rasterized BMP (which contains LC-8801-A, LC-8802-B, AND LC-8803-C) + partialPdfSelectableLines (only LC-8801-A & LC-8802-B)
+      const partialPdfResult = await extractDocketWithTesseractFirst([scannedLaserCentralImage], {
+        supplierHint: 'laser_central',
+        pageTextHints: [
+          {
+            hasSelectableText: true,
+            rawText: partialPdfSelectableLines.map((l) => l.text).join('\n'),
+            selectableLines: partialPdfSelectableLines,
+          },
+        ],
+      });
+
+      assert(
+        partialPdfResult.diagnostics.recognizeCalled === true,
+        '[B1/B3] Tesseract.recognize() is ALWAYS called on real rendered PDF page image even when selectable PDF text exists'
+      );
+      assert(
+        partialPdfResult.extractedData.items.length === 3 &&
+          partialPdfResult.extractedData.items.some((i) => i.partNumber.includes('8803')) &&
+          partialPdfResult.validationReport.shouldFallbackToGemini === false,
+        `[B3] Partially selectable PDF merges native PDF text (2 rows) + Tesseract OCR (row 3: LC-8803-C) into ${partialPdfResult.extractedData.items.length} unique rows with 0 duplicates`
+      );
+    }
+
+    // B5: PDF / OCR lines containing unusual characters, smart quotes, and inch measurements (1/2", 3/8")
+    {
+      const quotesAndInchesLines = buildPositionedTableLines([
+        {
+          pageNumber: 1,
+          y0: 40,
+          cells: [{ text: 'GCI GROUP AUSTRALIA', x0: 40, x1: 260 }],
+        },
+        {
+          pageNumber: 1,
+          y0: 68,
+          cells: [{ text: 'DELIVERY DOCKET: GCI-55410', x0: 40, x1: 280 }],
+        },
+        {
+          pageNumber: 1,
+          y0: 120,
+          cells: [
+            { text: 'Item', x0: 40, x1: 75 },
+            { text: 'Part No', x0: 95, x1: 230 },
+            { text: 'Rev', x0: 245, x1: 280 },
+            { text: 'Description', x0: 295, x1: 580 },
+            { text: 'Thick', x0: 600, x1: 660 },
+            { text: 'Qty', x0: 685, x1: 735 },
+          ],
+        },
+        {
+          pageNumber: 1,
+          y0: 150,
+          cells: [
+            { text: '1', x0: 42, x1: 60 },
+            { text: '“GCI-701-A”', x0: 95, x1: 220 },
+            { text: 'A', x0: 250, x1: 270 },
+            { text: 'HEAVY GUSSET "TYPE A" 12" x 24"', x0: 295, x1: 575 },
+            { text: '1/2"', x0: 600, x1: 650 },
+            { text: '8', x0: 690, x1: 720 },
+          ],
+        },
+        {
+          pageNumber: 1,
+          y0: 180,
+          cells: [
+            { text: '2', x0: 42, x1: 60 },
+            { text: '"GCI-702-B"', x0: 95, x1: 220 },
+            { text: 'B', x0: 250, x1: 270 },
+            { text: 'CLEAT PLATE 3/8" DRILLED', x0: 295, x1: 575 },
+            { text: '3/8"', x0: 600, x1: 650 },
+            { text: '14', x0: 690, x1: 720 },
+          ],
+        },
+      ]);
+
+      const parsedQuotes = parseIndustrialDocketText(quotesAndInchesLines, 1, 'gci');
+      assert(
+        parsedQuotes.items.length === 2 &&
+          parsedQuotes.items[0].partNumber === 'GCI-701-A' &&
+          parsedQuotes.items[0].thickness === '1/2"' &&
+          parsedQuotes.items[1].partNumber === 'GCI-702-B' &&
+          parsedQuotes.items[1].thickness === '3/8"',
+        `[B5] Quotes stripped from part numbers (${parsedQuotes.items[0]?.partNumber}, ${parsedQuotes.items[1]?.partNumber}) while preserving inch measurements (${parsedQuotes.items[0]?.thickness}, ${parsedQuotes.items[1]?.thickness})`
+      );
+    }
+
+    // =========================================================================
+    // GROUP C: Tesseract Worker Error Handling Regression Tests
+    // =========================================================================
+    console.log('\n  [Group C] Tesseract Worker Init, Language Load, Recognition & Malformed Block JSON...');
+
+    try {
+      // C1: Worker initialization failure propagates properly
+      setDocketTesseractWorkerFactoryForTesting(async () => {
+        throw new Error('Simulated WASM worker.min.js initialization failure');
+      });
+      let initErrCaught: Error | null = null;
+      try {
+        await extractDocketWithTesseractFirst([scannedLaserCentralImage]);
+      } catch (e: any) {
+        initErrCaught = e;
+      }
+      assert(
+        initErrCaught !== null &&
+          initErrCaught.message.includes('Simulated WASM worker.min.js initialization failure'),
+        `[C1] Worker initialization failure propagates properly (${initErrCaught?.message})`
+      );
+
+      // C2: Language loading failure propagates properly and marks trainedDataLoaded = false
+      setDocketTesseractWorkerFactoryForTesting(async () => {
+        throw new Error('Failed to load language eng.traineddata.gz (HTTP 404)');
+      });
+      let langErrCaught: Error | null = null;
+      try {
+        await extractDocketWithTesseractFirst([scannedLaserCentralImage]);
+      } catch (e: any) {
+        langErrCaught = e;
+      }
+      const { getTesseractWorkerDiagnosticState } = await import('../src/utils/tesseractDocketOcr');
+      const diagAfterLangErr = getTesseractWorkerDiagnosticState();
+      assert(
+        langErrCaught !== null &&
+          langErrCaught.message.includes('eng.traineddata.gz') &&
+          diagAfterLangErr.workerInitialised === false &&
+          diagAfterLangErr.trainedDataLoaded === false,
+        `[C2] Language loading failure propagates and sets trainedDataLoaded=false (${langErrCaught?.message})`
+      );
+
+      // C3: Unrecoverable recognition failure propagates and triggers Gemini fallback with C_TESSERACT_FAILED_TO_RECOGNISE_TEXT
+      setDocketTesseractWorkerFactoryForTesting(async () => ({
+        setParameters: async () => {},
+        recognize: async () => {
+          throw new Error('Simulated Leptonica pixRead corrupted buffer error');
+        },
+        terminate: async () => {},
+      }));
+      geminiApiCalls = 0;
+      const recFailSmart = await performSmartDocketExtraction([scannedLaserCentralImage]);
+      assert(
+        geminiApiCalls === 1 &&
+          recFailSmart.extractedData.tesseractDiagnostics?.outcomeCode ===
+            'C_TESSERACT_FAILED_TO_RECOGNISE_TEXT' &&
+          recFailSmart.extractedData.tesseractDiagnostics?.exactTriggerCondition?.includes(
+            'Simulated Leptonica pixRead corrupted buffer error'
+          ) === true,
+        `[C3] Unrecoverable recognition failure propagates to smart extractor, triggers Gemini, and records C_TESSERACT_FAILED_TO_RECOGNISE_TEXT`
+      );
+
+      // C4: Empty recognition result records C_TESSERACT_FAILED_TO_RECOGNISE_TEXT
+      setDocketTesseractWorkerFactoryForTesting(async () => ({
+        setParameters: async () => {},
+        recognize: async () => ({
+          data: { text: '', tsv: '', blocks: [], confidence: 0 },
+        }),
+        terminate: async () => {},
+      }));
+      const emptyRecResult = await extractDocketWithTesseractFirst([scannedLaserCentralImage]);
+      assert(
+        emptyRecResult.diagnostics.outcomeCode === 'C_TESSERACT_FAILED_TO_RECOGNISE_TEXT' &&
+          emptyRecResult.validationReport.shouldFallbackToGemini === true,
+        `[C4] Empty OCR recognition result classified as C_TESSERACT_FAILED_TO_RECOGNISE_TEXT`
+      );
+
+      // C5: Malformed block JSON (`{ blocks: true }` throws SyntaxError on quotes) retries with `{ text: true, tsv: true }` and succeeds!
+      let recognizeCallCount = 0;
+      setDocketTesseractWorkerFactoryForTesting(async () => ({
+        setParameters: async () => {},
+        recognize: async (_img: any, _opts: any, outputFormats: any) => {
+          recognizeCallCount++;
+          if (outputFormats?.blocks) {
+            throw new SyntaxError('Unexpected token " in JSON at position 412 (api.GetJSONText)');
+          }
+          // Return TSV output with word bounding boxes including 1/2" inch quote
+          const tsvLines = [
+            'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext',
+            '5\t1\t1\t1\t1\t1\t40\t40\t120\t20\t96\tLASER',
+            '5\t1\t1\t1\t1\t2\t170\t40\t140\t20\t96\tCENTRAL',
+            '5\t1\t1\t1\t2\t1\t40\t70\t110\t20\t95\tDOCKET:',
+            '5\t1\t1\t1\t2\t2\t160\t70\t120\t20\t95\tLC-99100',
+            '5\t1\t1\t1\t3\t1\t40\t120\t35\t18\t96\tNo',
+            '5\t1\t1\t1\t3\t2\t100\t120\t110\t18\t96\tPart',
+            '5\t1\t1\t1\t3\t3\t280\t120\t160\t18\t96\tDescription',
+            '5\t1\t1\t1\t3\t4\t620\t120\t50\t18\t96\tQty',
+            '5\t1\t1\t1\t4\t1\t42\t155\t25\t18\t95\t1',
+            '5\t1\t1\t1\t4\t2\t100\t155\t120\t18\t95\tLC-501-A',
+            '5\t1\t1\t1\t4\t3\t280\t155\t240\t18\t94\t1/2" BASE PLATE G250',
+            '5\t1\t1\t1\t4\t4\t625\t155\t35\t18\t96\t6',
+          ].join('\n');
+          return {
+            data: {
+              text: 'LASER CENTRAL\nDOCKET: LC-99100\nNo Part Description Qty\n1 LC-501-A 1/2" BASE PLATE G250 6',
+              tsv: tsvLines,
+              confidence: 95,
+            },
+          };
+        },
+        terminate: async () => {},
+      }));
+
+      const tsvRetryResult = await extractDocketWithTesseractFirst([scannedLaserCentralImage]);
+      assert(
+        recognizeCallCount === 2 &&
+          tsvRetryResult.diagnostics.outcomeCode === 'F_TESSERACT_SUCCEEDED' &&
+          tsvRetryResult.extractedData.items.length === 1 &&
+          tsvRetryResult.extractedData.items[0].partNumber === 'LC-501-A' &&
+          tsvRetryResult.extractedData.items[0].thickness === '1/2"' &&
+          tsvRetryResult.extractedData.items[0].quantity === 6 &&
+          tsvRetryResult.diagnostics.stages.some((s) => s.stage.includes('recognize_blocks_retry')),
+        `[C5] GetJSONText SyntaxError on quotes caught, logged in diagnostics, retried with {text:true, tsv:true}, and parsed 1/2" plate with word coordinates`
+      );
+    } finally {
+      setDocketTesseractWorkerFactoryForTesting(null);
+    }
+
+    // =========================================================================
+    // GROUP D: Table Parsing Across Resolutions (>300px), Multi-Line, Revisions & Pallets
+    // =========================================================================
+    console.log('\n  [Group D] Table Parsing Across Resolutions (600px, 1600px, 2400px), Multi-Line & Revisions...');
+
+    // D1 & D2: Test wide-resolution table (2400px wide, columns extending up to 2250px) and narrow-resolution table (600px wide)
+    for (const pageWidth of [600, 1600, 2400]) {
+      const scaleX = pageWidth / 1000;
+      const sx = (x: number) => Math.round(x * scaleX);
+      const scaledLines = buildPositionedTableLines([
+        {
+          pageNumber: 1,
+          y0: 40,
+          cells: [{ text: 'LASER CENTRAL PTY LTD', x0: sx(40), x1: sx(320) }],
+        },
+        {
+          pageNumber: 1,
+          y0: 70,
+          cells: [{ text: `DELIVERY DOCKET: LC-RES-${pageWidth}`, x0: sx(40), x1: sx(380) }],
+        },
+        {
+          pageNumber: 1,
+          y0: 120,
+          cells: [
+            { text: 'No', x0: sx(40), x1: sx(80) },
+            { text: 'Part Number', x0: sx(110), x1: sx(270) },
+            { text: 'Rev', x0: sx(300), x1: sx(350) },
+            { text: 'Description', x0: sx(380), x1: sx(620) },
+            { text: 'Material', x0: sx(650), x1: sx(740) },
+            { text: 'Thick', x0: sx(760), x1: sx(820) },
+            { text: 'Qty', x0: sx(850), x1: sx(900) },
+            { text: 'Pallet', x0: sx(920), x1: sx(980) },
+          ],
+        },
+        {
+          pageNumber: 1,
+          y0: 155,
+          cells: [
+            { text: '1', x0: sx(42), x1: sx(65) },
+            { text: 'LC-9001', x0: sx(110), x1: sx(240) },
+            { text: 'A', x0: sx(305), x1: sx(330) },
+            { text: 'MAIN CHASSIS BEAM LH', x0: sx(380), x1: sx(600) },
+            { text: 'G350', x0: sx(650), x1: sx(720) },
+            { text: '12mm', x0: sx(760), x1: sx(810) },
+            { text: '8', x0: sx(855), x1: sx(885) },
+            { text: 'Pallet 1', x0: sx(920), x1: sx(975) },
+          ],
+        },
+        // D3: Multi-line continuation description + dimensions on next line
+        {
+          pageNumber: 1,
+          y0: 178,
+          cells: [
+            { text: 'CHAMFERED BOTH ENDS 1200x350mm HA350', x0: sx(380), x1: sx(610) },
+          ],
+        },
+        // D4: Repeated part number with DIFFERENT revision (Rev B)
+        {
+          pageNumber: 1,
+          y0: 208,
+          cells: [
+            { text: '2', x0: sx(42), x1: sx(65) },
+            { text: 'LC-9001', x0: sx(110), x1: sx(240) },
+            { text: 'B', x0: sx(305), x1: sx(330) },
+            { text: 'MAIN CHASSIS BEAM LH REV B', x0: sx(380), x1: sx(600) },
+            { text: 'G350', x0: sx(650), x1: sx(720) },
+            { text: '12mm', x0: sx(760), x1: sx(810) },
+            { text: '4', x0: sx(855), x1: sx(885) },
+            { text: 'Pallet 1', x0: sx(920), x1: sx(975) },
+          ],
+        },
+        // D4: Repeated part number with DIFFERENT pallet number (Pallet 2)
+        {
+          pageNumber: 1,
+          y0: 238,
+          cells: [
+            { text: '3', x0: sx(42), x1: sx(65) },
+            { text: 'LC-9001', x0: sx(110), x1: sx(240) },
+            { text: 'B', x0: sx(305), x1: sx(330) },
+            { text: 'MAIN CHASSIS BEAM LH REV B', x0: sx(380), x1: sx(600) },
+            { text: 'G350', x0: sx(650), x1: sx(720) },
+            { text: '12mm', x0: sx(760), x1: sx(810) },
+            { text: '4', x0: sx(855), x1: sx(885) },
+            { text: 'Pallet 2', x0: sx(920), x1: sx(975) },
+          ],
+        },
+      ]);
+
+      const layout = detectTableColumnLayout(scaledLines);
+      assert(
+        Boolean(layout) && layout?.hasPositionalCoords === true,
+        `[D1] detectTableColumnLayout resolved real word coordinates at ${pageWidth}px page width`
+      );
+
+      const parsedRes = parseIndustrialDocketText(scaledLines, 1, 'laser_central');
+      const valRes = validateDocketExtractionQuality(
+        parsedRes.items,
+        parsedRes.unparsedCandidateCount
+      );
+      assert(
+        parsedRes.items.length === 3 &&
+          parsedRes.items[0].partNumber === 'LC-9001' &&
+          parsedRes.items[0].revision === 'A' &&
+          parsedRes.items[0].quantity === 8 &&
+          parsedRes.items[0].dimensions === '1200x350mm' &&
+          parsedRes.items[1].revision === 'B' &&
+          parsedRes.items[1].palletNumber === 'Pallet 1' &&
+          parsedRes.items[2].revision === 'B' &&
+          parsedRes.items[2].palletNumber === 'Pallet 2' &&
+          !valRes.flagsSummary.includes('duplicate_entry'),
+        `[D1-D4] Page width ${pageWidth}px (max X=${sx(980)}px): extracted all 3 rows, merged multi-line description/dimensions, and accepted repeated part LC-9001 across Rev A / Rev B / Pallet 2 without false duplicate warning`
+      );
+    }
+
+    // D5: Character-offset header fallback never mixes charPos*8 with pixel word coordinates
+    {
+      const headerWithoutWords: RawOcrLine = {
+        text: 'No   Part Number          Description                Qty',
+        confidence: 95,
+        pageNumber: 1,
+        // Notice: no `words` array on header line!
+      };
+      const rowWithPixelWords: RawOcrLine = {
+        text: '1    LC-7788              SIDE GUSSET 10MM G250      16',
+        confidence: 95,
+        pageNumber: 1,
+        words: [
+          { text: '1', confidence: 95, bbox: { x0: 60, y0: 150, x1: 85, y1: 170 } },
+          { text: 'LC-7788', confidence: 95, bbox: { x0: 420, y0: 150, x1: 610, y1: 170 } },
+          { text: 'SIDE GUSSET 10MM G250', confidence: 95, bbox: { x0: 750, y0: 150, x1: 1350, y1: 170 } },
+          { text: '16', confidence: 95, bbox: { x0: 1850, y0: 150, x1: 1920, y1: 170 } },
+        ],
+      };
+      const mixedLayout = detectTableColumnLayout([headerWithoutWords, rowWithPixelWords]);
+      assert(
+        Boolean(mixedLayout) && mixedLayout?.hasPositionalCoords === false,
+        '[D5] Character-offset header marks hasPositionalCoords = false so pixel words are never collapsed into the rightmost column'
+      );
+      const parsedMixed = parseIndustrialDocketText([headerWithoutWords, rowWithPixelWords], 1, 'laser_central');
+      assert(
+        parsedMixed.items.length === 1 &&
+          parsedMixed.items[0].partNumber === 'LC-7788' &&
+          parsedMixed.items[0].quantity === 16,
+        `[D5] Row with pixel words >300px under char-offset header extracts partNumber=${parsedMixed.items[0]?.partNumber}, qty=${parsedMixed.items[0]?.quantity} cleanly`
+      );
+    }
+
+    // =========================================================================
+    // GROUP E: Browser Canvas Execution Path, Manual Edit Preservation & Live HTTP Assets
+    // =========================================================================
+    console.log('\n  [Group E] Browser Canvas Execution Path, Manual Edit Preservation & Live HTTP Assets...');
+
+    // E1: Exercise the actual browser `preprocessDocketImage()` Canvas path + Tesseract OCR
+    {
+      // Install a lightweight pixel-accurate HTML5 Canvas 2D + Image DOM shim for preprocessDocketImage
+      const prevWindow = (globalThis as any).window;
+      const prevDocument = (globalThis as any).document;
+      const prevImage = (globalThis as any).Image;
+
+      class MockBrowserImage {
+          onload: (() => void) | null = null;
+          onerror: ((err: any) => void) | null = null;
+          crossOrigin = '';
+          naturalWidth = 0;
+          naturalHeight = 0;
+          width = 0;
+          height = 0;
+          _bmpBuf: Buffer | null = null;
+
+          set src(val: string) {
+            setTimeout(() => {
+              try {
+                if (val.startsWith('data:image/bmp;base64,')) {
+                  const buf = Buffer.from(val.slice('data:image/bmp;base64,'.length), 'base64');
+                  this._bmpBuf = buf;
+                  this.width = Math.abs(buf.readInt32LE(18));
+                  this.height = Math.abs(buf.readInt32LE(22));
+                  this.naturalWidth = this.width;
+                  this.naturalHeight = this.height;
+                }
+                this.onload?.();
+              } catch (e) {
+                this.onerror?.(e);
+              }
+            }, 1);
+          }
+        }
+
+        const createMockCanvas = () => {
+          let cWidth = 0;
+          let cHeight = 0;
+          let rgbaBuf: Uint8ClampedArray | null = null;
+
+          return {
+            get width() {
+              return cWidth;
+            },
+            set width(w: number) {
+              cWidth = w;
+              rgbaBuf = new Uint8ClampedArray(cWidth * Math.max(1, cHeight) * 4);
+            },
+            get height() {
+              return cHeight;
+            },
+            set height(h: number) {
+              cHeight = h;
+              rgbaBuf = new Uint8ClampedArray(Math.max(1, cWidth) * cHeight * 4);
+            },
+            getContext: (type: string) => {
+              if (type !== '2d') return null;
+              return {
+                fillStyle: '#FFFFFF',
+                fillRect: () => {},
+                drawImage: (img: any, _dx: number, _dy: number, dw: number, dh: number) => {
+                  cWidth = dw;
+                  cHeight = dh;
+                  rgbaBuf = new Uint8ClampedArray(dw * dh * 4);
+                  if (img?._bmpBuf) {
+                    const buf: Buffer = img._bmpBuf;
+                    const pixelOffset = buf.readUInt32LE(10);
+                    const srcW = Math.abs(buf.readInt32LE(18));
+                    const srcH = Math.abs(buf.readInt32LE(22));
+                    const rowStride = Math.ceil((srcW * 3) / 4) * 4;
+                    for (let y = 0; y < dh; y++) {
+                      const sy = Math.min(srcH - 1, Math.floor((y * srcH) / dh));
+                      for (let x = 0; x < dw; x++) {
+                        const sx = Math.min(srcW - 1, Math.floor((x * srcW) / dw));
+                        const off = pixelOffset + sy * rowStride + sx * 3;
+                        const dst = (y * dw + x) * 4;
+                        rgbaBuf[dst] = buf[off + 2];
+                        rgbaBuf[dst + 1] = buf[off + 1];
+                        rgbaBuf[dst + 2] = buf[off];
+                        rgbaBuf[dst + 3] = 255;
+                      }
+                    }
+                  }
+                },
+                getImageData: (_x: number, _y: number, w: number, h: number) => ({
+                  width: w,
+                  height: h,
+                  data: rgbaBuf || new Uint8ClampedArray(w * h * 4),
+                }),
+                putImageData: (imgData: { data: Uint8ClampedArray }) => {
+                  rgbaBuf = imgData.data;
+                },
+              };
+            },
+            toDataURL: (_mime?: string) => {
+              // Encode rgbaBuf back to 24-bit top-down BMP dataUrl so Leptonica/Tesseract decodes the exact canvas pixels
+              if (!rgbaBuf || cWidth <= 0 || cHeight <= 0) return scannedLaserCentralImage;
+              const rowStride = Math.ceil((cWidth * 3) / 4) * 4;
+              const pixelDataSize = rowStride * cHeight;
+              const fileSize = 54 + pixelDataSize;
+              const out = Buffer.alloc(fileSize, 0xff);
+              out.write('BM', 0);
+              out.writeUInt32LE(fileSize, 2);
+              out.writeUInt32LE(54, 10);
+              out.writeUInt32LE(40, 14);
+              out.writeInt32LE(cWidth, 18);
+              out.writeInt32LE(-cHeight, 22);
+              out.writeUInt16LE(1, 26);
+              out.writeUInt16LE(24, 28);
+              out.writeUInt32LE(pixelDataSize, 34);
+              for (let y = 0; y < cHeight; y++) {
+                for (let x = 0; x < cWidth; x++) {
+                  const src = (y * cWidth + x) * 4;
+                  const dst = 54 + y * rowStride + x * 3;
+                  out[dst] = rgbaBuf[src + 2];
+                  out[dst + 1] = rgbaBuf[src + 1];
+                  out[dst + 2] = rgbaBuf[src];
+                }
+              }
+              return `data:image/bmp;base64,${out.toString('base64')}`;
+            },
+          };
+        };
+
+      let browserPrepResult: Awaited<ReturnType<typeof preprocessDocketImage>> | null = null;
+      try {
+        (globalThis as any).Image = MockBrowserImage;
+        (globalThis as any).document = { createElement: (tag: string) => (tag === 'canvas' ? createMockCanvas() : {}) };
+        (globalThis as any).window = { document: (globalThis as any).document, location: { origin: 'http://localhost:3000' } };
+
+        browserPrepResult = await preprocessDocketImage(scannedGciImage);
+      } finally {
+        (globalThis as any).window = prevWindow;
+        (globalThis as any).document = prevDocument;
+        (globalThis as any).Image = prevImage;
+      }
+
+      assert(
+        Boolean(browserPrepResult?.ocrDataUrl) &&
+          browserPrepResult?.diagnostics !== undefined &&
+          browserPrepResult.diagnostics.pLow <= 30 &&
+          browserPrepResult.diagnostics.pHigh >= 245 &&
+          browserPrepResult.diagnostics.whitePixelRatioAfter >= 0.85 &&
+          !browserPrepResult.diagnostics.safeguardTriggered,
+        `[E1] Browser preprocessDocketImage() Canvas 2D path executed cleanly (pLow=${browserPrepResult?.diagnostics?.pLow}, pHigh=${browserPrepResult?.diagnostics?.pHigh}, whiteRatio=${browserPrepResult?.diagnostics?.whitePixelRatioAfter})`
+      );
+
+      // Pass the browser-preprocessed image directly into real Tesseract WASM OCR
+      clearDocketOcrPageCache();
+      const browserOcrOut = await extractDocketWithTesseractFirst(
+        [browserPrepResult!.ocrDataUrl],
+        { supplierHint: 'gci' }
+      );
+      assert(
+        browserOcrOut.diagnostics.outcomeCode === 'F_TESSERACT_SUCCEEDED' &&
+          browserOcrOut.extractedData.items.length === 2 &&
+          browserOcrOut.validationReport.shouldFallbackToGemini === false,
+        `[E1b] Browser-preprocessed GCI docket image recognized by real Tesseract WASM (${browserOcrOut.extractedData.items.length} rows, ${browserOcrOut.metrics.ocrTimeMs}ms, 0 Gemini calls)`
+      );
+    }
+
+    // E2: Manual edits preserved during reprocessing
+    {
+      const existingEditedItems: ExtractedDocketItem[] = [
+        {
+          itemNumber: '1',
+          partNumber: 'LC-8801-CUSTOM',
+          description: 'MANUALLY EDITED 6MM PLATE',
+          revision: 'C',
+          rev: 'C',
+          quantity: 10,
+          confidence: 'high',
+          manuallyEdited: true,
+          lastEditedBy: 'admin_1',
+          lastEditedAt: '2026-05-14T10:00:00.000Z',
+          originalOcrValues: {
+            partNumber: 'LC-8801-A',
+            itemNumber: '1',
+            description: 'MAIN BOOM BRACKET',
+            quantity: 4,
+          },
+        },
+        {
+          itemNumber: '99',
+          partNumber: 'MANUAL-ADDED-PART',
+          description: 'EXTRA PART ADDED BY OPERATOR',
+          quantity: 2,
+          confidence: 'high',
+          manuallyEdited: true,
+          lastEditedBy: 'admin_1',
+          lastEditedAt: '2026-05-14T10:02:00.000Z',
+        },
+      ];
+
+      const freshReprocessedItems = scannedLcOutput.extractedData.items;
+      const preserved = preserveManualEditsDuringReprocess(
+        existingEditedItems,
+        freshReprocessedItems
+      );
+
+      assert(
+        preserved.length === 4 &&
+          preserved[0].partNumber === 'LC-8801-CUSTOM' &&
+          preserved[0].quantity === 10 &&
+          preserved[0].manuallyEdited === true &&
+          preserved[0].originalOcrValues?.partNumber === 'LC-8801-A' &&
+          preserved[1].partNumber.includes('8802') &&
+          preserved[2].partNumber.includes('8803') &&
+          preserved[3].partNumber === 'MANUAL-ADDED-PART',
+        '[E2] Manual edits, originalOcrValues, audit metadata, and manually added rows are preserved during OCR reprocessing'
+      );
+    }
+
+    // E3: Live HTTP static asset verification against http://localhost:3000
+    {
+      const requiredAssets = [
+        '/tesseract/worker.min.js',
+        '/tesseract/core/tesseract-core-simd-lstm.wasm.js',
+        '/tesseract/core/tesseract-core-simd-lstm.wasm',
+        '/tesseract/core/tesseract-core-lstm.wasm.js',
+        '/tesseract/core/tesseract-core-lstm.wasm',
+        '/tesseract/core/tesseract-core.wasm.js',
+        '/tesseract/core/tesseract-core.wasm',
+        '/tesseract/lang-data/eng.traineddata.gz',
+        '/pdf.worker.min.mjs',
+      ];
+
+      for (const assetPath of requiredAssets) {
+        const res = await originalFetch(`http://localhost:3000${assetPath}`, { method: 'HEAD' });
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        assert(
+          res.status === 200 && !ct.includes('text/html'),
+          `[E3] Live HTTP asset ${assetPath} served with status ${res.status} and non-HTML MIME (${ct})`
+        );
+      }
+    }
 
     assert(
       scannedLcOutput.diagnostics.outcomeCode === 'F_TESSERACT_SUCCEEDED' &&
@@ -882,8 +1650,12 @@ async function runTests() {
         scannedLcOutput.diagnostics.recognizeCalled === true &&
         scannedLcOutput.diagnostics.ocrReturnedText === true &&
         scannedLcOutput.diagnostics.ocrReturnedWords === true &&
+        typeof scannedLcOutput.diagnostics.preprocessDurationMs === 'number' &&
+        typeof scannedLcOutput.diagnostics.workerInitDurationMs === 'number' &&
+        typeof scannedLcOutput.diagnostics.ocrDurationMs === 'number' &&
+        typeof scannedLcOutput.diagnostics.parseDurationMs === 'number' &&
         scannedLcOutput.diagnostics.stages.length >= 4,
-      `Diagnostic trace confirms worker init, asset loading, recognize() call, word data, and stage timestamps (${scannedLcOutput.diagnostics.outcomeLabel})`
+      `Diagnostic trace confirms worker init, asset loading, recognize() call, word data, stage durations, and timestamps (${scannedLcOutput.diagnostics.outcomeLabel})`
     );
 
     assert(
@@ -915,6 +1687,7 @@ async function runTests() {
   if (failed > 0) {
     process.exit(1);
   }
+  process.exit(0);
 }
 
 runTests().catch((err) => {

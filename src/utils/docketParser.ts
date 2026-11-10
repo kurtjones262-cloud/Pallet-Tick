@@ -441,6 +441,7 @@ export function validateDocketExtractionQuality(
     // 5. Check Duplicate Entries within the same docket (same partNumber + revision + palletNumber)
     const revKey = String(item.revision || item.rev || '').trim().toUpperCase();
     const palletKey = String(item.palletNumber || '').trim().toUpperCase();
+    const pageKey = String(item.pageNumber || 1);
     const compositeKey = `${pn.toUpperCase()}::REV=${revKey}::PAL=${palletKey}`;
     if (pn && seenCompositeKeys.has(compositeKey)) {
       rowFlags.push('duplicate_entry');
@@ -463,14 +464,22 @@ export function validateDocketExtractionQuality(
     if (itemNo && /^\d+$/.test(itemNo)) {
       const n = parseInt(itemNo, 10);
       if (n >= 1 && n <= 1500) {
-        if (seenItemNumbers.has(itemNo)) {
-          if (!rowFlags.includes('duplicate_entry')) {
+        const scopedItemNoKey = `${pageKey}::${itemNo}`;
+        if (seenItemNumbers.has(scopedItemNoKey)) {
+          const prevIdx = seenItemNumbers.get(scopedItemNoKey)!;
+          const prevItem = items[prevIdx];
+          const isDistinctRevOrPallet =
+            prevItem &&
+            prevItem.partNumber.toUpperCase() === pn.toUpperCase() &&
+            (String(prevItem.revision || prevItem.rev || '').toUpperCase() !== revKey ||
+              String(prevItem.palletNumber || '').toUpperCase() !== palletKey);
+          if (!isDistinctRevOrPallet && !rowFlags.includes('duplicate_entry')) {
             rowFlags.push('duplicate_entry');
             duplicateRowCount++;
             notesList.push(`Duplicate Docket No. ${itemNo}`);
           }
         } else {
-          seenItemNumbers.set(itemNo, i);
+          seenItemNumbers.set(scopedItemNoKey, i);
           numericItemNumbers.push(n);
         }
       }
@@ -1114,12 +1123,15 @@ function extractTableItemsWithLayout(
     if (item) {
       item.pageNumber = line.pageNumber ?? pageNumber;
       item.bbox = line.bbox;
-      // Check if the immediate next line is a detail continuation line (e.g. material/dimensions/description wrap)
-      if (i + 1 < candidateLines.length) {
-        const nextText = candidateLines[i + 1].text.trim();
-        if (isDetailContinuationLine(nextText, docketNumber)) {
+      // Consume 1 or more detail/description continuation lines immediately following this part row
+      while (i + 1 < candidateLines.length) {
+        const nextLine = candidateLines[i + 1];
+        const nextText = nextLine.text.trim();
+        if (isDetailContinuationLine(nextLine, docketNumber, orderNumber, columnLayout)) {
           mergeContinuationDetails(item, nextText);
           i++; // Consume continuation line
+        } else {
+          break;
         }
       }
       items.push(item);
@@ -1164,21 +1176,58 @@ function looksLikeUnparsedTableCandidateLine(text: string): boolean {
   return false;
 }
 
-function isDetailContinuationLine(text: string, docketNumber: string): boolean {
+function isDetailContinuationLine(
+  nextLine: RawOcrLine,
+  docketNumber: string,
+  orderNumber?: string,
+  columnLayout?: TableColumnLayout
+): boolean {
+  const text = (nextLine?.text || '').trim();
   if (!text || text.length < 4) return false;
-  if (isBarcodeOrMetadataLine(text, docketNumber)) return false;
+  if (isBarcodeOrMetadataLine(text, docketNumber, orderNumber)) return false;
 
-  if (/^\d{1,3}\s+[A-Z0-9][A-Z0-9\-_.]{2,18}\s+.*\b\d{1,4}\s*$/i.test(text)) {
+  // Reject if it's a pallet section divider
+  if (/^(?:pallet|bundle|pack|skid)\s*#?\s*\d{1,2}(?:\s*of\s*\d{1,2})?$/i.test(text)) {
     return false;
   }
 
+  // Reject if it starts with a row number or barcode item code (e.g., "1 LC-1001 ...", "894201-2 ...", "BAR-201 ...")
+  if (
+    /^(?:\d{1,3}[.)\s]+\S+|\d{4,8}-0*\d{1,4}\b|(?:BC|ITM|BAR|LCR|LINE)-\d{2,8}\b)/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+
+  // Reject if it contains a new structured part code AND ends with a numeric quantity
+  const hasNewPartCode = /\b([A-Z]{2,6}-[A-Z0-9\-_]{2,14})\b/.test(text);
+  if (hasNewPartCode) {
+    return false;
+  }
+
+  // If positional column layout and word bounding boxes are available, check if words sit inside the description/spec area
+  // (and NOT in the 'no' or 'quantity' columns)
+  if (columnLayout?.hasPositionalCoords && nextLine.words && nextLine.words.length > 0) {
+    const cells = extractColumnCellsFromLayout(nextLine, columnLayout);
+    if (cells && !cells.no && !cells.partNumber && !cells.quantity && (cells.description || cells.material || cells.dimensions)) {
+      return true;
+    }
+  }
+
   const hasDetailSpec =
-    /\b(?:\d{1,2}(?:\.\d)?\s*mm|250\s*gr|350\s*gr|g250|g350|ha350|hardox|stainless|304|316|mild\s*steel|\d{2,4}\s*[xX]\s*\d{2,4}|\d+(?:\.\d+)?\s*kg|pallet\s*\d+|rev\s*[a-z0-9])\b/i.test(
+    /\b(?:\d{1,2}(?:\.\d)?\s*mm|\d+\/\d+\s*["″]|250\s*gr|350\s*gr|g250|g350|ha350|hardox|stainless|304|316|mild\s*steel|\d{2,4}\s*[xX]\s*\d{2,4}|\d+(?:\.\d+)?\s*kg|pallet\s*\d+|rev\s*[a-z0-9])\b/i.test(
       text
     );
-  const hasNewPartCode = /\b([A-Z]{2,6}-[A-Z0-9\-_]{2,14})\b/.test(text);
+  if (hasDetailSpec) return true;
 
-  return hasDetailSpec && !hasNewPartCode;
+  // Pure multi-line description wrap: contains alphabetic words, does not start with a number, and does not end with a standalone quantity
+  const isPureDescriptionContinuation =
+    /^[A-Za-z(]/.test(text) &&
+    /[A-Za-z]{3,}/.test(text) &&
+    !/\s+\d{1,4}(?:\.00)?\s*$/.test(text);
+
+  return isPureDescriptionContinuation;
 }
 
 function mergeContinuationDetails(item: ExtractedDocketItem, continuationText: string): void {
@@ -1199,14 +1248,18 @@ function mergeContinuationDetails(item: ExtractedDocketItem, continuationText: s
     .replace(/\b(?:material|grade|thick|thickness|size|dim|dimensions|weight|wt|rev|revision|pallet)\s*[:.]?/gi, '')
     .trim();
   if (extraDesc && !item.description.toLowerCase().includes(extraDesc.toLowerCase())) {
-    item.description = `${item.description} · ${extraDesc}`.slice(0, 100);
+    item.description = `${item.description} · ${extraDesc}`.slice(0, 120);
+    if (item.originalOcrValues) {
+      item.originalOcrValues.description = item.description;
+    }
   }
 }
 
 /**
- * Extracts material, thickness, dimensions, weight, revision, and pallet allocation from a text string
+ * Extracts material, thickness, dimensions, weight, revision, and pallet allocation from a text string.
+ * Supports metric (mm) and imperial/inch (1/2", 3/8", 0.5") measurements.
  */
-export function extractPartSpecifications(text: string): {
+export function extractPartSpecifications(rawInput: string): {
   thickness?: string;
   material?: string;
   dimensions?: string;
@@ -1214,26 +1267,31 @@ export function extractPartSpecifications(text: string): {
   revision?: string;
   palletNumber?: string;
 } {
-  // Thickness: e.g. 10mm, 12.0mm, 6 mm, PL10, 10PL
-  const thicknessMatch =
+  const text = rawInput.replace(/[“”″]/g, '"').replace(/[‘’′]/g, "'");
+
+  // Thickness: e.g. 10mm, 12.0mm, 6 mm, PL10, 10PL, or inch fractions 1/2", 3/8", 1/4", 3/4"
+  const metricThicknessMatch =
     text.match(/\b(\d{1,2}(?:\.\d)?\s*mm)\b/i) ||
     text.match(/\bPL\s*(\d{1,2}(?:\.\d)?)\b/i);
-  const thickness = thicknessMatch
-    ? thicknessMatch[1].toLowerCase().endsWith('mm')
-      ? thicknessMatch[1].toLowerCase().replace(/\s+/g, '')
-      : `${thicknessMatch[1]}mm`
+  const inchThicknessMatch = text.match(/\b(\d\/\d{1,2}|\d{1,2}\s+\d\/\d{1,2}|0\.\d{2,3})\s*"/);
+  const thickness = metricThicknessMatch
+    ? metricThicknessMatch[1].toLowerCase().endsWith('mm')
+      ? metricThicknessMatch[1].toLowerCase().replace(/\s+/g, '')
+      : `${metricThicknessMatch[1]}mm`
+    : inchThicknessMatch
+    ? `${inchThicknessMatch[1].replace(/\s+/g, '-')}"`
     : undefined;
 
   // Material Grade: e.g. G250, G350, 350Gr, 250 Grade Steel, HA350, Hardox 450, 316 Stainless, 304SS, Mild Steel
   const materialMatch = text.match(
-    /\b(G\s*250|G\s*350|350\s*Gr(?:ade)?(?:\s*Steel)?|250\s*Gr(?:ade)?(?:\s*Steel)?|Gr(?:ade)?\s*350|Gr(?:ade)?\s*250|HA\s*350|HW\s*350|Hardox\s*\d{3}(?:\s*Wear\s*Plate)?|Bisalloy\s*\d{2,3}|316L?\s*(?:SS|Stainless(?:\s*Steel)?)|304L?\s*(?:SS|Stainless(?:\s*Steel)?)|Mild\s*Steel(?:\s*\d{3})?|Stainless\s*Steel|High\s*Tensile\s*\d{3}|Aluminium\s*\d{4}|Alum\s*\d{4}|Galv(?:anised)?|Corten|AS\s*3678(?:-\d{3})?)\b/i
+    /\b(G\s*250|G\s*350|350\s*Gr(?:ade)?(?:\s*Steel)?|250\s*Gr(?:ade)?(?:\s*Steel)?|Gr(?:ade)?\s*350|Gr(?:ade)?\s*250|HA\s*250|HA\s*350|HW\s*350|Hardox\s*\d{3}(?:\s*Wear\s*Plate)?|Bisalloy\s*\d{2,3}|316L?\s*(?:SS|Stainless(?:\s*Steel)?)|304L?\s*(?:SS|Stainless(?:\s*Steel)?)|Mild\s*Steel(?:\s*\d{3})?|Stainless\s*Steel|High\s*Tensile\s*\d{3}|Aluminium\s*\d{4}|Alum\s*\d{4}|Galv(?:anised)?|Corten|AS\s*3678(?:-\d{3})?|A36)\b/i
   );
   const material = materialMatch ? materialMatch[1].replace(/\s+/g, ' ').trim() : undefined;
 
-  // Dimensions: e.g. 400x400, 1200 x 350, 450x200x10, 250x150mm
-  const dimMatch = text.match(
-    /\b(\d{2,5}\s*[xX*]\s*\d{2,5}(?:\s*[xX*]\s*\d{1,3})?(?:\s*mm)?)\b/
-  );
+  // Dimensions: e.g. 400x400, 1200 x 350, 450x200x10, 250x150mm, or inch dimensions 12" x 24"
+  const dimMatch =
+    text.match(/\b(\d{2,5}\s*[xX*]\s*\d{2,5}(?:\s*[xX*]\s*\d{1,3})?(?:\s*mm)?)\b/) ||
+    text.match(/\b(\d{1,4}(?:\.\d+)?\s*"\s*[xX*]\s*\d{1,4}(?:\.\d+)?\s*")/);
   const dimensions = dimMatch ? dimMatch[1].replace(/\s+/g, '') : undefined;
 
   // Weight: e.g. 4.2kg, 18.5 kg, 120kg
@@ -1257,8 +1315,9 @@ export function extractPartSpecifications(text: string): {
 }
 
 /**
- * Assigns words from a line to detected table columns using horizontal bounding-box overlap / proximity
- * when a column layout is available.
+ * Assigns words from a line to detected table columns using midpoint territory boundaries
+ * in pixel/coordinate space when `layout.hasPositionalCoords` is true.
+ * Never mixes character offsets with pixel coordinates and handles arbitrary page resolutions (600px - 3000px).
  */
 function extractColumnCellsFromLayout(
   line: RawOcrLine,
@@ -1266,13 +1325,41 @@ function extractColumnCellsFromLayout(
 ): Partial<Record<TableColumnBand['key'], string>> | null {
   if (!layout || layout.columns.length < 3) return null;
 
-  // Case A: Word-level bounding boxes available
+  // Case A: Word-level bounding boxes available in the same coordinate space as header columns
   if (layout.hasPositionalCoords && line.words && line.words.length >= 2) {
+    const sortedCols = [...layout.columns].sort((a, b) => a.x0 - b.x0);
     const buckets: Partial<Record<TableColumnBand['key'], string[]>> = {};
-    const firstColX = layout.columns[0].x0;
-    const lastColX = layout.columns[layout.columns.length - 1].x1;
-    const tableSpan = Math.max(250, lastColX - firstColX);
-    const maxAllowedDist = Math.max(120, tableSpan * 0.28);
+
+    // Compute average horizontal gap between adjacent column centers to scale tolerance to page resolution
+    let totalCenterSpan = 0;
+    for (let i = 1; i < sortedCols.length; i++) {
+      totalCenterSpan += Math.max(20, sortedCols[i].xCenter - sortedCols[i - 1].xCenter);
+    }
+    const avgColSpacing =
+      sortedCols.length > 1 ? totalCenterSpan / (sortedCols.length - 1) : 140;
+
+    // Build contiguous horizontal territory [leftBound, rightBound] for each column using midpoints
+    const territories = sortedCols.map((col, idx) => {
+      const prev = idx > 0 ? sortedCols[idx - 1] : null;
+      const next = idx < sortedCols.length - 1 ? sortedCols[idx + 1] : null;
+
+      const leftBound = prev
+        ? (Math.max(prev.x0, prev.x1) + col.x0) / 2
+        : Math.max(0, col.x0 - Math.max(80, avgColSpacing * 0.85));
+
+      const rightBound = next
+        ? (col.x1 + Math.min(next.x0, next.x1)) / 2
+        : col.x1 + Math.max(120, avgColSpacing * 0.95);
+
+      return {
+        key: col.key,
+        leftBound,
+        rightBound,
+        x0: col.x0,
+        x1: col.x1,
+        xCenter: col.xCenter,
+      };
+    });
 
     for (const w of line.words) {
       const cleanW = w.text.replace(/^\||\|$/g, '').trim();
@@ -1281,22 +1368,38 @@ function extractColumnCellsFromLayout(
       if (/^\$\d+(?:,\d{3})*(?:\.\d{2})?$/.test(cleanW)) continue;
       const wCenter = (w.bbox.x0 + w.bbox.x1) / 2;
 
-      // Find the column whose horizontal band best contains or is closest to wCenter
-      let bestCol = layout.columns[0];
-      let bestDist = Infinity;
-      for (const col of layout.columns) {
-        const dist =
-          wCenter >= col.x0 && wCenter <= col.x1
-            ? 0
-            : Math.min(Math.abs(wCenter - col.x0), Math.abs(wCenter - col.x1), Math.abs(wCenter - col.xCenter));
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestCol = col;
+      // 1. Check if wCenter falls inside a column's horizontal territory [leftBound, rightBound]
+      let assignedKey: TableColumnBand['key'] | null = null;
+      for (const terr of territories) {
+        if (wCenter >= terr.leftBound && wCenter <= terr.rightBound) {
+          assignedKey = terr.key;
+          break;
         }
       }
-      if (bestDist <= maxAllowedDist) {
-        if (!buckets[bestCol.key]) buckets[bestCol.key] = [];
-        buckets[bestCol.key]!.push(cleanW);
+
+      // 2. Fallback to nearest column if within reasonable resolution-scaled distance
+      if (!assignedKey) {
+        let bestDist = Infinity;
+        let bestKey = territories[0].key;
+        for (const terr of territories) {
+          const dist = Math.min(
+            Math.abs(wCenter - terr.x0),
+            Math.abs(wCenter - terr.x1),
+            Math.abs(wCenter - terr.xCenter)
+          );
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestKey = terr.key;
+          }
+        }
+        if (bestDist <= Math.max(120, avgColSpacing * 0.9)) {
+          assignedKey = bestKey;
+        }
+      }
+
+      if (assignedKey) {
+        if (!buckets[assignedKey]) buckets[assignedKey] = [];
+        buckets[assignedKey]!.push(cleanW);
       }
     }
 
@@ -1380,6 +1483,7 @@ function parsePositionalAndSupplierLineItem(
 
     if (colCells.partNumber) {
       const candPart = colCells.partNumber
+        .replace(/^["'“”‘’″′]+|["'“”‘’″′]+$/g, '')
         .replace(/\.(?:dxf|dwg|nc1|step|stp)$/i, '')
         .trim()
         .toUpperCase();
@@ -1388,8 +1492,8 @@ function parsePositionalAndSupplierLineItem(
         const splitNoAndPart = candPart.match(/^(\d{1,3})\s+([A-Z0-9][A-Z0-9\-_./]{2,24})$/);
         if (splitNoAndPart && !itemNumber) {
           itemNumber = splitNoAndPart[1];
-          partNumber = splitNoAndPart[2];
-        } else {
+          partNumber = splitNoAndPart[2].replace(/^["'“”‘’″′]+|["'“”‘’″′]+$/g, '');
+        } else if (/^[A-Z0-9][A-Z0-9\-_./]{1,26}$/.test(candPart)) {
           partNumber = candPart;
         }
       }
@@ -1561,11 +1665,16 @@ function parsePositionalAndSupplierLineItem(
       : `${foundSteelKeyword.slice(0, 4)}-${String(100 + lineIndex)}`;
   }
 
+  partNumber = partNumber.replace(/^["'“”‘’″′]+|["'“”‘’″′]+$/g, '').trim();
+
   if (!partNumber) {
     return null;
   }
 
-  const remainingAfterPart = workingLine.replace(partNumber, '').trim();
+  const remainingAfterPart = workingLine
+    .replace(partNumber, '')
+    .replace(/^["'“”‘’″′\s]+/, '')
+    .trim();
   if (
     remainingAfterPart.length === 0 &&
     !description &&
@@ -1634,7 +1743,7 @@ function parsePositionalAndSupplierLineItem(
   // Build clean description if not already extracted from dedicated description column
   if (!description || description.length < 2) {
     description = workingLine
-      .replace(partNumber, '')
+      .replace(new RegExp(`["'“”‘’″′]?${partNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'“”‘’″′]?`, 'i'), '')
       .replace(/\.(?:dxf|dwg|nc1|step|stp)\b/gi, '')
       .replace(/\b(?:rev(?:ision)?\.?\s*[:\-]?\s*)[A-Z0-9]{1,3}\b/gi, '')
       .replace(/(?:qty|quantity|shipped|delivered|supplied)\s*[:.\s]*\d{1,4}\b/gi, '')
@@ -1689,4 +1798,196 @@ function parsePositionalAndSupplierLineItem(
       thickness,
     },
   };
+}
+
+/**
+ * Merges complementary parsed part rows from two extraction sources (e.g., native PDF selectable text
+ * and Tesseract.js page OCR) without creating duplicate line items.
+ * - Preserves page numbers, positional bounding boxes (`bbox`), and all valid rows from both sources.
+ * - Does not discard valid rows if one source only captured partial rows.
+ */
+export function mergeComplementaryParsedItems(
+  primaryItems: ExtractedDocketItem[],
+  secondaryItems: ExtractedDocketItem[]
+): ExtractedDocketItem[] {
+  if (!primaryItems || primaryItems.length === 0) {
+    return secondaryItems ? [...secondaryItems] : [];
+  }
+  if (!secondaryItems || secondaryItems.length === 0) {
+    return [...primaryItems];
+  }
+
+  const confRank: Record<'high' | 'medium' | 'low', number> = {
+    high: 3,
+    medium: 2,
+    low: 1,
+  };
+
+  const merged: ExtractedDocketItem[] = primaryItems.map((it) => ({ ...it }));
+
+  const findMatchingIndex = (candidate: ExtractedDocketItem): number => {
+    const candPart = String(candidate.partNumber || '').trim().toUpperCase();
+    const candItemNo = String(candidate.itemNumber || '').trim().toUpperCase();
+    const candRev = String(candidate.revision || candidate.rev || '').trim().toUpperCase();
+    const candPallet = String(candidate.palletNumber || '').trim().toUpperCase();
+    const candPage = candidate.pageNumber || 1;
+
+    for (let i = 0; i < merged.length; i++) {
+      const ex = merged[i];
+      const exPart = String(ex.partNumber || '').trim().toUpperCase();
+      const exItemNo = String(ex.itemNumber || '').trim().toUpperCase();
+      const exRev = String(ex.revision || ex.rev || '').trim().toUpperCase();
+      const exPallet = String(ex.palletNumber || '').trim().toUpperCase();
+      const exPage = ex.pageNumber || 1;
+
+      if (exPage !== candPage) continue;
+
+      // Exact match on partNumber + compatible revision + compatible palletNumber
+      if (candPart && exPart === candPart) {
+        const revCompatible = !candRev || !exRev || candRev === exRev;
+        const palletCompatible = !candPallet || !exPallet || candPallet === exPallet;
+        const itemNoCompatible = !candItemNo || !exItemNo || candItemNo === exItemNo;
+        if (revCompatible && palletCompatible && itemNoCompatible) {
+          return i;
+        }
+      }
+
+      // Or same explicit printed itemNumber on the same page with identical partNumber
+      if (candItemNo && exItemNo === candItemNo && candPart === exPart && candRev === exRev && candPallet === exPallet) {
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  for (const sec of secondaryItems) {
+    const matchIdx = findMatchingIndex(sec);
+    if (matchIdx >= 0) {
+      const ex = merged[matchIdx];
+      const secHigherConf = (confRank[sec.confidence] || 1) > (confRank[ex.confidence] || 1);
+      const bestDesc =
+        sec.description &&
+        (!ex.description ||
+          ex.description === 'Laser Cut Part' ||
+          (sec.description.length > ex.description.length && !sec.description.includes('Laser Cut Part')))
+          ? sec.description
+          : ex.description;
+
+      merged[matchIdx] = {
+        ...ex,
+        description: bestDesc,
+        revision: ex.revision || sec.revision,
+        rev: ex.rev || sec.rev || ex.revision || sec.revision,
+        material: ex.material || sec.material,
+        thickness: ex.thickness || sec.thickness,
+        dimensions: ex.dimensions || sec.dimensions,
+        weight: ex.weight || sec.weight,
+        palletNumber: ex.palletNumber || sec.palletNumber,
+        pageNumber: ex.pageNumber || sec.pageNumber,
+        bbox: ex.bbox || sec.bbox,
+        quantity: ex.quantity > 0 ? ex.quantity : sec.quantity,
+        confidence: secHigherConf ? sec.confidence : ex.confidence,
+        validationFlags: secHigherConf ? sec.validationFlags : ex.validationFlags,
+        notes: secHigherConf ? sec.notes : ex.notes,
+      };
+    } else {
+      merged.push({ ...sec });
+    }
+  }
+
+  // Sort merged rows by pageNumber and numeric itemNumber when numeric
+  merged.sort((a, b) => {
+    const pageDiff = (a.pageNumber || 1) - (b.pageNumber || 1);
+    if (pageDiff !== 0) return pageDiff;
+    const numA = parseInt(String(a.itemNumber || ''), 10);
+    const numB = parseInt(String(b.itemNumber || ''), 10);
+    if (!Number.isNaN(numA) && !Number.isNaN(numB) && numA !== numB) {
+      return numA - numB;
+    }
+    if (a.bbox && b.bbox && a.bbox.y0 !== b.bbox.y0) {
+      return a.bbox.y0 - b.bbox.y0;
+    }
+    return 0;
+  });
+
+  return merged;
+}
+
+/**
+ * Preserves manually edited or manually added rows (`manuallyEdited: true`) when a docket is reprocessed
+ * by Tesseract or Gemini, keeping `originalOcrValues`, `lastEditedBy`, and `lastEditedAt` intact.
+ */
+export function preserveManualEditsDuringReprocess(
+  existingItems: ExtractedDocketItem[],
+  freshItems: ExtractedDocketItem[]
+): ExtractedDocketItem[] {
+  const manualRows = (existingItems || []).filter((it) => it.manuallyEdited);
+  if (manualRows.length === 0) {
+    return (freshItems || []).map((fresh) => ({
+      ...fresh,
+      originalOcrValues: fresh.originalOcrValues || {
+        partNumber: fresh.partNumber,
+        itemNumber: fresh.itemNumber,
+        description: fresh.description,
+        revision: fresh.rev || fresh.revision,
+        quantity: Math.max(1, fresh.quantity || 1),
+        material: fresh.material,
+        thickness: fresh.thickness,
+      },
+    }));
+  }
+
+  const manualByItemNo = new Map<string, ExtractedDocketItem>();
+  const extraManualRows: ExtractedDocketItem[] = [];
+
+  for (const m of manualRows) {
+    const key = String(m.itemNumber || '').trim();
+    if (key && !manualByItemNo.has(key)) {
+      manualByItemNo.set(key, m);
+    } else {
+      extraManualRows.push(m);
+    }
+  }
+
+  const merged: ExtractedDocketItem[] = (freshItems || []).map((fresh) => {
+    const key = String(fresh.itemNumber || '').trim();
+    if (key && manualByItemNo.has(key)) {
+      const preserved = manualByItemNo.get(key)!;
+      manualByItemNo.delete(key);
+      return {
+        ...preserved,
+        manuallyEdited: true,
+        originalOcrValues: preserved.originalOcrValues || {
+          partNumber: fresh.partNumber,
+          itemNumber: fresh.itemNumber,
+          description: fresh.description,
+          revision: fresh.rev || fresh.revision,
+          quantity: Math.max(1, fresh.quantity || 1),
+          material: fresh.material,
+          thickness: fresh.thickness,
+        },
+      };
+    }
+    return {
+      ...fresh,
+      originalOcrValues: fresh.originalOcrValues || {
+        partNumber: fresh.partNumber,
+        itemNumber: fresh.itemNumber,
+        description: fresh.description,
+        revision: fresh.rev || fresh.revision,
+        quantity: Math.max(1, fresh.quantity || 1),
+        material: fresh.material,
+        thickness: fresh.thickness,
+      },
+    };
+  });
+
+  for (const remainingManual of manualByItemNo.values()) {
+    merged.push(remainingManual);
+  }
+  for (const extra of extraManualRows) {
+    merged.push(extra);
+  }
+
+  return merged;
 }

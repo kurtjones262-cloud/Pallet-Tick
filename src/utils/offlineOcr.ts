@@ -3,14 +3,25 @@ import {
   PageSlicePayload,
 } from '../server/docketOcr';
 import { SupplierRuleId } from '../types/delivery';
-import { RawOcrLine } from './docketParser';
+import {
+  RawOcrLine,
+  detectTableColumnLayout,
+  mergeComplementaryParsedItems,
+  preserveManualEditsDuringReprocess,
+} from './docketParser';
 import {
   extractDocketWithTesseractFirst,
+  getTesseractWorkerDiagnosticState,
   TesseractDocketExtractionResult,
 } from './tesseractDocketOcr';
 import { resolveApiUrl } from './apiConfig';
 
-export { resolveApiUrl };
+export {
+  resolveApiUrl,
+  detectTableColumnLayout,
+  mergeComplementaryParsedItems,
+  preserveManualEditsDuringReprocess,
+};
 
 export interface OcrProgressUpdate {
   currentPage: number;
@@ -610,18 +621,31 @@ export async function performSmartDocketExtraction(
 
   // Stage 2: Automatic Fallback to Gemini AI Vision
   const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+  const workerState = getTesseractWorkerDiagnosticState();
+  const isRecognitionException =
+    workerState.workerInitialised &&
+    Boolean(tesseractError?.message?.toLowerCase().includes('recognition failed'));
+
   const fallbackDiagnostics = tesseractResult?.diagnostics || {
-    outcomeCode: 'B_TESSERACT_FAILED_TO_INITIALISE' as const,
-    outcomeLabel: 'B. Tesseract failed to initialise.',
+    outcomeCode: isRecognitionException
+      ? ('C_TESSERACT_FAILED_TO_RECOGNISE_TEXT' as const)
+      : ('B_TESSERACT_FAILED_TO_INITIALISE' as const),
+    outcomeLabel: isRecognitionException
+      ? 'C. Tesseract initialised but failed to recognise text.'
+      : 'B. Tesseract failed to initialise.',
     startedAtIso: tesseractStartIso,
     completedAtIso: new Date().toISOString(),
     totalElapsedMs: Math.round(performance.now() - overallStartMs),
+    preprocessDurationMs: 0,
+    workerInitDurationMs: workerState.initDurationMs || 0,
+    ocrDurationMs: 0,
+    parseDurationMs: 0,
     pdfRenderingSucceeded: images.length > 0,
-    workerInitialised: false,
-    workerScriptLoaded: false,
-    wasmCoreLoaded: false,
-    trainedDataLoaded: false,
-    recognizeCalled: false,
+    workerInitialised: workerState.workerInitialised,
+    workerScriptLoaded: workerState.workerScriptLoaded,
+    wasmCoreLoaded: workerState.wasmCoreLoaded,
+    trainedDataLoaded: workerState.trainedDataLoaded,
+    recognizeCalled: isRecognitionException,
     ocrReturnedText: false,
     ocrReturnedWords: false,
     totalRawTextLength: 0,

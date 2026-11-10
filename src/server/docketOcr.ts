@@ -69,6 +69,10 @@ export interface TesseractPipelineDiagnostics {
   startedAtIso: string;
   completedAtIso: string;
   totalElapsedMs: number;
+  preprocessDurationMs?: number;
+  workerInitDurationMs?: number;
+  ocrDurationMs?: number;
+  parseDurationMs?: number;
   pdfRenderingSucceeded: boolean;
   workerInitialised: boolean;
   workerScriptLoaded: boolean;

@@ -554,8 +554,9 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <span>
                 <strong>Tesseract Diagnostics:</strong>{' '}
                 {extractedData.tesseractDiagnostics.outcomeLabel} (
-                {extractedData.tesseractDiagnostics.totalElapsedMs}ms ·{' '}
+                {extractedData.tesseractDiagnostics.totalElapsedMs}ms total ·{' '}
                 {extractedData.tesseractDiagnostics.totalWordsCount} words ·{' '}
+                {extractedData.tesseractDiagnostics.totalLinesCount} lines ·{' '}
                 {extractedData.tesseractDiagnostics.itemsParsedCount} items)
               </span>
               <span className="text-[10px] text-zinc-500">Click to inspect stage timestamps</span>
@@ -587,9 +588,29 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   </strong>
                 </div>
               </div>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 pt-1 border-t border-zinc-100 text-zinc-600">
+                <div>
+                  Preprocess: <strong>{extractedData.tesseractDiagnostics.preprocessDurationMs ?? 0}ms</strong>
+                </div>
+                <div>
+                  Worker Init: <strong>{extractedData.tesseractDiagnostics.workerInitDurationMs ?? 0}ms</strong>
+                </div>
+                <div>
+                  OCR Recognize: <strong>{extractedData.tesseractDiagnostics.ocrDurationMs ?? 0}ms</strong>
+                </div>
+                <div>
+                  Supplier Parse: <strong>{extractedData.tesseractDiagnostics.parseDurationMs ?? 0}ms</strong>
+                </div>
+                <div>
+                  Validation:{' '}
+                  <strong className={extractedData.tesseractDiagnostics.validationAccepted ? 'text-emerald-700' : 'text-amber-600'}>
+                    {extractedData.tesseractDiagnostics.validationAccepted ? 'ACCEPTED' : 'FALLBACK'}
+                  </strong>
+                </div>
+              </div>
               {extractedData.tesseractDiagnostics.exactTriggerCondition && (
                 <div className="text-amber-800 bg-amber-50 px-2 py-1 rounded">
-                  Trigger: {extractedData.tesseractDiagnostics.exactTriggerCondition}
+                  Fallback Reason: {extractedData.tesseractDiagnostics.exactTriggerCondition}
                 </div>
               )}
               <div className="max-h-28 overflow-y-auto divide-y divide-zinc-100 border border-zinc-200 rounded p-1.5">

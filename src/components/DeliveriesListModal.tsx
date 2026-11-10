@@ -5,8 +5,9 @@ import {
   X,
   Archive,
   Loader2,
+  Database,
 } from 'lucide-react';
-import { Delivery } from '../types/delivery';
+import { Delivery, UserRole } from '../types/delivery';
 import {
   getStoredDeliveries,
   setActiveDeliveryId,
@@ -18,15 +19,20 @@ interface DeliveriesListModalProps {
   activeDeliveryId: string | null;
   onSelectDelivery: (delivery: Delivery) => void;
   onOpenNewDelivery: () => void;
+  onOpenMigration?: () => void;
   onClose: () => void;
+  userRole?: UserRole;
 }
 
 export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
   activeDeliveryId,
   onSelectDelivery,
   onOpenNewDelivery,
+  onOpenMigration,
   onClose,
+  userRole,
 }) => {
+
   const [deliveries, setDeliveries] = useState<Delivery[]>(getStoredDeliveries());
   const [filter, setFilter] = useState<'all' | 'receiving' | 'completed'>('all');
   const [exportingId, setExportingId] = useState<string | null>(null);
@@ -93,7 +99,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                 title="Backup all deliveries as .zip archive"
               >
                 {exportingId === 'all' ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#059669]" />
+                   <Loader2 className="w-3.5 h-3.5 animate-spin text-[#059669]" />
                 ) : (
                   <Archive className="w-3.5 h-3.5 text-zinc-500" />
                 )}
@@ -101,16 +107,33 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
               </button>
             )}
 
-            <button
-              onClick={() => {
-                onClose();
-                onOpenNewDelivery();
-              }}
-              className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white text-xs font-semibold cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>New docket</span>
-            </button>
+            {onOpenMigration && (
+              <button
+                onClick={() => {
+                  onClose();
+                  onOpenMigration();
+                }}
+                className="h-7 px-2 inline-flex items-center gap-1 rounded-[4px] border border-cyan-700/60 bg-cyan-950/40 hover:bg-cyan-900/50 text-cyan-300 text-xs font-medium cursor-pointer transition-colors"
+                title="Migrate or sync local deliveries to central Cloudflare D1 database"
+              >
+                <Database className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="hidden xs:inline">D1 Sync</span>
+              </button>
+            )}
+
+
+            {userRole !== 'operator' && (
+              <button
+                onClick={() => {
+                  onClose();
+                  onOpenNewDelivery();
+                }}
+                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white text-xs font-semibold cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>New docket</span>
+              </button>
+            )}
 
             <button
               onClick={onClose}
@@ -166,10 +189,14 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
             </div>
           ) : (
             filtered.map((d) => {
-              const total = d.parts.length;
-              const received = d.parts.filter((p) => p.status === 'received').length;
+              const parts = d.parts || [];
+              const total = (d as any).stats?.totalParts ?? parts.length;
+              const received =
+                (d as any).stats?.receivedParts ??
+                parts.filter((p) => p.status === 'received').length;
               const percent = total > 0 ? Math.round((received / total) * 100) : 0;
               const isActive = d.id === activeDeliveryId;
+
 
               return (
                 <div
@@ -216,13 +243,15 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                           <Archive className="w-3.5 h-3.5" />
                         )}
                       </button>
-                      <button
-                        onClick={(e) => handleDelete(d.id, e)}
-                        className="p-1 text-zinc-400 hover:text-red-600 transition-colors cursor-pointer"
-                        title="Delete delivery"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      {userRole !== 'operator' && (
+                        <button
+                          onClick={(e) => handleDelete(d.id, e)}
+                          className="p-1 text-zinc-400 hover:text-red-600 transition-colors cursor-pointer"
+                          title="Delete delivery"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   </div>
 

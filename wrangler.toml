@@ -9,7 +9,15 @@ directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
+# Cloudflare D1 Relational Database Binding
+[[d1_databases]]
+binding = "DB"
+database_name = "pallettrack-db"
+database_id = "pallettrack-d1-placeholder-id"
+migrations_dir = "migrations"
+
 # Cloudflare Worker Environment Secrets:
 # Configure GEMINI_API_KEY in the Cloudflare dashboard under:
 # Workers & Pages -> Settings -> Variables and Secrets -> Add secret: GEMINI_API_KEY
 # Or via CLI: wrangler secret put GEMINI_API_KEY
+

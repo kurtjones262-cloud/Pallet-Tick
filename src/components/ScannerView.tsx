@@ -38,6 +38,8 @@ import {
   getStoredSettings,
   updateDelivery,
 } from '../utils/storage';
+import { isBackendOnline } from '../services/palletTrackApi';
+
 import {
   recognizePalletLabelOffline,
   evaluatePalletLabelMatch,
@@ -50,7 +52,9 @@ import {
   ActiveScanData,
   ConfirmedScanPayload,
 } from './ScanConfirmationModal';
-import { playAudio, triggerHaptic } from '../utils/audioFeedback';
+import { DuplicateScanModal, DuplicateScanModalData } from './DuplicateScanModal';
+import { detectDuplicateScan } from '../utils/duplicateDetection';
+import { playAudio, triggerHaptic, speakAlert } from '../utils/audioFeedback';
 import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
 
 export type ScanInputSource = 'camera_barcode_qr' | 'external_hid' | 'photo_snap' | 'manual';
@@ -111,13 +115,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   // UNIFIED SCAN CONFIRMATION STATE (locks/pauses camera detection while open)
   const [activeScanConfirmation, setActiveScanConfirmation] = useState<ActiveScanData | null>(null);
 
-  // Notify parent container so global menu bars are hidden while confirming a scan
+  // STRICT DUPLICATE SCAN WARNING STATE (prominent RED warning popup)
+  const [activeDuplicateWarning, setActiveDuplicateWarning] = useState<DuplicateScanModalData | null>(null);
+
+  // Notify parent container so global menu bars are hidden while confirming a scan or viewing duplicate warning
   useEffect(() => {
-    onScanConfirmationChange?.(activeScanConfirmation !== null);
+    onScanConfirmationChange?.(activeScanConfirmation !== null || activeDuplicateWarning !== null);
     return () => {
       onScanConfirmationChange?.(false);
     };
-  }, [activeScanConfirmation, onScanConfirmationChange]);
+  }, [activeScanConfirmation, activeDuplicateWarning, onScanConfirmationChange]);
 
   // Status and feedback states
   const [scanFeedback, setScanFeedback] = useState<ScanFeedback | null>(null);
@@ -224,6 +231,13 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const activeScanConfirmationRef = useRef<ActiveScanData | null>(null);
   activeScanConfirmationRef.current = activeScanConfirmation;
 
+  // Active duplicate warning ref to immediately block background scans while duplicate popup is open
+  const activeDuplicateWarningRef = useRef<DuplicateScanModalData | null>(null);
+  activeDuplicateWarningRef.current = activeDuplicateWarning;
+
+  // Atomic processing lock against rapid consecutive events
+  const isProcessingScanRef = useRef<boolean>(false);
+
   const isManualModalOpenRef = useRef<boolean>(false);
   isManualModalOpenRef.current = isManualModalOpen;
 
@@ -269,6 +283,31 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     flashTimeoutRef.current = setTimeout(() => {
       setFlashColor(null);
     }, 450);
+  }, []);
+
+  /**
+   * Triggers prominent RED duplicate scan warning popup & rejection feedback
+   */
+  const triggerDuplicateWarning = useCallback(
+    (dupData: DuplicateScanModalData) => {
+      playAudio.duplicate(appSettings.soundEnabled);
+      triggerHaptic('duplicate', appSettings.vibrationEnabled);
+      speakAlert(`Duplicate scan: ${dupData.partNumber}`, appSettings.speechEnabled);
+      triggerVisualFlash('red');
+
+      activeDuplicateWarningRef.current = dupData;
+      setActiveDuplicateWarning(dupData);
+    },
+    [appSettings, triggerVisualFlash]
+  );
+
+  /**
+   * Dismisses red duplicate warning popup and leaves camera ready for next scan
+   */
+  const handleDismissDuplicateWarning = useCallback(() => {
+    setActiveDuplicateWarning(null);
+    activeDuplicateWarningRef.current = null;
+    lastScannedTimeRef.current = Date.now();
   }, []);
 
   /**
@@ -502,8 +541,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       inputSource: ScanInputSource = 'camera_barcode_qr',
       detectedFormat?: string
     ) => {
-      // Block scanning if confirmation modal is already open
-      if (activeScanConfirmationRef.current !== null) {
+      // Block scanning if confirmation modal or duplicate warning is already open, or scan is being processed
+      if (
+        activeScanConfirmationRef.current !== null ||
+        activeDuplicateWarningRef.current !== null ||
+        isProcessingScanRef.current
+      ) {
         return;
       }
 
@@ -534,12 +577,45 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const currentDelivery = deliveryRef.current;
       if (!currentDelivery) return;
 
+      // Requirement 5: Online-only receiving
+      // Prevent scans from being recorded when disconnected from central database
+      if (!isBackendOnline()) {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
+        }
+        playAudio.duplicate(appSettings.soundEnabled);
+        triggerHaptic('duplicate', appSettings.vibrationEnabled);
+        return;
+      }
+
       const cleaned = codeText.trim();
       if (!cleaned) return;
 
       const now = Date.now();
+
       // Debounce identical scans within 1.2 seconds
       if (cleaned === lastScannedCodeRef.current && now - lastScannedTimeRef.current < 1200) {
+        return;
+      }
+
+      // STRICT DUPLICATE SCAN PREVENTION:
+      // When a QR code or barcode is scanned, immediately check whether that exact part
+      // has already been successfully scanned in the current delivery.
+      // Must happen before adding the part or quantity to the scanned parts list.
+      const duplicateCheck = detectDuplicateScan(currentDelivery, cleaned);
+      if (duplicateCheck.isDuplicate) {
+        lastScannedCodeRef.current = cleaned;
+        lastScannedTimeRef.current = now;
+
+        triggerDuplicateWarning({
+          partNumber: duplicateCheck.partNumber,
+          description: duplicateCheck.description,
+          code: cleaned,
+          itemNumber: duplicateCheck.itemNumber,
+          palletNumber: duplicateCheck.palletNumber,
+          scannedAt: duplicateCheck.scannedAt,
+          receivedQuantity: duplicateCheck.receivedQuantity,
+        });
         return;
       }
 
@@ -614,7 +690,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       activeScanConfirmationRef.current = newScanData;
       setActiveScanConfirmation(newScanData);
     },
-    [appendDiagnosticLog, appSettings]
+    [appendDiagnosticLog, appSettings, triggerDuplicateWarning]
   );
 
   /**
@@ -625,7 +701,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const currentDelivery = deliveryRef.current;
       if (!currentDelivery) return;
 
+      if (!isBackendOnline()) {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
+        }
+        return;
+      }
+
       const now = new Date().toISOString();
+
       let updatedDelivery: Delivery;
 
       const scanMethodToCodeType: ScanMethod =
@@ -811,6 +895,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         if (
           !isMountedRef.current ||
           activeScanConfirmationRef.current !== null ||
+          activeDuplicateWarningRef.current !== null ||
           isManualModalOpenRef.current
         ) {
           return;
@@ -862,6 +947,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         isLiveOcrBusyRef.current ||
         isProcessingOcrLabel ||
         activeScanConfirmationRef.current !== null ||
+        activeDuplicateWarningRef.current !== null ||
         isManualModalOpenRef.current
       ) {
         return;
@@ -892,11 +978,34 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           { x: 0.05, y: 0.16, width: 0.9, height: 0.68 }
         );
 
-        if (!isMountedRef.current || activeScanConfirmationRef.current !== null) {
+        if (
+          !isMountedRef.current ||
+          activeScanConfirmationRef.current !== null ||
+          activeDuplicateWarningRef.current !== null
+        ) {
           return;
         }
 
         if (result.partNumber) {
+          // STRICT DUPLICATE SCAN PREVENTION CHECK
+          const duplicateCheck = detectDuplicateScan(
+            deliveryRef.current,
+            result.partNumber,
+            result.partNumber
+          );
+          if (duplicateCheck.isDuplicate) {
+            triggerDuplicateWarning({
+              partNumber: duplicateCheck.partNumber,
+              description: duplicateCheck.description,
+              code: result.partNumber,
+              itemNumber: duplicateCheck.itemNumber,
+              palletNumber: duplicateCheck.palletNumber,
+              scannedAt: duplicateCheck.scannedAt,
+              receivedQuantity: duplicateCheck.receivedQuantity,
+            });
+            return;
+          }
+
           const evalResult = evaluatePalletLabelMatch(
             result.partNumber,
             result.quantity,
@@ -937,7 +1046,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         isLiveOcrBusyRef.current = false;
       }
     }, 1800);
-  }, [appendDiagnosticLog, appSettings, isProcessingOcrLabel]);
+  }, [appendDiagnosticLog, appSettings, isProcessingOcrLabel, triggerDuplicateWarning]);
 
   /**
    * Initializes the continuous video camera scanner
@@ -1209,7 +1318,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
    * Manual Snapshot / Shutter capture for instant OCR & Barcode processing
    */
   const handleShutterCapture = async () => {
-    if (isProcessingOcrLabel || isSnappingPhoto || activeScanConfirmation !== null) return;
+    if (
+      isProcessingOcrLabel ||
+      isSnappingPhoto ||
+      activeScanConfirmation !== null ||
+      activeDuplicateWarning !== null
+    ) {
+      return;
+    }
 
     const container = document.getElementById('camera-scanner-view');
     const video = container?.querySelector('video') as HTMLVideoElement | null;
@@ -1240,6 +1356,25 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       );
 
       if (ocrResult.partNumber) {
+        // STRICT DUPLICATE SCAN PREVENTION CHECK
+        const duplicateCheck = detectDuplicateScan(
+          deliveryRef.current,
+          ocrResult.partNumber,
+          ocrResult.partNumber
+        );
+        if (duplicateCheck.isDuplicate) {
+          triggerDuplicateWarning({
+            partNumber: duplicateCheck.partNumber,
+            description: duplicateCheck.description,
+            code: ocrResult.partNumber,
+            itemNumber: duplicateCheck.itemNumber,
+            palletNumber: duplicateCheck.palletNumber,
+            scannedAt: duplicateCheck.scannedAt,
+            receivedQuantity: duplicateCheck.receivedQuantity,
+          });
+          return;
+        }
+
         playAudio.success(appSettings.soundEnabled);
         triggerHaptic('success', appSettings.vibrationEnabled);
 
@@ -1291,7 +1426,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         tagName === 'SELECT' ||
         Boolean(target?.isContentEditable);
 
-      if (isEditable || activeScanConfirmationRef.current !== null || isManualModalOpenRef.current) {
+      if (
+        isEditable ||
+        activeScanConfirmationRef.current !== null ||
+        activeDuplicateWarningRef.current !== null ||
+        isManualModalOpenRef.current
+      ) {
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1384,6 +1524,22 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       );
 
       const partNo = ocrResult.partNumber || file.name.replace(/\.[^.]+$/, '');
+
+      // STRICT DUPLICATE SCAN PREVENTION CHECK
+      const duplicateCheck = detectDuplicateScan(deliveryRef.current, partNo, partNo);
+      if (duplicateCheck.isDuplicate) {
+        triggerDuplicateWarning({
+          partNumber: duplicateCheck.partNumber,
+          description: duplicateCheck.description,
+          code: partNo,
+          itemNumber: duplicateCheck.itemNumber,
+          palletNumber: duplicateCheck.palletNumber,
+          scannedAt: duplicateCheck.scannedAt,
+          receivedQuantity: duplicateCheck.receivedQuantity,
+        });
+        return;
+      }
+
       const newScanData: ActiveScanData = {
         scanMethod: 'ocr_label',
         rawCode: partNo,
@@ -1717,6 +1873,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           onSaveAndScanNext={handleSaveAndScanNext}
           onConfirmAndSave={handleConfirmAndSave}
           onDiscard={handleDiscard}
+        />
+      )}
+
+      {/* ============================================================ */}
+      {/* STRICT DUPLICATE SCAN WARNING MODAL (PROMINENT RED POPUP)    */}
+      {/* ============================================================ */}
+      {activeDuplicateWarning && (
+        <DuplicateScanModal
+          data={activeDuplicateWarning}
+          onDismiss={handleDismissDuplicateWarning}
         />
       )}
 

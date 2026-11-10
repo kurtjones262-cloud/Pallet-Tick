@@ -15,8 +15,8 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
-const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-2.5-flash'] as const;
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+const FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -214,11 +214,15 @@ Rules:
 
     let rawJsonText = '';
     let lastError: unknown = null;
+    let modelUsed: string = PRIMARY_MODEL;
 
     for (const model of [PRIMARY_MODEL, ...FALLBACK_MODELS]) {
       try {
         rawJsonText = await callGeminiRest(apiKey, model, systemInstruction, parts, responseSchema);
-        if (rawJsonText) break;
+        if (rawJsonText) {
+          modelUsed = model;
+          break;
+        }
       } catch (err) {
         lastError = err;
       }
@@ -261,7 +265,7 @@ Rules:
       confidenceScore: items.length > 0 ? 100 : 0,
       needsManualReview: items.length === 0,
       extractionMethod: 'ai-vision',
-      aiModelUsed: PRIMARY_MODEL,
+      aiModelUsed: modelUsed,
       pagesScanned: totalPages,
     };
 

@@ -5,8 +5,13 @@ import {
   ClipboardList,
   Settings,
   ChevronDown,
+  Users,
+  LogOut,
+  Shield,
+  UserCheck,
+  HardHat,
 } from 'lucide-react';
-import { Delivery } from '../types/delivery';
+import { Delivery, UserAccount, UserRole } from '../types/delivery';
 
 interface NavbarProps {
   activeTab: 'scanner' | 'checklist' | 'dashboard' | 'orders';
@@ -17,6 +22,9 @@ interface NavbarProps {
   onOpenDeliveriesList: () => void;
   onOpenTestSheet?: () => void;
   onOpenSettings: () => void;
+  currentUser?: UserAccount | null;
+  onOpenUserManagement?: () => void;
+  onLogout?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -25,17 +33,51 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
+  currentUser,
+  onOpenUserManagement,
+  onLogout,
 }) => {
-  const total = activeDelivery?.parts.length || 0;
-  const received = activeDelivery?.parts.filter((p) => p.status === 'received').length || 0;
+  const parts = activeDelivery?.parts || [];
+
+  const total = (activeDelivery as any)?.stats?.totalParts ?? parts.length;
+  const received =
+    (activeDelivery as any)?.stats?.receivedParts ??
+    parts.filter((p) => p.status === 'received').length;
+
+  const renderRoleBadge = (role?: UserRole) => {
+    switch (role) {
+      case 'admin':
+        return (
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-indigo-950/90 border border-indigo-500/40 text-indigo-300">
+            <Shield className="w-2.5 h-2.5 text-indigo-400" />
+            Admin
+          </span>
+        );
+      case 'supervisor':
+        return (
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-cyan-950/90 border border-cyan-500/40 text-cyan-300">
+            <UserCheck className="w-2.5 h-2.5 text-cyan-400" />
+            Supervisor
+          </span>
+        );
+      case 'operator':
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase bg-emerald-950/90 border border-emerald-500/40 text-emerald-300">
+            <HardHat className="w-2.5 h-2.5 text-emerald-400" />
+            Operator
+          </span>
+        );
+    }
+  };
 
   return (
     <>
       {/* =========================================================================
-       * TOP BAR: Premium Dark Industrial Native Header
+       * TOP BAR: Premium Dark Industrial Native Header with Employee Identity
        * ========================================================================= */}
       <header className="sticky top-0 z-30 bg-[#070A0F]/95 backdrop-blur-md border-b border-[#1E2D44] pt-safe">
-        <div className="max-w-6xl mx-auto px-3 sm:px-6 h-12 flex items-center justify-between gap-3">
+        <div className="max-w-6xl mx-auto px-3 sm:px-6 h-12 flex items-center justify-between gap-2 sm:gap-3">
           {/* Left: Brand + Active Docket Selector */}
           <div className="flex items-center gap-2 min-w-0">
             <button
@@ -50,7 +92,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   className="w-full h-full object-cover"
                 />
               </div>
-              <span className="font-bold text-sm tracking-tight text-white font-sans">
+              <span className="font-bold text-sm tracking-tight text-white font-sans hidden xs:inline">
                 PalletTrack
               </span>
             </button>
@@ -60,7 +102,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             {activeDelivery ? (
               <button
                 onClick={onOpenDeliveriesList}
-                className="flex items-center gap-1.5 py-1 px-2 rounded-md hover:bg-white/5 text-slate-200 transition-colors text-xs font-mono font-medium truncate max-w-[130px] sm:max-w-[240px] cursor-pointer border border-transparent hover:border-[#1E2D44]"
+                className="flex items-center gap-1.5 py-1 px-2 rounded-md hover:bg-white/5 text-slate-200 transition-colors text-xs font-mono font-medium truncate max-w-[120px] sm:max-w-[200px] cursor-pointer border border-transparent hover:border-[#1E2D44]"
                 title="Switch active delivery docket"
               >
                 <span className="truncate">{activeDelivery.docketNumber}</span>
@@ -78,10 +120,10 @@ export const Navbar: React.FC<NavbarProps> = ({
             )}
           </div>
 
-          {/* Right: Quick Action & Settings */}
-          <div className="flex items-center gap-2 shrink-0">
+          {/* Right: Employee Account Badge + Actions */}
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {activeDelivery && (
-              <div className="hidden sm:flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded-md bg-[#0E1626] border border-[#1E2D44] text-slate-300">
+              <div className="hidden md:flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded-md bg-[#0E1626] border border-[#1E2D44] text-slate-300">
                 <span className="text-cyan-400 font-bold">{received}</span>
                 <span className="text-slate-500">/</span>
                 <span>{total}</span>
@@ -89,14 +131,57 @@ export const Navbar: React.FC<NavbarProps> = ({
               </div>
             )}
 
+            {/* Logged in Employee Info */}
+            {currentUser && (
+              <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#0E1626] border border-[#1E2D44]">
+                <div className="flex flex-col text-left">
+                  <div className="flex items-center gap-1.5 leading-none">
+                    <span className="text-xs font-mono font-bold text-slate-200 truncate max-w-[90px] sm:max-w-[130px]">
+                      {currentUser.employeeName}
+                    </span>
+                    {renderRoleBadge(currentUser.role)}
+                  </div>
+                  <span className="text-[9px] font-mono text-cyan-400 tracking-wider">
+                    {currentUser.employeeCode}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Admin-only User Management Button */}
+            {currentUser?.role === 'admin' && onOpenUserManagement && (
+              <button
+                onClick={onOpenUserManagement}
+                className="h-8 px-2.5 inline-flex items-center gap-1.5 text-indigo-300 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/60 border border-indigo-500/40 rounded-lg transition-colors cursor-pointer text-xs font-mono font-semibold"
+                aria-label="User Management"
+                title="Employee Accounts & RBAC"
+              >
+                <Users className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Employees</span>
+              </button>
+            )}
+
+            {/* Settings Button */}
             <button
               onClick={onOpenSettings}
               className="w-8 h-8 inline-flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-colors cursor-pointer border border-transparent hover:border-[#1E2D44]"
               aria-label="Settings"
-              title="Settings & System Configurations"
+              title="Settings & Configurations"
             >
               <Settings className="w-4 h-4 stroke-[1.75]" />
             </button>
+
+            {/* Sign Out Button */}
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="w-8 h-8 inline-flex items-center justify-center text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 rounded-lg transition-colors cursor-pointer border border-transparent hover:border-rose-500/30"
+                aria-label="Sign Out"
+                title="Sign Out Terminal"
+              >
+                <LogOut className="w-4 h-4 stroke-[1.75]" />
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -107,7 +192,6 @@ export const Navbar: React.FC<NavbarProps> = ({
        * ========================================================================= */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0F1A]/95 backdrop-blur-md border-t border-[#1E2D44] pb-safe shadow-[0_-4px_20px_rgba(0,0,0,0.5)]">
         <div className="max-w-md mx-auto grid grid-cols-4 h-14 items-center px-1">
-
           {/* 1. Home */}
           <button
             type="button"
@@ -178,7 +262,6 @@ export const Navbar: React.FC<NavbarProps> = ({
               Settings
             </span>
           </button>
-
         </div>
       </nav>
     </>

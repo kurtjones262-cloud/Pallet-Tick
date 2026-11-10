@@ -8,24 +8,50 @@ import { DeliveriesListModal } from './components/DeliveriesListModal';
 import { TestBarcodesModal } from './components/TestBarcodesModal';
 import { UnexpectedPartsModal } from './components/UnexpectedPartsModal';
 import { SettingsModal } from './components/SettingsModal';
-import { Delivery, PendingQuantityConfirmation } from './types/delivery';
+import { Delivery, PendingQuantityConfirmation, UserAccount } from './types/delivery';
 import {
   getActiveDelivery,
   updateDelivery,
   processScannedCode,
   getStoredSettings,
+  syncDeliveriesFromCentralDatabase,
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { SplashScreen } from './components/SplashScreen';
 import { OrdersView } from './components/OrdersView';
+import { DuplicateScanModal, DuplicateScanModalData } from './components/DuplicateScanModal';
+import { ConnectionStatusBar } from './components/ConnectionStatusBar';
+import { ConnectionRequiredModal } from './components/ConnectionRequiredModal';
+import { DataMigrationModal } from './components/DataMigrationModal';
+import { LoginView } from './components/LoginView';
+import { FirstTimeAdminSetupModal } from './components/FirstTimeAdminSetupModal';
+import { UserManagementModal } from './components/UserManagementModal';
+import {
+  apiGetSession,
+  apiLogout,
+  apiCheckProvisionStatus,
+  getStoredUser,
+} from './services/palletTrackApi';
 
 export function App() {
+  // Phase 2 Multi-User & RBAC State
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => getStoredUser());
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [hasAdmin, setHasAdmin] = useState(true);
+  const [isFirstTimeSetupOpen, setIsFirstTimeSetupOpen] = useState(false);
+  const [isUserManagementOpen, setIsUserManagementOpen] = useState(false);
+
+  // Application views & state
   const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard' | 'orders'>('dashboard');
   const [activeDelivery, setActiveDelivery] = useState<Delivery | null>(null);
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
   const [externalPendingQuantity, setExternalPendingQuantity] =
     useState<PendingQuantityConfirmation | null>(null);
   const [isConfirmingScan, setIsConfirmingScan] = useState<boolean>(false);
+  const [globalDuplicateWarning, setGlobalDuplicateWarning] =
+    useState<DuplicateScanModalData | null>(null);
+  const [isConnectionRequiredOpen, setIsConnectionRequiredOpen] = useState(false);
+  const [isMigrationModalOpen, setIsMigrationModalOpen] = useState(false);
 
   // Modals state
   const [isNewDeliveryOpen, setIsNewDeliveryOpen] = useState(false);
@@ -34,7 +60,7 @@ export function App() {
   const [isUnexpectedOpen, setIsUnexpectedOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
-  // Startup splash screen initialisation state
+  // Startup splash screen state
   const [isAppReady, setIsAppReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [showSplash, setShowSplash] = useState(true);
@@ -47,30 +73,78 @@ export function App() {
   const initAppWorkspace = useCallback(() => {
     try {
       setInitError(null);
-      // Essential initialisation: load delivery data and stored state
       const current = getActiveDelivery();
       setActiveDelivery(current);
       setIsAppReady(true);
     } catch (err: any) {
-      console.error('PalletTick startup initialisation error:', err);
-      setInitError(err?.message || 'Could not initialise PalletTick storage.');
+      console.error('PalletTrack startup initialisation error:', err);
+      setInitError(err?.message || 'Could not initialise PalletTrack storage.');
     }
+  }, []);
+
+  // Check initial authentication and provision status
+  useEffect(() => {
+    let isMounted = true;
+
+    async function checkAuthStatus() {
+      try {
+        const prov = await apiCheckProvisionStatus();
+        if (isMounted) {
+          setHasAdmin(prov.hasAdmin);
+          if (!prov.hasAdmin) {
+            setIsFirstTimeSetupOpen(true);
+            setCurrentUser(null);
+            setIsCheckingAuth(false);
+            return;
+          }
+        }
+
+        const session = await apiGetSession();
+        if (isMounted) {
+          setCurrentUser(session.user);
+        }
+      } catch {
+        if (isMounted) {
+          setCurrentUser(null);
+        }
+      } finally {
+        if (isMounted) {
+          setIsCheckingAuth(false);
+        }
+      }
+    }
+
+    checkAuthStatus();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   useEffect(() => {
     initAppWorkspace();
 
+    if (currentUser) {
+      // Background sync with central Cloudflare D1 database
+      syncDeliveriesFromCentralDatabase()
+        .then(() => reloadDelivery())
+        .catch(console.warn);
+    }
+
     const handleDeliveriesUpdate = () => reloadDelivery();
     const handleActiveChange = () => reloadDelivery();
+    const handleConnectionRequired = () => setIsConnectionRequiredOpen(true);
 
     window.addEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
     window.addEventListener('parttrack_active_delivery_changed', handleActiveChange);
+    window.addEventListener('parttrack_connection_required', handleConnectionRequired);
 
     return () => {
       window.removeEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
+      window.removeEventListener('parttrack_connection_required', handleConnectionRequired);
     };
-  }, [initAppWorkspace, reloadDelivery]);
+  }, [initAppWorkspace, reloadDelivery, currentUser]);
 
   // Global Ctrl+K / Cmd+K focuses search bar in Orders
   useEffect(() => {
@@ -94,6 +168,21 @@ export function App() {
     updateDelivery(updated);
   };
 
+  const handleLoginSuccess = (user: UserAccount) => {
+    setCurrentUser(user);
+    setHasAdmin(true);
+    setIsFirstTimeSetupOpen(false);
+    syncDeliveriesFromCentralDatabase()
+      .then(() => reloadDelivery())
+      .catch(console.warn);
+  };
+
+  const handleLogout = async () => {
+    await apiLogout();
+    setCurrentUser(null);
+    setActiveTab('dashboard');
+  };
+
   const handleSimulateScan = (code: string) => {
     if (!activeDelivery) return;
     const { updatedDelivery, result } = processScannedCode(activeDelivery, code);
@@ -112,16 +201,31 @@ export function App() {
       return;
     }
 
+    if (result.status === 'duplicate') {
+      playAudio.duplicate(settings.soundEnabled);
+      triggerHaptic('duplicate', settings.vibrationEnabled);
+      speakAlert(
+        `Duplicate scan: ${result.part?.partNumber || code}`,
+        settings.speechEnabled
+      );
+      setGlobalDuplicateWarning({
+        partNumber: result.part?.partNumber || code,
+        description: result.part?.description || '',
+        code,
+        itemNumber: result.part?.itemNumber,
+        palletNumber: result.part?.palletNumber,
+        scannedAt: result.part?.scannedAt,
+        receivedQuantity: result.part?.receivedQuantity,
+      });
+      return;
+    }
+
     handleUpdateDelivery(updatedDelivery);
 
     if (result.status === 'matched') {
       playAudio.success(settings.soundEnabled);
       triggerHaptic('success', settings.vibrationEnabled);
       speakAlert(`Matched ${result.part?.partNumber}`, settings.speechEnabled);
-    } else if (result.status === 'duplicate') {
-      playAudio.duplicate(settings.soundEnabled);
-      triggerHaptic('duplicate', settings.vibrationEnabled);
-      speakAlert('Duplicate scan', settings.speechEnabled);
     } else {
       playAudio.unexpected(settings.soundEnabled);
       triggerHaptic('unexpected', settings.vibrationEnabled);
@@ -135,6 +239,24 @@ export function App() {
     }
     setActiveTab(tab);
   };
+
+  // If not logged in, display the PIN login screen
+  if (!isCheckingAuth && !currentUser) {
+    return (
+      <div className="min-h-dvh bg-[#070A0F]">
+        <LoginView
+          onLoginSuccess={handleLoginSuccess}
+          onOpenSetupAdmin={() => setIsFirstTimeSetupOpen(true)}
+          hasAdmin={hasAdmin}
+        />
+        <FirstTimeAdminSetupModal
+          isOpen={isFirstTimeSetupOpen}
+          onClose={() => setIsFirstTimeSetupOpen(false)}
+          onSuccess={handleLoginSuccess}
+        />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -152,6 +274,9 @@ export function App() {
         />
       )}
 
+      {/* Database Connection Warning Status Bar */}
+      <ConnectionStatusBar />
+
       {/* Top Bar & Fixed Bottom Navigation (hidden when confirming scan) */}
       {!isConfirmingScan && (
         <Navbar
@@ -163,6 +288,9 @@ export function App() {
           onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
           onOpenTestSheet={() => setIsTestSheetOpen(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          currentUser={currentUser}
+          onOpenUserManagement={() => setIsUserManagementOpen(true)}
+          onLogout={handleLogout}
         />
       )}
 
@@ -224,12 +352,12 @@ export function App() {
         )}
       </main>
 
+      {/* Modals */}
       {isNewDeliveryOpen && (
         <NewDeliveryModal
           onClose={() => setIsNewDeliveryOpen(false)}
           onDeliveryCreated={(newDel) => {
             setActiveDelivery(newDel);
-            // Automatically navigate to the scanner screen once the compiled parts list is confirmed!
             setActiveTab('scanner');
           }}
         />
@@ -240,7 +368,9 @@ export function App() {
           activeDeliveryId={activeDelivery?.id || null}
           onSelectDelivery={(selected) => setActiveDelivery(selected)}
           onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+          onOpenMigration={() => setIsMigrationModalOpen(true)}
           onClose={() => setIsDeliveriesListOpen(false)}
+          userRole={currentUser?.role}
         />
       )}
 
@@ -264,6 +394,37 @@ export function App() {
         <SettingsModal
           onClose={() => setIsSettingsOpen(false)}
           onSettingsSaved={() => reloadDelivery()}
+          onOpenMigration={() => setIsMigrationModalOpen(true)}
+        />
+      )}
+
+      {globalDuplicateWarning && (
+        <DuplicateScanModal
+          data={globalDuplicateWarning}
+          onDismiss={() => setGlobalDuplicateWarning(null)}
+        />
+      )}
+
+      {/* Online-only Receiving Alert Modal */}
+      <ConnectionRequiredModal
+        isOpen={isConnectionRequiredOpen}
+        onDismiss={() => setIsConnectionRequiredOpen(false)}
+        onConnected={() => reloadDelivery()}
+      />
+
+      {/* Cloudflare D1 Migration Modal */}
+      <DataMigrationModal
+        isOpen={isMigrationModalOpen}
+        onClose={() => setIsMigrationModalOpen(false)}
+        onMigrationComplete={() => reloadDelivery()}
+      />
+
+      {/* Phase 2: Administrator User Management Modal */}
+      {isUserManagementOpen && currentUser?.role === 'admin' && (
+        <UserManagementModal
+          isOpen={isUserManagementOpen}
+          onClose={() => setIsUserManagementOpen(false)}
+          currentUser={currentUser}
         />
       )}
     </div>

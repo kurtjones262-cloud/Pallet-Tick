@@ -139,3 +139,21 @@ export interface AppSettings {
   autoExpandQuantities: boolean;
   darkHighContrast: boolean;
 }
+
+export type UserRole = 'admin' | 'supervisor' | 'operator';
+
+export interface UserAccount {
+  id: string;
+  employeeName: string;
+  employeeCode: string;
+  role: UserRole;
+  active: boolean;
+  failedLoginAttempts?: number;
+  lockedUntil?: string | null;
+  lastLoginAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  totalScans?: number;
+  lastScanAt?: string | null;
+}
+

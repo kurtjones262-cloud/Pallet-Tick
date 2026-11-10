@@ -4,6 +4,8 @@ import {
   Trash2,
   Archive,
   Loader2,
+  Database,
+  Cloud,
 } from 'lucide-react';
 import { AppSettings } from '../types/delivery';
 import {
@@ -17,12 +19,15 @@ import { exportAllDeliveriesBackupZip } from '../utils/zipExport';
 interface SettingsModalProps {
   onClose: () => void;
   onSettingsSaved: () => void;
+  onOpenMigration?: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   onSettingsSaved,
+  onOpenMigration,
 }) => {
+
   const [settings, setSettings] = useState<AppSettings>(getStoredSettings());
   const [isBackingUpZip, setIsBackingUpZip] = useState(false);
 
@@ -164,8 +169,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         <div className="p-4 space-y-2 border-t border-[#E4E3DE]">
           <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1">
+            Central Database (Cloudflare D1)
+          </div>
+
+          {onOpenMigration && (
+            <button
+              onClick={() => {
+                onClose();
+                onOpenMigration();
+              }}
+              className="w-full h-9 px-3 rounded-[4px] border border-cyan-800/40 bg-cyan-950/20 hover:bg-cyan-950/40 text-xs font-semibold text-cyan-900 flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+            >
+              <Database className="w-3.5 h-3.5 text-cyan-700" />
+              <span>Migrate / Sync Deliveries to D1</span>
+            </button>
+          )}
+
+          <div className="pt-2 border-t border-[#E4E3DE]" />
+
+          <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1">
             Export & Backup
           </div>
+
 
           <button
             onClick={handleBackupAllZip}

@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { type Request as ExpressRequest, type Response as ExpressResponse } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -45,25 +45,60 @@ app.use(express.static(path.resolve(__dirname, 'public')));
 app.use('/tesseract', express.static(path.resolve(__dirname, 'node_modules/tesseract.js/dist')));
 
 
-/**
- * GET /api/health
- */
-app.get('/api/health', (_req: Request, res: Response) => {
-  res.status(200).json({
-    status: 'ok',
-    app: 'PalletTick',
-    runtime: 'node-express',
-    offlineOcrReady: true,
-    engine: 'tesseract.js-wasm-local',
-    timestamp: new Date().toISOString(),
-  });
+import { getLocalDevDatabase } from './src/server/db/nodeSqliteAdapter.ts';
+import { handlePalletTrackApiRequest } from './src/server/api/palletTrackApiRouter.ts';
+
+const localDb = getLocalDevDatabase();
+
+// Mount PalletTrack Centralised Database API routes
+app.use(async (req, res, next) => {
+  if (
+    req.path.startsWith('/api/deliveries') ||
+    req.path.startsWith('/api/users') ||
+    req.path === '/api/health'
+  ) {
+    try {
+      const url = `${req.protocol}://${req.get('host') || 'localhost:3000'}${req.originalUrl}`;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === 'string') headers.set(k, v);
+        else if (Array.isArray(v)) v.forEach((val) => headers.append(k, val));
+      }
+
+      const body =
+        req.method !== 'GET' && req.method !== 'HEAD' && req.body
+          ? JSON.stringify(req.body)
+          : undefined;
+
+      const webReq = new Request(url, {
+        method: req.method,
+        headers,
+        body,
+      });
+
+      const webRes = await handlePalletTrackApiRequest(webReq, localDb);
+      if (webRes) {
+        res.status(webRes.status);
+        webRes.headers.forEach((val, key) => {
+          res.setHeader(key, val);
+        });
+        const responseText = await webRes.text();
+        return res.send(responseText);
+      }
+    } catch (err: any) {
+      console.error('API router error in server.ts:', err);
+      return res.status(500).json({ error: err?.message || 'Server database error' });
+    }
+  }
+  next();
 });
+
 
 /**
  * GET /api/export-project-zip
  * Bundles the application project source code and assets into a .zip file
  */
-app.get('/api/export-project-zip', async (_req: Request, res: Response) => {
+app.get('/api/export-project-zip', async (_req: ExpressRequest, res: ExpressResponse) => {
   try {
     const JSZipModule = (await import('jszip')).default;
     const fs = await import('fs');
@@ -120,7 +155,7 @@ app.get('/api/export-project-zip', async (_req: Request, res: Response) => {
  * Uses Gemini Flash multimodal structured extraction when online to identify
  * ONLY each individual part on the delivery docket and all of its details.
  */
-app.post('/api/extract-docket', async (req: Request, res: Response) => {
+app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse) => {
   try {
     const { images, startItemIndex, pageSlices } = req.body || {};
     if (
@@ -164,7 +199,7 @@ app.post('/api/extract-docket', async (req: Request, res: Response) => {
  * POST /api/recover-docket-items
  * Targeted recovery pass for any missing "No" numbers across page boundaries (e.g. 1..199).
  */
-app.post('/api/recover-docket-items', async (req: Request, res: Response) => {
+app.post('/api/recover-docket-items', async (req: ExpressRequest, res: ExpressResponse) => {
   try {
     const { slicePayload, pageNumber, missingNos } = req.body || {};
     if (!slicePayload || !Array.isArray(missingNos) || missingNos.length === 0) {
@@ -186,7 +221,7 @@ app.post('/api/recover-docket-items', async (req: Request, res: Response) => {
  * POST /api/read-part-label
  * Reads a single part barcode/QR/tag image with Gemini AI Vision when optical barcode decoding struggles.
  */
-app.post('/api/read-part-label', async (req: Request, res: Response) => {
+app.post('/api/read-part-label', async (req: ExpressRequest, res: ExpressResponse) => {
   try {
     const { image, imageBase64, mimeType, knownParts, docketParts } = req.body || {};
     const resolvedImage =
@@ -220,7 +255,7 @@ app.post('/api/read-part-label', async (req: Request, res: Response) => {
 });
 
 // Ensure any unmatched /api/* route returns JSON instead of falling through to SPA HTML
-app.all('/api/*', (req: Request, res: Response) => {
+app.all('/api/*', (req: ExpressRequest, res: ExpressResponse) => {
   return res.status(404).json({
     error: `API route not found: ${req.path}`,
     code: 'NOT_FOUND',

@@ -21,6 +21,16 @@ import {
   saveDocketImageToIndexedDb,
   clearAllIndexedDb,
 } from './indexedDb';
+import {
+  apiFetchDeliveries,
+  apiCreateDelivery,
+  apiUpdateDelivery,
+  apiReceivePart,
+  apiMigrateDeliveries,
+  checkBackendConnection,
+  isBackendOnline,
+} from '../services/palletTrackApi';
+
 
 const DELIVERIES_KEY = 'parttrack_deliveries_v2';
 const ACTIVE_DELIVERY_KEY = 'parttrack_active_delivery_id_v2';
@@ -201,12 +211,65 @@ export function getStoredDeliveries(): Delivery[] {
   }
 }
 
+let isSyncingCentralDb = false;
+
+/**
+ * Synchronises local deliveries with the centralised Cloudflare D1 / Worker backend.
+ * Retains IndexedDB and localStorage as local cache.
+ */
+export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
+  if (isSyncingCentralDb || typeof window === 'undefined') return getStoredDeliveries();
+  isSyncingCentralDb = true;
+  try {
+    const health = await checkBackendConnection();
+    if (!health.connected) {
+      return getStoredDeliveries();
+    }
+
+    const centralList = await apiFetchDeliveries();
+    if (Array.isArray(centralList) && centralList.length > 0) {
+      const normalizedList = centralList.map(normalizeDeliveryDocketNumbers);
+      saveStoredDeliveries(normalizedList);
+      const activeId = getActiveDeliveryId();
+      if (!activeId || !normalizedList.some((d) => d.id === activeId)) {
+        setActiveDeliveryId(normalizedList[0].id);
+      }
+      return normalizedList;
+    } else {
+      // If the central database is freshly provisioned and empty,
+      // upload the local working deliveries into the central database.
+      const locals = getStoredDeliveries();
+      if (locals.length > 0) {
+        await apiMigrateDeliveries(locals);
+        const refreshed = await apiFetchDeliveries();
+        if (refreshed.length > 0) {
+          const normalizedRefreshed = refreshed.map(normalizeDeliveryDocketNumbers);
+          saveStoredDeliveries(normalizedRefreshed);
+          return normalizedRefreshed;
+        }
+      }
+    }
+    return getStoredDeliveries();
+
+  } catch (err) {
+    console.warn('Central database sync notice:', err);
+    return getStoredDeliveries();
+  } finally {
+    isSyncingCentralDb = false;
+  }
+}
+
+
 /**
  * Ensures every part in a stored delivery has its clean Docket "No" (1, 2, 3...)
  * in itemNumber & docketLineIndex, repairing any legacy "ITM-003-1", "3-1", or "BC-9001" values.
  */
 function normalizeDeliveryDocketNumbers(delivery: Delivery): Delivery {
-  if (!delivery || !Array.isArray(delivery.parts)) return delivery;
+  if (!delivery) return delivery;
+  if (!Array.isArray(delivery.parts)) {
+    return { ...delivery, parts: [] };
+  }
+
 
   let currentDocketRowNo = 0;
   let lastGroupKey = '';
@@ -377,7 +440,28 @@ export function updateDelivery(updated: Delivery): void {
 
   saveStoredDeliveries(deliveries);
   saveDeliveryToIndexedDb(withUpdatedTimestamp).catch(console.error);
+
+  // Sync to central database
+  if (typeof window !== 'undefined') {
+    if (index >= 0) {
+      apiUpdateDelivery(updated.id, {
+        status: updated.status,
+        carrier: updated.carrier,
+        notes: updated.notes,
+        docketNumber: updated.docketNumber,
+        supplier: updated.supplier,
+      }).catch((err) => {
+
+        console.warn('Central database update sync notice:', err?.message || err);
+      });
+    } else {
+      apiCreateDelivery(withUpdatedTimestamp).catch((err) => {
+        console.warn('Central database create sync notice:', err?.message || err);
+      });
+    }
+  }
 }
+
 
 export function deleteDelivery(id: string): void {
   const deliveries = getStoredDeliveries();
@@ -434,7 +518,15 @@ export function setPartStatus(
   if (partIndex === -1) return null;
 
   const part = delivery.parts[partIndex];
+  if (status === 'received' && !isBackendOnline()) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
+    }
+    return null;
+  }
+
   const now = new Date().toISOString();
+
   const requiredQty = Math.max(1, part.quantity ?? 1);
   const resolvedReceivedQty =
     status === 'received'
@@ -506,8 +598,22 @@ export function setPartStatus(
   };
 
   updateDelivery(updatedDelivery);
+
+  // Sync receiving transaction to central database
+  if (typeof window !== 'undefined') {
+    apiReceivePart(deliveryId, partId, {
+      receivedQuantity: resolvedReceivedQty || 0,
+      status,
+      scannedVia: method,
+      scannedCode,
+    }).catch((err) => {
+      console.warn('Central database receive sync notice:', err?.message || err);
+    });
+  }
+
   return updatedDelivery;
 }
+
 
 /**
  * Confirms the user-entered quantity for a scanned part whose required quantity > 1.
@@ -526,10 +632,24 @@ export function confirmScannedPartQuantity(
   requiredQuantity: number;
   receivedQuantity: number;
 } {
-  const now = new Date().toISOString();
   const requiredQuantity = Math.max(1, pending.part.quantity ?? 1);
   const receivedQuantity = Math.max(0, Math.round(enteredQuantity));
+
+  if (!isBackendOnline()) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
+    }
+    return {
+      updatedDelivery: delivery,
+      updatedPart: pending.part,
+      isCorrectQuantity: false,
+      requiredQuantity,
+      receivedQuantity: pending.part.receivedQuantity ?? 0,
+    };
+  }
+
   const isCorrectQuantity = receivedQuantity === requiredQuantity;
+
   const previousStatus = pending.part.status;
   const previousReceivedQuantity =
     pending.part.status === 'received'
@@ -537,6 +657,8 @@ export function confirmScannedPartQuantity(
         ? pending.part.receivedQuantity
         : requiredQuantity
       : 0;
+
+  const now = new Date().toISOString();
 
   const updatedPart: DeliveryPart = {
     ...pending.part,
@@ -579,8 +701,20 @@ export function confirmScannedPartQuantity(
 
   updateDelivery(updatedDelivery);
 
+  // Sync to central database
+  if (typeof window !== 'undefined') {
+    apiReceivePart(delivery.id, pending.part.id, {
+      receivedQuantity,
+      scannedVia: pending.detectedType,
+      scannedCode: pending.code,
+    }).catch((err) => {
+      console.warn('Central database quantity sync notice:', err?.message || err);
+    });
+  }
+
   return {
     updatedDelivery,
+
     updatedPart,
     isCorrectQuantity,
     requiredQuantity,
@@ -1167,34 +1301,14 @@ export function processScannedCode(
         ? alreadyReceivedPart.receivedQuantity
         : reqQty;
 
-    const scanEvent: ScanEvent = {
-      id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      timestamp: now,
-      code: cleaned,
-      codeType: detectedType,
-      status: 'duplicate_warning',
-      partId: alreadyReceivedPart.id,
-      partNumber: alreadyReceivedPart.partNumber,
-      itemNumber: alreadyReceivedPart.itemNumber,
-      requiredQuantity: reqQty,
-      receivedQuantity: recQty,
-      message: `Duplicate scan ignored: Docket No. ${docketNoLabel} (${alreadyReceivedPart.partNumber}) already recorded (Qty ${recQty}/${reqQty})`,
-    };
-
-    const updatedDelivery: Delivery = {
-      ...delivery,
-      scanHistory: [scanEvent, ...delivery.scanHistory].slice(0, 300),
-      updatedAt: now,
-    };
-
-    updateDelivery(updatedDelivery);
-
+    // STRICT DUPLICATE PREVENTION:
+    // Do not increment quantities, create another scan record or modify delivery totals.
     return {
-      updatedDelivery,
+      updatedDelivery: delivery,
       result: {
         status: 'duplicate',
         part: alreadyReceivedPart,
-        message: `Duplicate: No. ${docketNoLabel} (${alreadyReceivedPart.partNumber}) already recorded (Qty ${recQty}/${reqQty})`,
+        message: 'This part has already been scanned into this delivery.',
         code: cleaned,
         detectedType,
       },

@@ -696,13 +696,14 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       <div className="flex flex-wrap items-center justify-between gap-2.5 pb-3 border-b border-white/5">
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-mono font-bold uppercase tracking-wider text-slate-400">
-                            Individual Parts ({d.parts.length})
+                            Individual Parts ({(d.parts || []).length})
                           </span>
                           <span className="text-slate-600">·</span>
                           <span className="text-xs font-mono text-cyan-400">
                             {remaining} Outstanding
                           </span>
                         </div>
+
 
                         <div className="flex items-center gap-2">
                           <button
@@ -783,9 +784,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       {/* Parts Rows */}
                       <div className="divide-y divide-white/5 border border-[#1E2D44] rounded-xl overflow-hidden bg-[#070A0F]">
                         {(() => {
-                          let partsList = d.parts;
+                          const baseParts = d.parts || [];
+                          let partsList = baseParts;
                           if (debouncedQuery) {
-                            const smartList = filterPartsSmart(d.parts, debouncedQuery, {
+                            const smartList = filterPartsSmart(baseParts, debouncedQuery, {
                               docketNumber: d.docketNumber,
                               supplier: d.supplier,
                             });
@@ -793,6 +795,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                               partsList = smartList;
                             }
                           }
+
 
                           const filteredList = partsList.filter((p) => {
                             if (partsFilter === 'outstanding') return p.status !== 'received';

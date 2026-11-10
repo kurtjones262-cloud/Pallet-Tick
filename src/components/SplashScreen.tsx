@@ -115,8 +115,8 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({
 
       {/* Subtle version/build watermark at bottom */}
       <div className="absolute bottom-4 inset-x-0 text-center pointer-events-none">
-        <span className="font-mono text-[10px] text-zinc-600 tracking-widest uppercase">
-          PalletTick · Industrial Parts Verification
+        <span className="font-mono text-[10px] text-zinc-500 tracking-widest uppercase">
+          PalletTrack · Base Offline Version
         </span>
       </div>
     </div>

@@ -14,7 +14,7 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
+const PRIMARY_MODEL = 'gemini-3.8-flash';
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);

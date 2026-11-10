@@ -149,7 +149,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
         completedDeliveriesCount += 1;
       }
 
-      del.parts.forEach((p) => {
+      (del.parts || []).forEach((p) => {
         if (p.status === 'received') {
           const qty = typeof p.receivedQuantity === 'number' ? p.receivedQuantity : (p.quantity || 1);
           partsProcessedTotal += qty;
@@ -167,12 +167,13 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
           }
           if (ev.timestamp && ev.timestamp.startsWith(todayStr)) {
             if (ev.partId) {
-              const matchedPart = del.parts.find((p) => p.id === ev.partId);
+              const matchedPart = (del.parts || []).find((p) => p.id === ev.partId);
               if (matchedPart?.palletNumber) {
                 palletsScannedTodaySet.add(`${del.id}_${matchedPart.palletNumber}`);
               }
             }
           }
+
         } catch {}
       });
     });
@@ -234,7 +235,8 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
 
     targetDeliveries.forEach((del) => {
       (del.scanHistory || []).forEach((ev) => {
-        const matched = del.parts.find((p) => p.id === ev.partId || p.partNumber === ev.partNumber);
+        const matched = (del.parts || []).find((p) => p.id === ev.partId || p.partNumber === ev.partNumber);
+
         events.push({
           id: ev.id,
           partNumber: ev.partNumber || matched?.partNumber || ev.code || 'Part Scan',

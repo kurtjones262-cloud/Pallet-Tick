@@ -45,8 +45,8 @@ export interface ExtractedDocketResult {
   lastVisibleRowNo?: number;
 }
 
-const PRIMARY_VISION_MODEL = 'gemini-3.1-flash-lite';
-const FALLBACK_VISION_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'] as const;
+const PRIMARY_VISION_MODEL = 'gemini-3.8-flash';
+const FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -168,9 +168,6 @@ async function generateWithRateLimitProtection(
               contents: { parts },
               config: {
                 systemInstruction,
-                ...(fallbackModel === 'gemini-3.8-flash'
-                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                  : {}),
                 responseMimeType: 'application/json',
                 responseSchema,
                 abortSignal: fbController.signal,

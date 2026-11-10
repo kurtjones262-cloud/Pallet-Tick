@@ -6,14 +6,19 @@
  * Never exposes the API key to frontend code, browser storage, or network responses.
  */
 
+import { D1Database } from './src/server/db/types.ts';
+import { handlePalletTrackApiRequest } from './src/server/api/palletTrackApiRouter.ts';
+
 export interface Env {
   GEMINI_API_KEY?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
+  DB?: D1Database;
   [key: string]: unknown;
 }
 
-const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
-const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-2.5-flash'] as const;
+
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+const FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest'] as const;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -197,11 +202,15 @@ Rules:
 
   let rawJsonText = '';
   let lastError: unknown = null;
+  let modelUsed: string = PRIMARY_MODEL;
 
   for (const model of [PRIMARY_MODEL, ...FALLBACK_MODELS]) {
     try {
       rawJsonText = await callGeminiRest(apiKey, model, systemInstruction, parts, responseSchema);
-      if (rawJsonText) break;
+      if (rawJsonText) {
+        modelUsed = model;
+        break;
+      }
     } catch (err) {
       lastError = err;
     }
@@ -244,7 +253,7 @@ Rules:
     confidenceScore: items.length > 0 ? 100 : 0,
     needsManualReview: items.length === 0,
     extractionMethod: 'ai-vision',
-    aiModelUsed: PRIMARY_MODEL,
+    aiModelUsed: modelUsed,
     pagesScanned: totalPages,
   };
 
@@ -370,12 +379,17 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
+      if (env.DB) {
+        const dbRes = await handlePalletTrackApiRequest(request, env.DB);
+        if (dbRes) return dbRes;
+      }
       return new Response(
         JSON.stringify({
           status: 'ok',
-          app: 'PalletTick',
+          app: 'PalletTrack',
           runtime: 'cloudflare-worker',
           geminiConfigured: Boolean(env.GEMINI_API_KEY),
+          d1Configured: Boolean(env.DB),
           timestamp: new Date().toISOString(),
         }),
         {
@@ -384,6 +398,26 @@ export default {
         }
       );
     }
+
+    // Handle PalletTrack Centralised Database API routes
+    if (url.pathname.startsWith('/api/deliveries') || url.pathname.startsWith('/api/users')) {
+      if (!env.DB) {
+        return new Response(
+          JSON.stringify({
+            error:
+              'Cloudflare D1 database is not bound to this Worker. Please ensure the DB binding is configured in wrangler.toml or the Cloudflare dashboard.',
+            code: 'D1_NOT_BOUND',
+          }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+          }
+        );
+      }
+      const apiResponse = await handlePalletTrackApiRequest(request, env.DB);
+      if (apiResponse) return apiResponse;
+    }
+
 
     if (url.pathname === '/api/extract-docket' && request.method === 'POST') {
       try {

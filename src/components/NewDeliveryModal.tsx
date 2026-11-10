@@ -129,12 +129,17 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
         const file = filesArray[i];
         const formatLabel = detectFileFormatLabel(file);
 
+        const filePrefix =
+          filesArray.length > 1 ? `(${i + 1}/${filesArray.length}) ` : '';
+
         // 1. Handle PDF documents
         if (isPdfFile(file)) {
-          setLoadingFileStatus(`Staging PDF "${file.name}"...`);
+          setLoadingFileStatus(`${filePrefix}Staging PDF "${file.name}"...`);
           try {
             const pdfPages = await extractPagesFromPdfFile(file, (curr, total) => {
-              setLoadingFileStatus(`Staging PDF "${file.name}" (Page ${curr} of ${total})...`);
+              setLoadingFileStatus(
+                `${filePrefix}Staging PDF "${file.name}" (Page ${curr} of ${total})...`
+              );
             });
             for (const pdfPage of pdfPages) {
               newPages.push({
@@ -164,7 +169,9 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
 
         // 2. Handle Images (JPG, JPEG, PNG, WebP, etc.)
         if (isSupportedImageFile(file) || origin === 'camera' || origin === 'gallery') {
-          setLoadingFileStatus(`Staging image "${file.name || `Photo ${i + 1}`}"...`);
+          setLoadingFileStatus(
+            `${filePrefix}Staging image "${file.name || `Photo ${i + 1}`}"...`
+          );
           try {
             const prepared = await prepareColorImageForGemini(file, 1800);
             newPages.push({
@@ -206,7 +213,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           file.type.startsWith('text/') ||
           /\.(txt|csv|tsv|json)$/i.test(file.name || '')
         ) {
-          setLoadingFileStatus(`Staging document "${file.name}"...`);
+          setLoadingFileStatus(`${filePrefix}Staging document "${file.name}"...`);
           try {
             const rawText = await file.text();
             const rawLines = rawText
@@ -372,8 +379,8 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             {/* ============================================================ */}
             {/* DEDICATED HTML FILE INPUTS FOR MOBILE & DESKTOP              */}
             {/* 1. CAMERA: Rear camera photo capture (accept="image/*" + capture="environment") */}
-            {/* 2. GALLERY: Pure accept="image/*" (NO capture, NO comma-separated subtypes, NO multiple on primary) so Android & Samsung One UI always show native Gallery / Photo Picker */}
-            {/* 3. FILES: System file picker for PDFs, images & documents    */}
+            {/* 2. GALLERY: Multi-select image gallery picker (accept="image/*" + multiple) */}
+            {/* 3. FILES: Multi-select system file picker for PDFs, images & documents */}
             {/* ============================================================ */}
             <input
               id="invoice-upload-camera-input"
@@ -388,12 +395,13 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 e.target.value = '';
               }}
             />
-            {/* 2. GALLERY: Explicit image MIME types WITHOUT multiple attribute, ensuring Android & iOS open the native Photo Gallery / Photos app instead of Files */}
+            {/* 2. GALLERY: Multi-select image picker for selecting multiple invoice photos at once */}
             <input
               id="invoice-upload-gallery-input"
               ref={galleryInputRef}
               type="file"
               accept="image/jpeg,image/png,image/webp,image/jpg,image/heic,image/*"
+              multiple
               disabled={isLoadingFiles}
               className="sr-only"
               onChange={async (e) => {
@@ -508,17 +516,33 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   </div>
 
                   {/* Step 2: 3-Option Mobile & Desktop Upload Selection Interface */}
-                  <div className="p-4 bg-white">
+                  <div
+                    className="p-4 bg-white"
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }}
+                    onDrop={async (e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (!isLoadingFiles && e.dataTransfer?.files?.length) {
+                        await handleFilesAdded(e.dataTransfer.files, 'files');
+                      }
+                    }}
+                  >
                     <div className="flex items-center justify-between mb-2.5">
                       <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-zinc-500">
-                        2. Upload Invoice / Docket (Choose Camera, Gallery or Files)
+                        2. Upload Invoice / Docket (Multi-File Supported)
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded-[3px] bg-emerald-50 text-[#059669] border border-emerald-200 font-mono text-[9px] font-semibold">
+                        Select 1 or Multiple Files
                       </span>
                     </div>
 
                     <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
-                      Tap <span className="font-semibold text-[#18181B]">1. Camera</span> to capture a new photo,{' '}
-                      <span className="font-semibold text-[#059669]">2. Gallery</span> to select existing photos from your device gallery (JPG, JPEG, PNG, WebP), or{' '}
-                      <span className="font-semibold text-[#18181B]">3. Files</span> to browse PDFs, images, and documents.
+                      Tap <span className="font-semibold text-[#18181B]">1. Camera</span> to capture photos,{' '}
+                      <span className="font-semibold text-[#059669]">2. Gallery</span> to select multiple photos from your gallery (JPG, JPEG, PNG, WebP), or{' '}
+                      <span className="font-semibold text-[#18181B]">3. Files</span> to select multiple PDFs, images, or documents at once.
                     </p>
 
                     {/* Three Clear Mobile Upload Options: 1. CAMERA, 2. GALLERY, 3. FILES */}
@@ -560,7 +584,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             2. Gallery
                           </span>
                           <span className="block text-[10px] text-zinc-600 leading-tight mt-0.5">
-                            Choose from photo gallery
+                            Select 1 or more photos
                           </span>
                         </div>
                       </button>
@@ -581,7 +605,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             3. Files
                           </span>
                           <span className="block text-[10px] text-zinc-500 leading-tight mt-0.5">
-                            PDFs, docs &amp; multi-files
+                            Select multiple files
                           </span>
                         </div>
                       </button>
@@ -599,7 +623,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                     {/* Staged / Selected Files Queue (Shown Before Processing — Requires Confirmation) */}
                     {capturedPages.length > 0 && (
                       <div className="pt-3 border-t border-[#E4E3DE] space-y-3">
-                        <div className="flex items-center justify-between">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5">
                             <span className="text-[11px] font-bold text-[#18181B]">
                               Selected Files Ready ({capturedPages.length}{' '}
@@ -609,13 +633,31 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                               Awaiting Confirmation
                             </span>
                           </div>
-                          <button
-                            type="button"
-                            onClick={handleClearAllPages}
-                            className="text-[11px] font-medium text-red-600 hover:text-red-700 cursor-pointer"
-                          >
-                            Clear All
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => galleryInputRef.current?.click()}
+                              disabled={isLoadingFiles}
+                              className="px-2 py-1 rounded-[3px] bg-emerald-50 hover:bg-emerald-100 text-[#059669] border border-emerald-200 text-[10px] font-mono font-semibold cursor-pointer"
+                            >
+                              + Add Photos
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => filesInputRef.current?.click()}
+                              disabled={isLoadingFiles}
+                              className="px-2 py-1 rounded-[3px] bg-zinc-100 hover:bg-zinc-200 text-[#18181B] border border-zinc-200 text-[10px] font-mono font-semibold cursor-pointer"
+                            >
+                              + Add Files
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleClearAllPages}
+                              className="text-[11px] font-medium text-red-600 hover:text-red-700 cursor-pointer ml-1"
+                            >
+                              Clear All
+                            </button>
+                          </div>
                         </div>
 
                         {/* Thumbnail & File Metadata Grid */}

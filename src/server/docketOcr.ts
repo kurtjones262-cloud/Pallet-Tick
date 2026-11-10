@@ -46,6 +46,46 @@ export interface PageSlicePayload {
   pdfSelectableText?: string;
 }
 
+export type TesseractDiagnosticOutcomeCode =
+  | 'A_TESSERACT_NEVER_STARTED'
+  | 'B_TESSERACT_FAILED_TO_INITIALISE'
+  | 'C_TESSERACT_FAILED_TO_RECOGNISE_TEXT'
+  | 'D_TESSERACT_RECOGNISED_TEXT_BUT_PARSING_FAILED'
+  | 'E_PARSING_SUCCEEDED_BUT_VALIDATION_REJECTED'
+  | 'F_TESSERACT_SUCCEEDED';
+
+export interface TesseractDiagnosticStageEvent {
+  stage: string;
+  timestampIso: string;
+  elapsedMs: number;
+  durationMs?: number;
+  status: 'ok' | 'warn' | 'error';
+  detail: string;
+}
+
+export interface TesseractPipelineDiagnostics {
+  outcomeCode: TesseractDiagnosticOutcomeCode;
+  outcomeLabel: string;
+  startedAtIso: string;
+  completedAtIso: string;
+  totalElapsedMs: number;
+  pdfRenderingSucceeded: boolean;
+  workerInitialised: boolean;
+  workerScriptLoaded: boolean;
+  wasmCoreLoaded: boolean;
+  trainedDataLoaded: boolean;
+  recognizeCalled: boolean;
+  ocrReturnedText: boolean;
+  ocrReturnedWords: boolean;
+  totalRawTextLength: number;
+  totalWordsCount: number;
+  totalLinesCount: number;
+  itemsParsedCount: number;
+  validationAccepted: boolean;
+  exactTriggerCondition?: string;
+  stages: TesseractDiagnosticStageEvent[];
+}
+
 export interface ExtractedDocketResult {
   docketNumber: string;
   supplier: string;
@@ -75,6 +115,7 @@ export interface ExtractedDocketResult {
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: number;
   lastVisibleRowNo?: number;
+  tesseractDiagnostics?: TesseractPipelineDiagnostics;
 }
 
 export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-3.8-flash';

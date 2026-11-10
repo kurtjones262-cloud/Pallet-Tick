@@ -547,6 +547,65 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           </div>
         )}
 
+        {/* Tesseract Runtime Pipeline Diagnostics Banner */}
+        {extractedData.tesseractDiagnostics && (
+          <details className="bg-zinc-50 border-b border-[#E4E3DE] text-[11px] text-zinc-700 shrink-0">
+            <summary className="px-4 py-1.5 cursor-pointer select-none flex items-center justify-between gap-2 font-mono hover:bg-zinc-100/80">
+              <span>
+                <strong>Tesseract Diagnostics:</strong>{' '}
+                {extractedData.tesseractDiagnostics.outcomeLabel} (
+                {extractedData.tesseractDiagnostics.totalElapsedMs}ms ·{' '}
+                {extractedData.tesseractDiagnostics.totalWordsCount} words ·{' '}
+                {extractedData.tesseractDiagnostics.itemsParsedCount} items)
+              </span>
+              <span className="text-[10px] text-zinc-500">Click to inspect stage timestamps</span>
+            </summary>
+            <div className="px-4 py-2 border-t border-[#E4E3DE] bg-white space-y-1.5 font-mono text-[10px]">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                <div>
+                  worker.min.js:{' '}
+                  <strong className={extractedData.tesseractDiagnostics.workerScriptLoaded ? 'text-emerald-700' : 'text-red-600'}>
+                    {extractedData.tesseractDiagnostics.workerScriptLoaded ? 'LOADED' : 'FAILED'}
+                  </strong>
+                </div>
+                <div>
+                  WASM Core:{' '}
+                  <strong className={extractedData.tesseractDiagnostics.wasmCoreLoaded ? 'text-emerald-700' : 'text-red-600'}>
+                    {extractedData.tesseractDiagnostics.wasmCoreLoaded ? 'LOADED' : 'FAILED'}
+                  </strong>
+                </div>
+                <div>
+                  eng.traineddata.gz:{' '}
+                  <strong className={extractedData.tesseractDiagnostics.trainedDataLoaded ? 'text-emerald-700' : 'text-red-600'}>
+                    {extractedData.tesseractDiagnostics.trainedDataLoaded ? 'LOADED' : 'FAILED'}
+                  </strong>
+                </div>
+                <div>
+                  recognize() called:{' '}
+                  <strong className={extractedData.tesseractDiagnostics.recognizeCalled ? 'text-emerald-700' : 'text-amber-600'}>
+                    {extractedData.tesseractDiagnostics.recognizeCalled ? 'YES' : 'NO'}
+                  </strong>
+                </div>
+              </div>
+              {extractedData.tesseractDiagnostics.exactTriggerCondition && (
+                <div className="text-amber-800 bg-amber-50 px-2 py-1 rounded">
+                  Trigger: {extractedData.tesseractDiagnostics.exactTriggerCondition}
+                </div>
+              )}
+              <div className="max-h-28 overflow-y-auto divide-y divide-zinc-100 border border-zinc-200 rounded p-1.5">
+                {extractedData.tesseractDiagnostics.stages.map((st, sIdx) => (
+                  <div key={sIdx} className="py-0.5 flex items-start justify-between gap-2">
+                    <span>
+                      <strong className="text-zinc-900">[{st.elapsedMs}ms]</strong> {st.stage}: {st.detail}
+                    </span>
+                    <span className="text-zinc-400 shrink-0">{st.timestampIso.slice(11, 23)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </details>
+        )}
+
         {/* Missing Row Sequence Warning Banner */}
         {activeExtractionMeta.missingRowNumbers.length > 0 && (
           <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 shrink-0">

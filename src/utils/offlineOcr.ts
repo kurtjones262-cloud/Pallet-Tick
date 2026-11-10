@@ -563,6 +563,7 @@ export async function performSmartDocketExtraction(
   // Stage 1: Primary Tesseract.js Docket Extraction
   let tesseractResult: TesseractDocketExtractionResult | null = null;
   let tesseractError: Error | null = null;
+  const tesseractStartIso = new Date().toISOString();
 
   try {
     tesseractResult = await extractDocketWithTesseractFirst(images, {
@@ -609,13 +610,44 @@ export async function performSmartDocketExtraction(
 
   // Stage 2: Automatic Fallback to Gemini AI Vision
   const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+  const fallbackDiagnostics = tesseractResult?.diagnostics || {
+    outcomeCode: 'B_TESSERACT_FAILED_TO_INITIALISE' as const,
+    outcomeLabel: 'B. Tesseract failed to initialise.',
+    startedAtIso: tesseractStartIso,
+    completedAtIso: new Date().toISOString(),
+    totalElapsedMs: Math.round(performance.now() - overallStartMs),
+    pdfRenderingSucceeded: images.length > 0,
+    workerInitialised: false,
+    workerScriptLoaded: false,
+    wasmCoreLoaded: false,
+    trainedDataLoaded: false,
+    recognizeCalled: false,
+    ocrReturnedText: false,
+    ocrReturnedWords: false,
+    totalRawTextLength: 0,
+    totalWordsCount: 0,
+    totalLinesCount: 0,
+    itemsParsedCount: 0,
+    validationAccepted: false,
+    exactTriggerCondition: tesseractError?.message || 'Tesseract worker failed to initialise.',
+    stages: [
+      {
+        stage: 'tesseract_exception',
+        timestampIso: new Date().toISOString(),
+        elapsedMs: Math.round(performance.now() - overallStartMs),
+        status: 'error' as const,
+        detail: tesseractError?.message || 'Unknown Tesseract error',
+      },
+    ],
+  };
+
   const fallbackReason =
     tesseractResult?.validationReport.fallbackReason ||
     tesseractError?.message ||
     'Tesseract confidence below threshold';
 
   console.info(
-    `[PalletTrack OCR] Triggering Gemini fallback (${fallbackReason})`
+    `[PalletTrack OCR] Triggering Gemini fallback [${fallbackDiagnostics.outcomeCode}] (${fallbackReason})`
   );
 
   if (!isOnline || forceOffline) {
@@ -624,6 +656,7 @@ export async function performSmartDocketExtraction(
         extractedData: {
           ...tesseractResult.extractedData,
           needsManualReview: true,
+          tesseractDiagnostics: fallbackDiagnostics,
         },
         processedPages: tesseractResult.processedPages.map((p) => ({
           pageNumber: p.pageNumber,
@@ -651,6 +684,7 @@ export async function performSmartDocketExtraction(
     1,
     Math.round(performance.now() - overallStartMs)
   );
+  geminiOutput.extractedData.tesseractDiagnostics = fallbackDiagnostics;
 
   return geminiOutput;
 }

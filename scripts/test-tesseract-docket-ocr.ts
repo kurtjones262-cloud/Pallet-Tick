@@ -850,6 +850,47 @@ async function runTests() {
         smartFallbackResult.extractedData.items[2].partNumber === 'LC-1003-C',
       'Gemini fallback recovers all 4 rows including previously missed row #3'
     );
+
+    // -------------------------------------------------------------------------
+    // TEST 6: Runtime Diagnostics, Document Luminance Normalization & PDF Raster OCR
+    // -------------------------------------------------------------------------
+    console.log('\n6. Testing Runtime Diagnostics, Luminance Normalization & PDF Raster OCR...');
+
+    const { normalizeDocumentLuminances } = await import('../src/utils/imagePreprocessing');
+    // Simulate a 1600x2200 document page with 1.2% black text strokes and 98.8% white background
+    const totalPixels = 100000;
+    const simLum = new Uint8Array(totalPixels);
+    const simHist = new Uint32Array(256);
+    const darkCount = Math.floor(totalPixels * 0.012);
+    for (let i = 0; i < totalPixels; i++) {
+      const v = i < darkCount ? 0 : 255;
+      simLum[i] = v;
+      simHist[v]++;
+    }
+    const normCheck = normalizeDocumentLuminances(simLum, simHist);
+    assert(
+      normCheck.pLow <= 90 && normCheck.pHigh >= 170 && normCheck.whitePixelRatioAfter > 0.95,
+      `Sparse text (<2% area) normalization preserves white background (pLow=${normCheck.pLow}, pHigh=${normCheck.pHigh}, whiteRatio=${normCheck.whitePixelRatioAfter})`
+    );
+
+    assert(
+      scannedLcOutput.diagnostics.outcomeCode === 'F_TESSERACT_SUCCEEDED' &&
+        scannedLcOutput.diagnostics.workerInitialised === true &&
+        scannedLcOutput.diagnostics.workerScriptLoaded === true &&
+        scannedLcOutput.diagnostics.wasmCoreLoaded === true &&
+        scannedLcOutput.diagnostics.trainedDataLoaded === true &&
+        scannedLcOutput.diagnostics.recognizeCalled === true &&
+        scannedLcOutput.diagnostics.ocrReturnedText === true &&
+        scannedLcOutput.diagnostics.ocrReturnedWords === true &&
+        scannedLcOutput.diagnostics.stages.length >= 4,
+      `Diagnostic trace confirms worker init, asset loading, recognize() call, word data, and stage timestamps (${scannedLcOutput.diagnostics.outcomeLabel})`
+    );
+
+    assert(
+      smartFallbackResult.extractedData.tesseractDiagnostics?.outcomeCode ===
+        'E_PARSING_SUCCEEDED_BUT_VALIDATION_REJECTED',
+      `Fallback diagnostic trace classifies exact validation trigger (${smartFallbackResult.extractedData.tesseractDiagnostics?.outcomeCode})`
+    );
   } finally {
     globalThis.fetch = originalFetch;
     await terminateDocketTesseractWorker();

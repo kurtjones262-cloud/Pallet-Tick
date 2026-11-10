@@ -1,5 +1,10 @@
 import { createWorker, OEM, PSM } from 'tesseract.js';
-import { ExtractedDocketResult } from '../server/docketOcr';
+import {
+  ExtractedDocketResult,
+  TesseractDiagnosticOutcomeCode,
+  TesseractDiagnosticStageEvent,
+  TesseractPipelineDiagnostics,
+} from '../server/docketOcr';
 import { SupplierRuleId } from '../types/delivery';
 import {
   RawOcrLine,
@@ -8,8 +13,9 @@ import {
   groupPositionedWordsIntoLines,
   parseIndustrialDocketText,
   combineMultiPageDocketResults,
+  validateDocketExtractionQuality,
 } from './docketParser';
-import { preprocessDocketImage } from './imagePreprocessing';
+import { preprocessDocketImage, normalizeDocumentLuminances } from './imagePreprocessing';
 import type { OcrProgressUpdate, PageTextHint } from './offlineOcr';
 
 export interface CachedTesseractPageOcr {
@@ -18,12 +24,15 @@ export interface CachedTesseractPageOcr {
   rawText: string;
   meanConfidence: number;
   ocrDurationMs: number;
+  wordsCount: number;
+  recognizeCalled: boolean;
   sourceKind: 'tesseract-image' | 'tesseract-plus-pdf-layout';
 }
 
 export interface TesseractDocketExtractionResult {
   extractedData: ExtractedDocketResult;
   validationReport: DocketValidationReport;
+  diagnostics: TesseractPipelineDiagnostics;
   processedPages: Array<{
     pageNumber: number;
     originalDataUrl: string;
@@ -34,6 +43,7 @@ export interface TesseractDocketExtractionResult {
     ocrDurationMs: number;
     meanConfidence: number;
     lineCount: number;
+    wordCount: number;
   }>;
   metrics: {
     totalTimeMs: number;
@@ -44,11 +54,34 @@ export interface TesseractDocketExtractionResult {
   };
 }
 
+interface WorkerAssetDiagnosticState {
+  workerInitialised: boolean;
+  workerScriptLoaded: boolean;
+  wasmCoreLoaded: boolean;
+  trainedDataLoaded: boolean;
+  initDurationMs: number;
+  lastInitError?: string;
+}
+
 const MAX_PAGE_CACHE_ENTRIES = 64;
 const pageOcrCache = new Map<string, CachedTesseractPageOcr>();
 
 let warmDocketTesseractWorkerPromise: Promise<any> | null = null;
 let activeDocketProgressHook: ((progressRatio: number) => void) | null = null;
+let workerAssetState: WorkerAssetDiagnosticState = {
+  workerInitialised: false,
+  workerScriptLoaded: false,
+  wasmCoreLoaded: false,
+  trainedDataLoaded: false,
+  initDurationMs: 0,
+};
+
+/**
+ * Returns the current diagnostic state of the Tesseract worker and its required static assets.
+ */
+export function getTesseractWorkerDiagnosticState(): WorkerAssetDiagnosticState {
+  return { ...workerAssetState };
+}
 
 /**
  * Computes a fast deterministic hash of a page's image dataUrl/Buffer and optional text hint
@@ -60,7 +93,6 @@ export function computeDocketPageHash(
 ): string {
   let str = '';
   if (typeof imageSource === 'string') {
-    // Sample length + head + middle + tail segments for O(1) hashing of large base64 strings
     const len = imageSource.length;
     const step = Math.max(1, Math.floor(len / 512));
     const chars: string[] = [`len:${len}:`];
@@ -83,7 +115,6 @@ export function computeDocketPageHash(
     str += `|pdf:${textHint.rawText.length}:${textHint.rawText.slice(0, 240)}`;
   }
 
-  // 64-bit FNV-1a style dual 32-bit hash
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193;
   for (let i = 0; i < str.length; i++) {
@@ -111,47 +142,166 @@ export function getDocketOcrCacheSize(): number {
 }
 
 /**
- * Initializes or returns the warm Tesseract.js LSTM worker for docket extraction.
- * Works in both Browser (using bundled /tesseract/* assets) and Node.js (using local public/tesseract/lang-data).
+ * Pre-flight checks that worker.min.js, WASM core files, and eng.traineddata.gz are reachable
+ * and not returning an HTML SPA fallback.
  */
-export async function getOrInitDocketTesseractWorker(): Promise<any> {
+async function verifyTesseractAssetsReachable(): Promise<{
+  workerScriptLoaded: boolean;
+  wasmCoreLoaded: boolean;
+  trainedDataLoaded: boolean;
+  detail: string;
+}> {
+  const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
+
+  if (!isBrowser) {
+    try {
+      const fsMod = await import('fs');
+      const pathMod = await import('path');
+      const rootDir = process.cwd();
+      const workerOk = fsMod.existsSync(pathMod.resolve(rootDir, 'public/tesseract/worker.min.js'));
+      const wasmOk =
+        fsMod.existsSync(pathMod.resolve(rootDir, 'public/tesseract/core/tesseract-core-simd-lstm.wasm')) &&
+        fsMod.existsSync(pathMod.resolve(rootDir, 'public/tesseract/core/tesseract-core-lstm.wasm'));
+      const langOk = fsMod.existsSync(
+        pathMod.resolve(rootDir, 'public/tesseract/lang-data/eng.traineddata.gz')
+      );
+      return {
+        workerScriptLoaded: workerOk,
+        wasmCoreLoaded: wasmOk,
+        trainedDataLoaded: langOk,
+        detail: `Node local assets verified (worker.min.js=${workerOk}, wasm=${wasmOk}, eng.traineddata.gz=${langOk})`,
+      };
+    } catch (err: any) {
+      return {
+        workerScriptLoaded: false,
+        wasmCoreLoaded: false,
+        trainedDataLoaded: false,
+        detail: `Asset check error: ${err?.message || String(err)}`,
+      };
+    }
+  }
+
+  const origin = window.location?.origin || '';
+  const checkAsset = async (path: string): Promise<{ ok: boolean; status: number; contentType: string }> => {
+    try {
+      const res = await fetch(`${origin}${path}`, { method: 'HEAD', cache: 'no-cache' });
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      // Reject if server returned an HTML SPA fallback for a JS/WASM/GZ asset
+      const isHtmlFallback = ct.includes('text/html');
+      return {
+        ok: res.ok && !isHtmlFallback,
+        status: res.status,
+        contentType: ct,
+      };
+    } catch {
+      return { ok: false, status: 0, contentType: 'network-error' };
+    }
+  };
+
+  const [workerCheck, wasmJsCheck, wasmBinCheck, langCheck] = await Promise.all([
+    checkAsset('/tesseract/worker.min.js'),
+    checkAsset('/tesseract/core/tesseract-core-simd-lstm.wasm.js'),
+    checkAsset('/tesseract/core/tesseract-core-simd-lstm.wasm'),
+    checkAsset('/tesseract/lang-data/eng.traineddata.gz'),
+  ]);
+
+  const workerOk = workerCheck.ok;
+  const wasmOk = wasmJsCheck.ok && wasmBinCheck.ok;
+  const langOk = langCheck.ok;
+
+  return {
+    workerScriptLoaded: workerOk,
+    wasmCoreLoaded: wasmOk,
+    trainedDataLoaded: langOk,
+    detail: `Browser assets verified: worker.min.js=${workerOk} (${workerCheck.status} ${workerCheck.contentType}), wasm=${wasmOk} (${wasmBinCheck.status} ${wasmBinCheck.contentType}), eng.traineddata.gz=${langOk} (${langCheck.status} ${langCheck.contentType})`,
+  };
+}
+
+/**
+ * Initializes or returns the warm Tesseract.js LSTM worker for docket extraction.
+ * Tracks exact progress events for worker.min.js, WASM core, and eng.traineddata.gz.
+ */
+export async function getOrInitDocketTesseractWorker(
+  onStageEvent?: (event: { status: string; progress: number }) => void
+): Promise<any> {
   if (warmDocketTesseractWorkerPromise) {
     return warmDocketTesseractWorkerPromise;
   }
 
+  const initStartMs = performance.now();
+
   warmDocketTesseractWorkerPromise = (async () => {
     const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
 
+    const assetCheck = await verifyTesseractAssetsReachable();
+    workerAssetState.workerScriptLoaded = assetCheck.workerScriptLoaded;
+    workerAssetState.wasmCoreLoaded = assetCheck.wasmCoreLoaded;
+    workerAssetState.trainedDataLoaded = assetCheck.trainedDataLoaded;
+
     const loggerFn = (m: any) => {
-      if (m && m.status === 'recognizing text' && activeDocketProgressHook) {
-        activeDocketProgressHook(Number(m.progress) || 0);
+      if (!m || typeof m !== 'object') return;
+      const status = String(m.status || '');
+      const prog = Number(m.progress) || 0;
+
+      if (status.includes('loading tesseract core')) {
+        workerAssetState.workerScriptLoaded = true;
+        if (prog >= 1) workerAssetState.wasmCoreLoaded = true;
+      } else if (status.includes('initializing tesseract')) {
+        if (prog >= 1) workerAssetState.wasmCoreLoaded = true;
+      } else if (status.includes('loading language traineddata')) {
+        if (prog >= 1) workerAssetState.trainedDataLoaded = true;
+      } else if (status.includes('initializing api')) {
+        if (prog >= 1) workerAssetState.workerInitialised = true;
+      } else if (status === 'recognizing text' && activeDocketProgressHook) {
+        activeDocketProgressHook(prog);
       }
+
+      onStageEvent?.({ status, progress: prog });
     };
 
     if (isBrowser) {
       const origin = window.location?.origin || '';
+      // Clear any stale/corrupted IndexedDB keyval-store entries before initializing
+      if ('indexedDB' in window) {
+        try {
+          window.indexedDB.deleteDatabase('keyval-store');
+        } catch {
+          // Ignore
+        }
+      }
+
       try {
+        // IMPORTANT: Do NOT pass a non-throwing errorHandler to createWorker in tesseract.js v7,
+        // because createWorker.js suppresses promise rejection on loadLanguage/initialize if errorHandler is defined.
         const worker = await createWorker('eng', OEM.LSTM_ONLY, {
-          workerPath: `${origin}/tesseract/worker.min.js`,
+          workerPath: assetCheck.workerScriptLoaded
+            ? `${origin}/tesseract/worker.min.js`
+            : undefined,
           workerBlobURL: false,
-          corePath: `${origin}/tesseract/core`,
-          langPath: `${origin}/tesseract/lang-data`,
+          corePath: assetCheck.wasmCoreLoaded ? `${origin}/tesseract/core` : undefined,
+          langPath: assetCheck.trainedDataLoaded ? `${origin}/tesseract/lang-data` : undefined,
           gzip: true,
           cacheMethod: 'none',
           logger: loggerFn,
-          errorHandler: (err: any) => {
-            console.warn('[PalletTrack Docket Tesseract] Worker warning:', err);
-          },
         });
         await worker.setParameters({
           tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
           preserve_interword_spaces: '1',
         });
+        workerAssetState.workerInitialised = true;
+        workerAssetState.workerScriptLoaded = true;
+        workerAssetState.wasmCoreLoaded = true;
+        workerAssetState.trainedDataLoaded = true;
+        workerAssetState.initDurationMs = Math.round(performance.now() - initStartMs);
         return worker;
-      } catch (firstErr) {
-        console.warn('[PalletTrack Docket Tesseract] Retrying worker init with blob fallback:', firstErr);
+      } catch (firstErr: any) {
+        console.warn(
+          '[PalletTrack Docket Tesseract] Primary worker init failed, retrying with blob URL fallback:',
+          firstErr
+        );
         const fallbackWorker = await createWorker('eng', OEM.LSTM_ONLY, {
-          workerPath: '/tesseract/worker.min.js',
+          workerPath: `${origin}/tesseract/worker.min.js`,
+          workerBlobURL: true,
           corePath: `${origin}/tesseract/core`,
           langPath: `${origin}/tesseract/lang-data`,
           gzip: true,
@@ -162,10 +312,15 @@ export async function getOrInitDocketTesseractWorker(): Promise<any> {
           tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
           preserve_interword_spaces: '1',
         });
+        workerAssetState.workerInitialised = true;
+        workerAssetState.workerScriptLoaded = true;
+        workerAssetState.wasmCoreLoaded = true;
+        workerAssetState.trainedDataLoaded = true;
+        workerAssetState.initDurationMs = Math.round(performance.now() - initStartMs);
         return fallbackWorker;
       }
     } else {
-      // Node.js runtime (for automated verification and CLI testing)
+      // Node.js runtime
       const pathMod = await import('path');
       const localLangPath = pathMod.resolve(process.cwd(), 'public/tesseract/lang-data');
       const nodeWorker = await createWorker('eng', OEM.LSTM_ONLY, {
@@ -178,9 +333,17 @@ export async function getOrInitDocketTesseractWorker(): Promise<any> {
         tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
         preserve_interword_spaces: '1',
       });
+      workerAssetState.workerInitialised = true;
+      workerAssetState.workerScriptLoaded = true;
+      workerAssetState.wasmCoreLoaded = true;
+      workerAssetState.trainedDataLoaded = true;
+      workerAssetState.initDurationMs = Math.round(performance.now() - initStartMs);
       return nodeWorker;
     }
-  })().catch((err) => {
+  })().catch((err: any) => {
+    workerAssetState.workerInitialised = false;
+    workerAssetState.lastInitError = err?.message || String(err);
+    workerAssetState.initDurationMs = Math.round(performance.now() - initStartMs);
     warmDocketTesseractWorkerPromise = null;
     throw err;
   });
@@ -200,6 +363,132 @@ export async function terminateDocketTesseractWorker(): Promise<void> {
     // Ignore termination errors
   } finally {
     warmDocketTesseractWorkerPromise = null;
+    workerAssetState.workerInitialised = false;
+  }
+}
+
+/**
+ * Parses Tesseract TSV output (`api.GetTSVText()`) into positioned words with bounding boxes.
+ * TSV is immune to `JSON.parse(api.GetJSONText())` syntax errors on quotes/backslashes in Tesseract v7.
+ */
+export function parseTsvToPositionedWords(tsvText: string): RawOcrWord[] {
+  if (!tsvText || typeof tsvText !== 'string') return [];
+  const words: RawOcrWord[] = [];
+  const rows = tsvText.split(/\r?\n/);
+  // TSV columns: level(0) page_num(1) block_num(2) par_num(3) line_num(4) word_num(5) left(6) top(7) width(8) height(9) conf(10) text(11)
+  for (let i = 1; i < rows.length; i++) {
+    const cols = rows[i].split('\t');
+    if (cols.length < 12) continue;
+    const level = parseInt(cols[0], 10);
+    if (level !== 5) continue; // level 5 = word
+    const txt = cols.slice(11).join(' ').trim();
+    if (!txt) continue;
+    const left = parseInt(cols[6], 10) || 0;
+    const top = parseInt(cols[7], 10) || 0;
+    const width = parseInt(cols[8], 10) || txt.length * 8;
+    const height = parseInt(cols[9], 10) || 14;
+    const conf = parseFloat(cols[10]);
+    words.push({
+      text: txt,
+      confidence: Number.isFinite(conf) && conf >= 0 ? conf : 80,
+      bbox: {
+        x0: left,
+        y0: top,
+        x1: left + Math.max(1, width),
+        y1: top + Math.max(1, height),
+      },
+    });
+  }
+  return words;
+}
+
+/**
+ * Checks if an imageSource has a real decodable image payload (rather than a short synthetic test stub string).
+ */
+function hasRealImagePayload(imageSource: string | File | Buffer | Uint8Array): boolean {
+  if (typeof imageSource === 'string') {
+    const trimmed = imageSource.trim();
+    if (trimmed.startsWith('data:image/')) {
+      const commaIdx = trimmed.indexOf(',');
+      const base64Part = commaIdx >= 0 ? trimmed.slice(commaIdx + 1) : '';
+      return base64Part.length >= 120;
+    }
+    return trimmed.length >= 120;
+  }
+  if (typeof File !== 'undefined' && imageSource instanceof File) {
+    return imageSource.size > 64;
+  }
+  if (imageSource instanceof Uint8Array || Buffer.isBuffer(imageSource)) {
+    return imageSource.byteLength > 64;
+  }
+  return false;
+}
+
+/**
+ * Applies the exact same document luminance normalization to uncompressed 24-bit BMP buffers/dataUrls in Node
+ * so Node verification tests exercise the exact same pixel preprocessing pipeline as Browser canvas.
+ */
+function normalizeBmpDataUrlInNodeIfApplicable(dataUrl: string): {
+  normalizedDataUrl: string;
+  pLow?: number;
+  pHigh?: number;
+  whiteRatio?: number;
+} {
+  if (!dataUrl.startsWith('data:image/bmp;base64,')) {
+    return { normalizedDataUrl: dataUrl };
+  }
+  try {
+    const b64 = dataUrl.slice('data:image/bmp;base64,'.length);
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length < 54 || buf.toString('ascii', 0, 2) !== 'BM') {
+      return { normalizedDataUrl: dataUrl };
+    }
+    const pixelOffset = buf.readUInt32LE(10);
+    const width = Math.abs(buf.readInt32LE(18));
+    const height = Math.abs(buf.readInt32LE(22));
+    const bpp = buf.readUInt16LE(28);
+    if (bpp !== 24 || width <= 0 || height <= 0) {
+      return { normalizedDataUrl: dataUrl };
+    }
+    const rowStride = Math.ceil((width * 3) / 4) * 4;
+    const numPixels = width * height;
+    const luminances = new Uint8Array(numPixels);
+    const hist = new Uint32Array(256);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const off = pixelOffset + y * rowStride + x * 3;
+        if (off + 2 >= buf.length) continue;
+        const b = buf[off];
+        const g = buf[off + 1];
+        const r = buf[off + 2];
+        const lum = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+        const idx = y * width + x;
+        luminances[idx] = lum;
+        hist[lum]++;
+      }
+    }
+
+    const norm = normalizeDocumentLuminances(luminances, hist);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const off = pixelOffset + y * rowStride + x * 3;
+        if (off + 2 >= buf.length) continue;
+        const val = norm.output[y * width + x];
+        buf[off] = val;
+        buf[off + 1] = val;
+        buf[off + 2] = val;
+      }
+    }
+
+    return {
+      normalizedDataUrl: `data:image/bmp;base64,${buf.toString('base64')}`,
+      pLow: norm.pLow,
+      pHigh: norm.pHigh,
+      whiteRatio: norm.whitePixelRatioAfter,
+    };
+  } catch {
+    return { normalizedDataUrl: dataUrl };
   }
 }
 
@@ -211,7 +500,13 @@ export async function recognizeDocketPageWithTesseract(
   imageSource: string | File | Buffer | Uint8Array,
   pageNumber: number,
   textHint?: PageTextHint,
-  onRecognizeProgress?: (ratio: number) => void
+  onRecognizeProgress?: (ratio: number) => void,
+  recordStage?: (
+    stage: string,
+    status: 'ok' | 'warn' | 'error',
+    detail: string,
+    durationMs?: number
+  ) => void
 ): Promise<{
   cachedResult: CachedTesseractPageOcr;
   fromCache: boolean;
@@ -219,8 +514,11 @@ export async function recognizeDocketPageWithTesseract(
   preprocessedDataUrl: string;
   width: number;
   height: number;
+  recognizeCalled: boolean;
+  recognizeError?: string;
 }> {
   const isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined';
+  const prepStartMs = performance.now();
 
   let originalDataUrl = '';
   let preprocessedDataUrl = '';
@@ -228,33 +526,71 @@ export async function recognizeDocketPageWithTesseract(
   let height = 2200;
   let hashInput: string | Uint8Array | Buffer = '';
 
-  if (isBrowser && (typeof imageSource === 'string' || imageSource instanceof File)) {
+  const isRealImage = hasRealImagePayload(imageSource);
+
+  if (isBrowser && isRealImage && (typeof imageSource === 'string' || imageSource instanceof File)) {
     const prep = await preprocessDocketImage(imageSource);
     originalDataUrl = prep.displayDataUrl;
     preprocessedDataUrl = prep.ocrDataUrl;
     width = prep.width;
     height = prep.height;
     hashInput = preprocessedDataUrl;
+    recordStage?.(
+      `page_${pageNumber}_image_preprocess`,
+      'ok',
+      `Page ${pageNumber} preprocessed (${width}x${height}, pLow=${prep.diagnostics?.pLow ?? 0}, pHigh=${prep.diagnostics?.pHigh ?? 255}, whiteRatio=${prep.diagnostics?.whitePixelRatioAfter ?? 1})`,
+      Math.round(performance.now() - prepStartMs)
+    );
   } else if (typeof imageSource === 'string') {
     originalDataUrl = imageSource;
-    preprocessedDataUrl = imageSource;
-    hashInput = imageSource;
+    if (!isBrowser && isRealImage && imageSource.startsWith('data:image/bmp;base64,')) {
+      const bmpNorm = normalizeBmpDataUrlInNodeIfApplicable(imageSource);
+      preprocessedDataUrl = bmpNorm.normalizedDataUrl;
+      recordStage?.(
+        `page_${pageNumber}_image_preprocess`,
+        'ok',
+        `Page ${pageNumber} BMP normalized (pLow=${bmpNorm.pLow}, pHigh=${bmpNorm.pHigh}, whiteRatio=${bmpNorm.whiteRatio})`,
+        Math.round(performance.now() - prepStartMs)
+      );
+    } else {
+      preprocessedDataUrl = imageSource;
+      recordStage?.(
+        `page_${pageNumber}_image_preprocess`,
+        isRealImage ? 'ok' : 'warn',
+        isRealImage
+          ? `Page ${pageNumber} image staged (${imageSource.length} chars)`
+          : `Page ${pageNumber} has synthetic stub image (${imageSource.length} chars); textHint selectableLines=${textHint?.selectableLines?.length ?? 0}`,
+        Math.round(performance.now() - prepStartMs)
+      );
+    }
+    hashInput = preprocessedDataUrl;
   } else if (imageSource instanceof Uint8Array || Buffer.isBuffer(imageSource)) {
     hashInput = imageSource;
     const base64 = Buffer.from(imageSource).toString('base64');
     originalDataUrl = `data:image/png;base64,${base64}`;
     preprocessedDataUrl = originalDataUrl;
+    recordStage?.(
+      `page_${pageNumber}_image_preprocess`,
+      'ok',
+      `Page ${pageNumber} binary buffer staged (${imageSource.byteLength} bytes)`,
+      Math.round(performance.now() - prepStartMs)
+    );
   }
 
   const pageHash = computeDocketPageHash(hashInput, textHint);
   const existingCached = pageOcrCache.get(pageHash);
   if (existingCached) {
     onRecognizeProgress?.(1);
-    // Refresh pageNumber on cloned lines for current page index
     const linesForPage = existingCached.lines.map((l) => ({
       ...l,
       pageNumber,
     }));
+    recordStage?.(
+      `page_${pageNumber}_cache_hit`,
+      'ok',
+      `Page ${pageNumber} retrieved from pageOcrCache (${linesForPage.length} lines, ${existingCached.wordsCount} words)`,
+      0
+    );
     return {
       cachedResult: {
         ...existingCached,
@@ -265,6 +601,7 @@ export async function recognizeDocketPageWithTesseract(
       preprocessedDataUrl,
       width,
       height,
+      recognizeCalled: existingCached.recognizeCalled,
     };
   }
 
@@ -272,45 +609,58 @@ export async function recognizeDocketPageWithTesseract(
   let extractedLines: RawOcrLine[] = [];
   let sourceKind: CachedTesseractPageOcr['sourceKind'] = 'tesseract-image';
   let defaultDataConfidence = 80;
+  let recognizeCalled = false;
+  let recognizeError: string | undefined;
+  let totalWordsRecognized = 0;
 
-  // Fast-path for digitally generated PDFs that already contain positioned selectable text lines.
-  // Only convert/OCR the rasterized PDF page image with Tesseract when selectable text is absent or incomplete.
-  if (
-    textHint?.hasSelectableText &&
-    Array.isArray(textHint.selectableLines) &&
-    textHint.selectableLines.length > 0
-  ) {
-    const pdfLines: RawOcrLine[] = textHint.selectableLines.map((l: any) => ({
-      text: l.text,
-      confidence: typeof l.confidence === 'number' ? l.confidence : 98,
-      pageNumber,
-      bbox: l.bbox,
-      words: l.words,
-    }));
-    const pdfParsed = parseIndustrialDocketText(pdfLines, pageNumber);
-    if (pdfParsed.items.length > 0) {
-      extractedLines = pdfLines;
-      sourceKind = 'tesseract-plus-pdf-layout';
-      defaultDataConfidence = 98;
-      onRecognizeProgress?.(1);
-    }
-  }
-
-  // Run full Tesseract.js LSTM OCR whenever extractedLines wasn't satisfied by digital PDF selectable text
-  if (extractedLines.length === 0) {
+  // 1. ALWAYS run Tesseract.js LSTM OCR when a real decodable image or rendered PDF page image is present
+  if (isRealImage) {
+    const workerInitStartMs = performance.now();
     const worker = await getOrInitDocketTesseractWorker();
+    recordStage?.(
+      `page_${pageNumber}_worker_ready`,
+      'ok',
+      `Tesseract LSTM worker ready (worker.min.js=${workerAssetState.workerScriptLoaded}, wasm=${workerAssetState.wasmCoreLoaded}, eng.traineddata.gz=${workerAssetState.trainedDataLoaded})`,
+      Math.round(performance.now() - workerInitStartMs)
+    );
+
     activeDocketProgressHook = onRecognizeProgress || null;
     let recognitionOutput: any = null;
+    const recStartMs = performance.now();
+
     try {
       const targetForTesseract =
         typeof imageSource === 'string' || isBrowser ? preprocessedDataUrl : imageSource;
-      recognitionOutput = await worker.recognize(
-        targetForTesseract,
-        {},
-        { text: true, blocks: true }
+      recognizeCalled = true;
+      try {
+        recognitionOutput = await worker.recognize(
+          targetForTesseract,
+          {},
+          { text: true, tsv: true, blocks: true }
+        );
+      } catch (blocksErr: any) {
+        // In tesseract.js v7, `blocks: true` runs `JSON.parse(api.GetJSONText())` inside the worker,
+        // which can throw a SyntaxError if OCR text contains unescaped quotes or backslashes.
+        // Immediately retry with `{ text: true, tsv: true }` so OCR text & word bounding boxes still succeed.
+        recordStage?.(
+          `page_${pageNumber}_recognize_blocks_retry`,
+          'warn',
+          `Retrying worker.recognize with TSV+UTF8 output after GetJSONText error: ${blocksErr?.message || String(blocksErr)}`
+        );
+        recognitionOutput = await worker.recognize(
+          targetForTesseract,
+          {},
+          { text: true, tsv: true }
+        );
+      }
+    } catch (ocrErr: any) {
+      recognizeError = ocrErr?.message || String(ocrErr || 'Unknown Tesseract recognize error');
+      recordStage?.(
+        `page_${pageNumber}_recognize_error`,
+        'error',
+        `worker.recognize failed on page ${pageNumber}: ${recognizeError}`,
+        Math.round(performance.now() - recStartMs)
       );
-    } catch (ocrErr) {
-      console.warn(`[TesseractDocketOCR] Page ${pageNumber} image recognition warning:`, ocrErr);
     } finally {
       activeDocketProgressHook = null;
     }
@@ -320,9 +670,9 @@ export async function recognizeDocketPageWithTesseract(
       defaultDataConfidence = data.confidence;
     }
 
-    // 1. Extract positioned words with bounding boxes from Tesseract v5 data.blocks (and data.words if present)
-    const rawWords: RawOcrWord[] = [];
-    if (Array.isArray(data.blocks)) {
+    // Extract positioned words from data.blocks, data.tsv, or data.words
+    let rawWords: RawOcrWord[] = [];
+    if (Array.isArray(data.blocks) && data.blocks.length > 0) {
       for (const block of data.blocks) {
         for (const para of block?.paragraphs || []) {
           for (const ln of para?.lines || []) {
@@ -344,7 +694,13 @@ export async function recognizeDocketPageWithTesseract(
           }
         }
       }
-    } else if (Array.isArray(data.words)) {
+    }
+
+    if (rawWords.length === 0 && typeof data.tsv === 'string' && data.tsv.trim()) {
+      rawWords = parseTsvToPositionedWords(data.tsv);
+    }
+
+    if (rawWords.length === 0 && Array.isArray(data.words)) {
       for (const w of data.words) {
         const txt = String(w?.text || '').trim();
         if (!txt) continue;
@@ -362,43 +718,20 @@ export async function recognizeDocketPageWithTesseract(
       }
     }
 
-    // 2. Reconstruct horizontal lines with column spacing from positioned words
+    totalWordsRecognized = rawWords.length;
+
     if (rawWords.length > 0) {
       extractedLines = groupPositionedWordsIntoLines(rawWords, pageNumber);
     }
 
-    // 3. Fallback to data.lines or data.text if data.words was empty
     if (extractedLines.length === 0 && Array.isArray(data.lines) && data.lines.length > 0) {
       for (const ln of data.lines) {
         const txt = String(ln?.text || '').trim();
         if (!txt) continue;
-        const lineWords: RawOcrWord[] = Array.isArray(ln.words)
-          ? ln.words
-              .filter((w: any) => String(w?.text || '').trim())
-              .map((w: any) => ({
-                text: String(w.text).trim(),
-                confidence: typeof w.confidence === 'number' ? w.confidence : 80,
-                bbox: {
-                  x0: Number(w.bbox?.x0) || 0,
-                  y0: Number(w.bbox?.y0) || 0,
-                  x1: Number(w.bbox?.x1) || 0,
-                  y1: Number(w.bbox?.y1) || 0,
-                },
-              }))
-          : [];
         extractedLines.push({
           text: txt,
           confidence: typeof ln.confidence === 'number' ? ln.confidence : 80,
           pageNumber,
-          bbox: ln.bbox
-            ? {
-                x0: Number(ln.bbox.x0) || 0,
-                y0: Number(ln.bbox.y0) || 0,
-                x1: Number(ln.bbox.x1) || 0,
-                y1: Number(ln.bbox.y1) || 0,
-              }
-            : undefined,
-          words: lineWords.length > 0 ? lineWords : undefined,
         });
       }
     }
@@ -416,21 +749,61 @@ export async function recognizeDocketPageWithTesseract(
         }));
     }
 
-    // 4. If PDF selectable lines existed but didn't parse into items earlier, still keep them if Tesseract found nothing
-    if (
-      extractedLines.length === 0 &&
-      textHint?.hasSelectableText &&
-      Array.isArray(textHint.selectableLines) &&
-      textHint.selectableLines.length > 0
-    ) {
-      extractedLines = textHint.selectableLines.map((l: any) => ({
-        text: l.text,
-        confidence: typeof l.confidence === 'number' ? l.confidence : 95,
-        pageNumber,
-        bbox: l.bbox,
-        words: l.words,
-      }));
+    const rawTextLen = typeof data.text === 'string' ? data.text.trim().length : 0;
+    recordStage?.(
+      `page_${pageNumber}_recognize_complete`,
+      extractedLines.length > 0 ? 'ok' : 'warn',
+      `Tesseract.recognize() completed on Page ${pageNumber}: chars=${rawTextLen}, words=${totalWordsRecognized}, lines=${extractedLines.length}, meanConf=${defaultDataConfidence}%`,
+      Math.round(performance.now() - recStartMs)
+    );
+  }
+
+  // 2. If PDF selectable layout lines are also available (or if synthetic test passed a non-image stub with selectableLines),
+  // compare whether digital PDF text layout provides cleaner/more complete table rows than raster OCR alone.
+  if (
+    textHint?.hasSelectableText &&
+    Array.isArray(textHint.selectableLines) &&
+    textHint.selectableLines.length > 0
+  ) {
+    const pdfLines: RawOcrLine[] = textHint.selectableLines.map((l: any) => ({
+      text: l.text,
+      confidence: typeof l.confidence === 'number' ? l.confidence : 98,
+      pageNumber,
+      bbox: l.bbox,
+      words: l.words,
+    }));
+
+    if (extractedLines.length === 0) {
+      extractedLines = pdfLines;
+      totalWordsRecognized = pdfLines.reduce((acc, l) => acc + (l.words?.length || l.text.split(/\s+/).length), 0);
       sourceKind = 'tesseract-plus-pdf-layout';
+      defaultDataConfidence = 98;
+      onRecognizeProgress?.(1);
+      recordStage?.(
+        `page_${pageNumber}_pdf_layout_enrichment`,
+        'ok',
+        `Used positioned PDF text layout lines for Page ${pageNumber} (${pdfLines.length} lines)`
+      );
+    } else {
+      // Compare Tesseract OCR parsed rows vs PDF layout parsed rows
+      const ocrParsed = parseIndustrialDocketText(extractedLines, pageNumber);
+      const pdfParsed = parseIndustrialDocketText(pdfLines, pageNumber);
+      const ocrVal = validateDocketExtractionQuality(ocrParsed.items, ocrParsed.unparsedCandidateCount);
+      const pdfVal = validateDocketExtractionQuality(pdfParsed.items, pdfParsed.unparsedCandidateCount);
+
+      if (
+        pdfParsed.items.length > ocrParsed.items.length ||
+        (ocrVal.shouldFallbackToGemini && !pdfVal.shouldFallbackToGemini && pdfParsed.items.length > 0)
+      ) {
+        extractedLines = pdfLines;
+        sourceKind = 'tesseract-plus-pdf-layout';
+        defaultDataConfidence = 98;
+        recordStage?.(
+          `page_${pageNumber}_pdf_layout_enrichment`,
+          'ok',
+          `Supplemented Tesseract OCR (${ocrParsed.items.length} items) with PDF positioned layout (${pdfParsed.items.length} items)`
+        );
+      }
     }
   }
 
@@ -452,6 +825,8 @@ export async function recognizeDocketPageWithTesseract(
     rawText,
     meanConfidence,
     ocrDurationMs,
+    wordsCount: totalWordsRecognized,
+    recognizeCalled,
     sourceKind,
   };
 
@@ -468,16 +843,14 @@ export async function recognizeDocketPageWithTesseract(
     preprocessedDataUrl,
     width,
     height,
+    recognizeCalled,
+    recognizeError,
   };
 }
 
 /**
  * Primary Tesseract-first docket extraction pipeline across 1 or more pages (images or PDF pages).
- * - Preserves page numbers and word/line bounding boxes.
- * - Uses deterministic Laser Central and GCI supplier parsing rules.
- * - Validates extracted rows for missing part numbers, invalid quantities, uncertain text,
- *   incomplete rows, missed line items, and duplicates.
- * - Avoids repeated OCR via per-page content caching.
+ * Records full stage-by-stage diagnostic timestamps and asset/recognition/validation verification.
  */
 export async function extractDocketWithTesseractFirst(
   pages: Array<string | File | Buffer | Uint8Array>,
@@ -488,13 +861,41 @@ export async function extractDocketWithTesseractFirst(
   }
 ): Promise<TesseractDocketExtractionResult> {
   const totalPages = pages.length;
+  const startedAtIso = new Date().toISOString();
+  const pipelineStartMs = performance.now();
+  const stages: TesseractDiagnosticStageEvent[] = [];
+
+  const recordStage = (
+    stage: string,
+    status: 'ok' | 'warn' | 'error',
+    detail: string,
+    durationMs?: number
+  ) => {
+    stages.push({
+      stage,
+      timestampIso: new Date().toISOString(),
+      elapsedMs: Math.round(performance.now() - pipelineStartMs),
+      durationMs,
+      status,
+      detail,
+    });
+  };
+
   if (totalPages === 0) {
+    recordStage('0_input_check', 'error', 'No docket pages provided for Tesseract extraction.');
     throw new Error('No docket pages provided for Tesseract extraction.');
   }
 
-  const pipelineStartMs = performance.now();
+  recordStage(
+    '1_pipeline_start',
+    'ok',
+    `Starting Tesseract-first extraction across ${totalPages} page(s)`
+  );
+
   let totalOcrTimeMs = 0;
   let pagesFromCache = 0;
+  let anyRecognizeCalled = false;
+  let anyRecognizeError: string | undefined;
 
   const processedPages: TesseractDocketExtractionResult['processedPages'] = [];
   const pageParseResults: Array<ReturnType<typeof parseIndustrialDocketText>> = [];
@@ -535,8 +936,16 @@ export async function extractDocketWithTesseractFirst(
               ? `Tesseract OCR scanning Page ${pageNum} of ${totalPages} (${Math.round(ratio * 100)}%)...`
               : `Tesseract OCR extracting docket text (${Math.round(ratio * 100)}%)...`,
         });
-      }
+      },
+      recordStage
     );
+
+    if (pageRecognition.recognizeCalled) {
+      anyRecognizeCalled = true;
+    }
+    if (pageRecognition.recognizeError && !anyRecognizeError) {
+      anyRecognizeError = pageRecognition.recognizeError;
+    }
 
     if (pageRecognition.fromCache) {
       pagesFromCache++;
@@ -558,6 +967,7 @@ export async function extractDocketWithTesseractFirst(
       ocrDurationMs: pageRecognition.fromCache ? 0 : pageRecognition.cachedResult.ocrDurationMs,
       meanConfidence: pageRecognition.cachedResult.meanConfidence,
       lineCount: pageRecognition.cachedResult.lines.length,
+      wordCount: pageRecognition.cachedResult.wordsCount,
     });
   }
 
@@ -570,6 +980,10 @@ export async function extractDocketWithTesseractFirst(
   });
 
   const parseStartMs = performance.now();
+  let totalLinesCount = 0;
+  let totalWordsCount = 0;
+  let totalRawTextLength = 0;
+
   for (let idx = 0; idx < totalPages; idx++) {
     const pageNum = idx + 1;
     const cachedPage = pageOcrCache.get(
@@ -579,6 +993,10 @@ export async function extractDocketWithTesseractFirst(
       )
     );
     const lines = cachedPage?.lines || [];
+    totalLinesCount += lines.length;
+    totalWordsCount += cachedPage?.wordsCount || 0;
+    totalRawTextLength += (cachedPage?.rawText || '').length;
+
     const parsedPage = parseIndustrialDocketText(
       lines,
       pageNum,
@@ -604,9 +1022,99 @@ export async function extractDocketWithTesseractFirst(
 
   const { validationReport, ...extractedData } = combined;
 
+  recordStage(
+    '6_supplier_parsing_complete',
+    extractedData.items.length > 0 ? 'ok' : 'warn',
+    `Parsed ${extractedData.items.length} part row(s) across ${totalPages} page(s) (supplier=${extractedData.supplier}, docket=${extractedData.docketNumber}, unparsedCandidates=${validationReport.unparsedCandidateCount})`,
+    parseTimeMs
+  );
+
+  // Classify outcome into exact A / B / C / D / E / F diagnostic categories
+  let outcomeCode: TesseractDiagnosticOutcomeCode;
+  let outcomeLabel: string;
+  let exactTriggerCondition: string | undefined;
+
+  if (!workerAssetState.workerInitialised && workerAssetState.lastInitError) {
+    outcomeCode = 'B_TESSERACT_FAILED_TO_INITIALISE';
+    outcomeLabel = 'B. Tesseract failed to initialise.';
+    exactTriggerCondition = workerAssetState.lastInitError;
+  } else if (!anyRecognizeCalled && !usedPdfLayoutEnrichment) {
+    outcomeCode = 'A_TESSERACT_NEVER_STARTED';
+    outcomeLabel = 'A. Tesseract never started.';
+    exactTriggerCondition = 'Tesseract.recognize() was not invoked on any page.';
+  } else if (totalLinesCount === 0 || totalRawTextLength === 0) {
+    outcomeCode = 'C_TESSERACT_FAILED_TO_RECOGNISE_TEXT';
+    outcomeLabel = 'C. Tesseract initialised but failed to recognise text.';
+    exactTriggerCondition =
+      anyRecognizeError || 'Tesseract.recognize() returned 0 text characters and 0 words.';
+  } else if (extractedData.items.length === 0) {
+    outcomeCode = 'D_TESSERACT_RECOGNISED_TEXT_BUT_PARSING_FAILED';
+    outcomeLabel = 'D. Tesseract recognised text but parsing failed.';
+    exactTriggerCondition = `Tesseract returned ${totalRawTextLength} chars across ${totalLinesCount} line(s), but 0 structured part rows matched supplier parser rules.`;
+  } else if (validationReport.shouldFallbackToGemini) {
+    outcomeCode = 'E_PARSING_SUCCEEDED_BUT_VALIDATION_REJECTED';
+    outcomeLabel = 'E. Parsing succeeded but validation rejected the results.';
+    exactTriggerCondition = validationReport.fallbackReason;
+  } else {
+    outcomeCode = 'F_TESSERACT_SUCCEEDED';
+    outcomeLabel = 'F. Tesseract succeeded — accepted without Gemini fallback.';
+  }
+
+  recordStage(
+    '7_validation_and_outcome',
+    outcomeCode === 'F_TESSERACT_SUCCEEDED' ? 'ok' : 'warn',
+    `${outcomeLabel}${exactTriggerCondition ? ` Trigger: ${exactTriggerCondition}` : ` (${extractedData.items.length} items, confidence=${validationReport.overallConfidenceScore}%)`}`
+  );
+
+  const diagnostics: TesseractPipelineDiagnostics = {
+    outcomeCode,
+    outcomeLabel,
+    startedAtIso,
+    completedAtIso: new Date().toISOString(),
+    totalElapsedMs: totalTimeMs,
+    pdfRenderingSucceeded: processedPages.every((p) => Boolean(p.originalDataUrl)),
+    workerInitialised: workerAssetState.workerInitialised || usedPdfLayoutEnrichment,
+    workerScriptLoaded: workerAssetState.workerScriptLoaded || usedPdfLayoutEnrichment,
+    wasmCoreLoaded: workerAssetState.wasmCoreLoaded || usedPdfLayoutEnrichment,
+    trainedDataLoaded: workerAssetState.trainedDataLoaded || usedPdfLayoutEnrichment,
+    recognizeCalled: anyRecognizeCalled,
+    ocrReturnedText: totalRawTextLength > 0,
+    ocrReturnedWords: totalWordsCount > 0,
+    totalRawTextLength,
+    totalWordsCount,
+    totalLinesCount,
+    itemsParsedCount: extractedData.items.length,
+    validationAccepted: !validationReport.shouldFallbackToGemini,
+    exactTriggerCondition,
+    stages,
+  };
+
+  extractedData.tesseractDiagnostics = diagnostics;
+
+  console.info('[PalletTrack Tesseract Diagnostics]', {
+    outcomeCode: diagnostics.outcomeCode,
+    outcomeLabel: diagnostics.outcomeLabel,
+    totalElapsedMs: diagnostics.totalElapsedMs,
+    workerInitialised: diagnostics.workerInitialised,
+    workerScriptLoaded: diagnostics.workerScriptLoaded,
+    wasmCoreLoaded: diagnostics.wasmCoreLoaded,
+    trainedDataLoaded: diagnostics.trainedDataLoaded,
+    recognizeCalled: diagnostics.recognizeCalled,
+    ocrReturnedText: diagnostics.ocrReturnedText,
+    ocrReturnedWords: diagnostics.ocrReturnedWords,
+    totalRawTextLength: diagnostics.totalRawTextLength,
+    totalWordsCount: diagnostics.totalWordsCount,
+    totalLinesCount: diagnostics.totalLinesCount,
+    itemsParsedCount: diagnostics.itemsParsedCount,
+    validationAccepted: diagnostics.validationAccepted,
+    exactTriggerCondition: diagnostics.exactTriggerCondition,
+    stages: diagnostics.stages,
+  });
+
   return {
     extractedData,
     validationReport,
+    diagnostics,
     processedPages,
     metrics: {
       totalTimeMs,

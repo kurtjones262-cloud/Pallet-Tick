@@ -63,7 +63,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          cacheId: 'pallettick-pwa-v2',
+          cacheId: 'pallettick-pwa-v3',
           cleanupOutdatedCaches: true,
           clientsClaim: true,
           skipWaiting: true,
@@ -71,13 +71,18 @@ export default defineConfig(() => {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           globIgnores: ['**/assets/aistudio/**', '**/tesseract/**'],
           navigateFallback: '/index.html',
-          navigateFallbackDenylist: [/^\/api\//, /\.zip$/i],
+          navigateFallbackDenylist: [
+            /^\/api\//,
+            /^\/tesseract\//i,
+            /pdf\.worker/i,
+            /\.(?:wasm|gz|traineddata|mjs|zip)$/i,
+          ],
           runtimeCaching: [
             {
               urlPattern: /^\/tesseract\/.*/i,
               handler: 'CacheFirst',
               options: {
-                cacheName: 'tesseract-offline-assets',
+                cacheName: 'tesseract-offline-assets-v3',
                 expiration: {
                   maxEntries: 60,
                   maxAgeSeconds: 60 * 60 * 24 * 365, // 1 year

@@ -838,6 +838,38 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
 
     // Also handle single-space separated headers when words weren't pre-segmented
     if (matchedCols.length < 3) {
+      if (line.words && line.words.length >= 3) {
+        const wordCols: TableColumnBand[] = [];
+        const wordKeys = new Set<TableColumnBand['key']>();
+        for (const w of line.words) {
+          const cleanTok = w.text.replace(/[^A-Za-z0-9#]/g, '');
+          if (!cleanTok) continue;
+          for (const rule of HEADER_TOKEN_MAP) {
+            if (!wordKeys.has(rule.key) && rule.pattern.test(cleanTok)) {
+              wordKeys.add(rule.key);
+              wordCols.push({
+                key: rule.key,
+                x0: w.bbox.x0,
+                x1: w.bbox.x1,
+                xCenter: (w.bbox.x0 + w.bbox.x1) / 2,
+              });
+              break;
+            }
+          }
+        }
+        if (
+          wordCols.length >= 3 &&
+          (wordKeys.has('partNumber') || wordKeys.has('description')) &&
+          wordKeys.has('quantity')
+        ) {
+          return {
+            headerLineIndex: i,
+            columns: wordCols.sort((a, b) => a.x0 - b.x0),
+            hasPositionalCoords: true,
+          };
+        }
+      }
+
       const tokens = raw.split(/\s+/);
       let charPos = 0;
       const fallbackCols: TableColumnBand[] = [];
@@ -868,7 +900,8 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
         return {
           headerLineIndex: i,
           columns: fallbackCols.sort((a, b) => a.x0 - b.x0),
-          hasPositionalCoords: Boolean(line.words && line.words.length > 0),
+          // Character-offset columns must NOT be compared against pixel word bounding boxes
+          hasPositionalCoords: false,
         };
       }
     }
@@ -1236,9 +1269,16 @@ function extractColumnCellsFromLayout(
   // Case A: Word-level bounding boxes available
   if (layout.hasPositionalCoords && line.words && line.words.length >= 2) {
     const buckets: Partial<Record<TableColumnBand['key'], string[]>> = {};
+    const firstColX = layout.columns[0].x0;
+    const lastColX = layout.columns[layout.columns.length - 1].x1;
+    const tableSpan = Math.max(250, lastColX - firstColX);
+    const maxAllowedDist = Math.max(120, tableSpan * 0.28);
+
     for (const w of line.words) {
       const cleanW = w.text.replace(/^\||\|$/g, '').trim();
       if (!cleanW) continue;
+      // Ignore standalone currency values from unmapped invoice price columns
+      if (/^\$\d+(?:,\d{3})*(?:\.\d{2})?$/.test(cleanW)) continue;
       const wCenter = (w.bbox.x0 + w.bbox.x1) / 2;
 
       // Find the column whose horizontal band best contains or is closest to wCenter
@@ -1254,8 +1294,10 @@ function extractColumnCellsFromLayout(
           bestCol = col;
         }
       }
-      if (!buckets[bestCol.key]) buckets[bestCol.key] = [];
-      buckets[bestCol.key]!.push(cleanW);
+      if (bestDist <= maxAllowedDist) {
+        if (!buckets[bestCol.key]) buckets[bestCol.key] = [];
+        buckets[bestCol.key]!.push(cleanW);
+      }
     }
 
     const result: Partial<Record<TableColumnBand['key'], string>> = {};

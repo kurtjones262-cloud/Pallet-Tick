@@ -637,7 +637,11 @@ export default {
       if (assetRes.status !== 404) {
         return assetRes;
       }
-      if (request.method === 'GET' || request.method === 'HEAD') {
+      const isStaticAssetPath =
+        url.pathname.startsWith('/tesseract/') ||
+        url.pathname.startsWith('/assets/') ||
+        /\.(?:js|mjs|wasm|gz|traineddata|css|map|png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(url.pathname);
+      if (!isStaticAssetPath && (request.method === 'GET' || request.method === 'HEAD')) {
         const indexUrl = new URL('/', request.url);
         return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
       }

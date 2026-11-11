@@ -52,6 +52,8 @@ function computeExponentialBackoffWithJitter(retryAttempt, baseDelayMs = INITIAL
   const jitter = Math.floor(Math.random() * 650);
   return Math.min(2e4, exponentialDelay + jitter);
 }
+var modelQuotaCooldownUntil = /* @__PURE__ */ new Map();
+var MODEL_COOLDOWN_DURATION_MS = 10 * 60 * 1e3;
 function classifyGeminiError(err) {
   const rawMessage = String(err?.message || err || "Unknown Gemini API error").replace(
     /key=[A-Za-z0-9_\-]+/gi,
@@ -59,7 +61,7 @@ function classifyGeminiError(err) {
   );
   let statusCode = Number(err?.status || err?.statusCode || err?.httpStatus || 0);
   if (!statusCode) {
-    const codeMatch = rawMessage.match(/\b(429|500|502|503|504)\b/) || rawMessage.match(/"code"\s*:\s*(\d{3})/);
+    const codeMatch = rawMessage.match(/\b(400|401|403|404|429|500|502|503|504)\b/) || rawMessage.match(/"code"\s*:\s*(\d{3})/);
     if (codeMatch) {
       statusCode = parseInt(codeMatch[1], 10);
     }
@@ -68,6 +70,9 @@ function classifyGeminiError(err) {
     rawMessage
   );
   const isRateLimit = statusCode === 429 || /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
+  const isModelDailyQuotaExhausted = isRateLimit && /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
+    rawMessage
+  );
   const isTemporary5xx = statusCode === 500 || statusCode === 502 || statusCode === 504 || /500|502|504|INTERNAL|DEADLINE_EXCEEDED|bad gateway|gateway timeout|timed out|AbortError|fetch failed/i.test(
     rawMessage
   );
@@ -81,6 +86,7 @@ function classifyGeminiError(err) {
     isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
     isRateLimit,
     isHighDemand503,
+    isModelDailyQuotaExhausted,
     cleanMessage: rawMessage.slice(0, 260)
   };
 }
@@ -152,13 +158,19 @@ function parseCleanRowNo(raw) {
 }
 async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInstruction, responseSchema, mode = "batch", envOverride, baseDelayMs = INITIAL_BACKOFF_MS) {
   const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
-  const candidateModels = [primaryModel, ...fallbackModels];
+  const allConfiguredModels = [primaryModel, ...fallbackModels];
+  const nowMs = Date.now();
+  const useCooldownMemory = baseDelayMs >= 500;
+  const candidateModels = useCooldownMemory ? [
+    ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) <= nowMs),
+    ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) > nowMs)
+  ] : allConfiguredModels;
   let totalRetryAttempts = 0;
   let lastError = null;
   let lastStatusCode = 500;
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const currentModel = candidateModels[mIdx];
-    const isFallbackModel = mIdx > 0;
+    const isFallbackModel = currentModel !== primaryModel;
     const maxRetriesForModel = MAX_AUTOMATIC_RETRIES;
     logOcrEvent("info", isFallbackModel ? "model_fallback_selected" : "model_selected", {
       model: currentModel,
@@ -221,7 +233,15 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           permErr.code = classification.statusCode === 401 || classification.statusCode === 403 ? "GEMINI_AUTH_ERROR" : "GEMINI_BAD_REQUEST";
           throw permErr;
         }
-        if (!classification.isRetryableAvailabilityError && !isValidationFailure && classification.statusCode === 404) {
+        if (classification.statusCode === 404 && !classification.isRetryableAvailabilityError && !isValidationFailure || classification.isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1) {
+          if (useCooldownMemory) {
+            modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_COOLDOWN_DURATION_MS);
+          }
+          logOcrEvent("info", "model_daily_quota_or_404_fast_failover", {
+            exhaustedModel: currentModel,
+            nextModel: candidateModels[mIdx + 1],
+            statusCode: classification.statusCode
+          });
           break;
         }
         if (retry < maxRetriesForModel) {
@@ -1256,7 +1276,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     const palletCount = Math.max(1, Number(input.palletCount) || 1);
     const supplierProfile = input.supplierProfile || "laser_central";
     const notes = input.notes || null;
-    const createdBy = input.createdBy || "usr_receiver_default";
+    const createdBy = input.createdBy || null;
     if (!docketNumber) {
       throw new Error("docketNumber is required");
     }
@@ -1510,7 +1530,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const partId = input.id || `part_${deliveryId}_manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const actorName = actor?.employeeName || "Authorized User";
-    const actorId = actor?.id || "usr_receiver_default";
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || "supervisor";
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const auditMessage = `Manually added part ${partNumber} (No. ${itemNumber}${revision ? `, Rev ${revision}` : ""}) \u2014 "${description}" (Qty ${reqQty}) by ${actorName}`;
@@ -1672,7 +1692,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const actorName = actor?.employeeName || "Authorized User";
-    const actorId = actor?.id || "usr_receiver_default";
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || "supervisor";
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const auditMessage = changesSummary.length > 0 ? `Manually edited part ${newPartNumber} (No. ${newItemNumber}): ${changesSummary.join("; ")} by ${actorName}` : `Saved part ${newPartNumber} (No. ${newItemNumber}) by ${actorName}`;
@@ -1773,7 +1793,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const actorName = actor?.employeeName || "Authorized User";
-    const actorId = actor?.id || "usr_receiver_default";
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || "supervisor";
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const wasScannedNote = isScanned ? ` [Was already scanned: ${recQty}/${existing.required_quantity}]` : "";
@@ -1857,7 +1877,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const actorName = actor?.employeeName || "Authorized User";
-    const actorId = actor?.id || "usr_receiver_default";
+    const actorId = actor?.id || null;
     const actorRole = actor?.role || "supervisor";
     const isSupOrAdmin = this.isSupervisorOrAdmin(actor?.role);
     const stmts = [];
@@ -2113,7 +2133,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
         scanId,
         deliveryId,
         partId,
-        input.userId || "usr_receiver_default",
+        input.userId || null,
         now,
         scannedCode || part.part_number,
         scannedVia || "manual",
@@ -2173,7 +2193,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       scanId,
       deliveryId,
       input.partId || null,
-      input.userId || "usr_receiver_default",
+      input.userId || null,
       now,
       input.code,
       input.scanType,

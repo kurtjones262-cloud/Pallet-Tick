@@ -109,6 +109,9 @@ app.get('/api/export-project-zip', async (_req: ExpressRequest, res: ExpressResp
     const ignoredNames = new Set([
       'node_modules',
       'dist',
+      'build',
+      'server.js',
+      '.data',
       '.git',
       '.tempmediaStorage',
       '.aistudio',

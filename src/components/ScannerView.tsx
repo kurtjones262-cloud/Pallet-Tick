@@ -100,8 +100,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     height: number;
     frameRate?: number;
     focusMode?: string;
+    supportedFocusModes?: string[];
     deviceLabel?: string;
+    decodeMethod?: string;
+    avgDecodeTimeMs?: number;
+    lastDecodeTimeMs?: number;
+    attemptsBeforeLastSuccess?: number;
+    currentAttemptCount?: number;
   } | null>(null);
+  const [showDiagnosticsHud, setShowDiagnosticsHud] = useState<boolean>(false);
 
   // Torch & zoom state
   const [torchOn, setTorchOn] = useState<boolean>(false);
@@ -174,6 +181,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   activeSupplierRuleRef.current = activeSupplierRule;
 
   const startScannerRef = useRef<((targetCameraId?: string) => Promise<void>) | null>(null);
+  const reconfigureActiveModeRef = useRef<(() => void) | null>(null);
 
   const handleSelectSupplierRule = useCallback(
     (ruleId: SupplierRuleId) => {
@@ -184,10 +192,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         onUpdateDelivery(updated);
       }
       setIsSupplierModalOpen(false);
-      // Re-configure scanner formats when switching between OCR Label mode and barcode/QR modes
+      // Re-configure active decoder loops in-place without restarting the camera stream
       setTimeout(() => {
-        startScannerRef.current?.();
-      }, 60);
+        if (scannerRef.current && scannerRef.current.isScanning) {
+          reconfigureActiveModeRef.current?.();
+        } else {
+          startScannerRef.current?.();
+        }
+      }, 30);
     },
     [delivery, onUpdateDelivery]
   );
@@ -196,9 +208,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const scannerRef = useRef<Html5Qrcode | null>(null);
   const offscreenScannerRef = useRef<Html5Qrcode | null>(null);
   const nativeDetectorIntervalRef = useRef<any>(null);
+  const isNativeDetectingRef = useRef<boolean>(false);
+  const focusMaintenanceIntervalRef = useRef<any>(null);
   const liveOcrIntervalRef = useRef<any>(null);
   const lastOcrFrameSignatureRef = useRef<number[]>([]);
   const isLiveOcrBusyRef = useRef<boolean>(false);
+
+  // QR & Barcode decode performance diagnostic counters
+  const decodeAttemptCountRef = useRef<number>(0);
+  const attemptsBeforeLastSuccessRef = useRef<number>(0);
+  const decodeTimeSamplesRef = useRef<number[]>([]);
+  const activeDecodeMethodRef = useRef<string>('Initializing...');
 
   const lastScannedCodeRef = useRef<string>('');
   const lastScannedTimeRef = useRef<number>(0);
@@ -341,7 +361,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [appendDiagnosticLog]);
 
   /**
-   * Apply hardware camera capabilities (focus, zoom, torch, exposure)
+   * Apply hardware camera capabilities (continuous autofocus, zoom, torch, exposure)
+   * without restarting or disrupting the video stream.
    */
   const configureTrackFocusAndCapabilities = useCallback(
     async (targetZoom: number = 1) => {
@@ -349,8 +370,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       if (!track) return;
 
       try {
+        if (focusMaintenanceIntervalRef.current) {
+          clearInterval(focusMaintenanceIntervalRef.current);
+          focusMaintenanceIntervalRef.current = null;
+        }
+
         const capabilities: any = track.getCapabilities ? track.getCapabilities() : {};
-        const settings: any = track.getSettings ? track.getSettings() : {};
+        const supportedFocusModes: string[] = Array.isArray(capabilities.focusMode)
+          ? capabilities.focusMode
+          : [];
 
         // 1. Check Torch capability
         if (capabilities.torch && isMountedRef.current) {
@@ -372,17 +400,57 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           setSupportsHardwareZoom(false);
         }
 
-        // 3. Apply continuous autofocus, exposure, white balance & zoom
-        if (
-          Array.isArray(capabilities.focusMode) &&
-          capabilities.focusMode.includes('continuous')
-        ) {
-          await track
-            .applyConstraints({
+        // 3. Apply continuous autofocus where supported (or best available focus fallback)
+        let appliedContinuousFocus = false;
+        if (supportedFocusModes.includes('continuous') || supportedFocusModes.length === 0) {
+          try {
+            await track.applyConstraints({
               advanced: [{ focusMode: 'continuous' } as any],
-            })
-            .catch(() => {});
+            });
+            appliedContinuousFocus = true;
+          } catch {
+            try {
+              await track.applyConstraints({ focusMode: 'continuous' } as any);
+              appliedContinuousFocus = true;
+            } catch {}
+          }
         }
+
+        // Fallback if continuous autofocus is not supported by the camera driver
+        if (!appliedContinuousFocus && supportedFocusModes.length > 0) {
+          const fallbackMode = supportedFocusModes.includes('single-shot')
+            ? 'single-shot'
+            : supportedFocusModes.includes('auto')
+            ? 'auto'
+            : null;
+          if (fallbackMode) {
+            await track
+              .applyConstraints({
+                advanced: [{ focusMode: fallbackMode } as any],
+              })
+              .catch(() => {});
+
+            // Gently trigger single-shot refocus periodically without resetting the stream
+            focusMaintenanceIntervalRef.current = setInterval(() => {
+              if (
+                !isMountedRef.current ||
+                activeScanConfirmationRef.current !== null ||
+                activeDuplicateWarningRef.current !== null
+              ) {
+                return;
+              }
+              const currentTrack = getActiveVideoTrack();
+              if (!currentTrack) return;
+              currentTrack
+                .applyConstraints({
+                  advanced: [{ focusMode: fallbackMode } as any],
+                })
+                .catch(() => {});
+            }, 2200);
+          }
+        }
+
+        // 4. Apply continuous exposure & white balance if supported
         if (
           Array.isArray(capabilities.exposureMode) &&
           capabilities.exposureMode.includes('continuous')
@@ -393,7 +461,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             })
             .catch(() => {});
         }
-        if (capabilities.zoom) {
+        if (
+          Array.isArray(capabilities.whiteBalanceMode) &&
+          capabilities.whiteBalanceMode.includes('continuous')
+        ) {
+          await track
+            .applyConstraints({
+              advanced: [{ whiteBalanceMode: 'continuous' } as any],
+            })
+            .catch(() => {});
+        }
+        if (capabilities.zoom && targetZoom > 1) {
           const minZ = capabilities.zoom.min || 1;
           const maxZ = capabilities.zoom.max || 4;
           const clampedZ = Math.max(minZ, Math.min(maxZ, targetZoom));
@@ -404,24 +482,48 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             .catch(() => {});
         }
 
-        // 4. Update actual camera resolution info
+        // 5. Inspect updated settings after applying constraints
+        const updatedSettings: any = track.getSettings ? track.getSettings() : {};
         const container = document.getElementById('camera-scanner-view');
         const video = container?.querySelector('video') as HTMLVideoElement | null;
-        const actualW = settings.width || video?.videoWidth || 0;
-        const actualH = settings.height || video?.videoHeight || 0;
-        const fps = settings.frameRate ? Math.round(settings.frameRate) : undefined;
-        const focusMode =
-          settings.focusMode ||
-          (Array.isArray(capabilities.focusMode) ? capabilities.focusMode.join(',') : 'auto');
+        const actualW = updatedSettings.width || video?.videoWidth || 0;
+        const actualH = updatedSettings.height || video?.videoHeight || 0;
+        const fps = updatedSettings.frameRate ? Math.round(updatedSettings.frameRate) : undefined;
+        const activeFocusMode =
+          updatedSettings.focusMode ||
+          (appliedContinuousFocus && supportedFocusModes.includes('continuous')
+            ? 'continuous'
+            : supportedFocusModes.length > 0
+            ? supportedFocusModes[0]
+            : 'auto (driver managed)');
 
-        if (isMountedRef.current && actualW > 0 && actualH > 0) {
-          setActualCameraInfo({
+        if (isMountedRef.current) {
+          const diagPayload = {
             width: actualW,
             height: actualH,
             frameRate: fps,
-            focusMode,
-            deviceLabel: track.label || undefined,
-          });
+            focusMode: activeFocusMode,
+            supportedFocusModes:
+              supportedFocusModes.length > 0 ? supportedFocusModes : ['driver-default'],
+            deviceLabel: track.label || 'Rear Camera',
+            decodeMethod: activeDecodeMethodRef.current,
+            avgDecodeTimeMs:
+              decodeTimeSamplesRef.current.length > 0
+                ? Math.round(
+                    (decodeTimeSamplesRef.current.reduce((a, b) => a + b, 0) /
+                      decodeTimeSamplesRef.current.length) *
+                      10
+                  ) / 10
+                : 0,
+            lastDecodeTimeMs:
+              decodeTimeSamplesRef.current[decodeTimeSamplesRef.current.length - 1] || 0,
+            attemptsBeforeLastSuccess: attemptsBeforeLastSuccessRef.current,
+            currentAttemptCount: decodeAttemptCountRef.current,
+          };
+          setActualCameraInfo(diagPayload);
+          if (typeof window !== 'undefined') {
+            (window as any).__PALLETTRACK_SCANNER_DIAGNOSTICS__ = diagPayload;
+          }
         }
       } catch (e: any) {
         appendDiagnosticLog('error', `Track capability check note: ${e?.message || String(e)}`);
@@ -846,53 +948,146 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [externalPendingQuantity, delivery, onClearExternalPendingQuantity]);
 
   /**
-   * Continuous Barcode & QR scanning loop on video frames
+   * Helper to update live decode diagnostics in state and window
+   */
+  const recordDecodeDiagnostics = useCallback(
+    (elapsedMs: number, recognized: boolean, methodLabel: string) => {
+      activeDecodeMethodRef.current = methodLabel;
+      decodeAttemptCountRef.current += 1;
+      const roundedMs = Math.round(elapsedMs * 10) / 10;
+      const samples = decodeTimeSamplesRef.current;
+      samples.push(roundedMs);
+      if (samples.length > 30) {
+        samples.shift();
+      }
+      const avgMs =
+        Math.round((samples.reduce((acc, v) => acc + v, 0) / samples.length) * 10) / 10;
+
+      if (recognized) {
+        attemptsBeforeLastSuccessRef.current = decodeAttemptCountRef.current;
+        decodeAttemptCountRef.current = 0;
+      }
+
+      // Throttle React state updates for non-recognition frames to every 6 attempts
+      if (recognized || decodeAttemptCountRef.current % 6 === 0) {
+        setActualCameraInfo((prev) => {
+          const next = {
+            width: prev?.width || 0,
+            height: prev?.height || 0,
+            frameRate: prev?.frameRate,
+            focusMode: prev?.focusMode || 'continuous',
+            supportedFocusModes: prev?.supportedFocusModes || ['continuous'],
+            deviceLabel: prev?.deviceLabel || 'Rear Camera',
+            decodeMethod: methodLabel,
+            avgDecodeTimeMs: avgMs,
+            lastDecodeTimeMs: roundedMs,
+            attemptsBeforeLastSuccess: attemptsBeforeLastSuccessRef.current,
+            currentAttemptCount: decodeAttemptCountRef.current,
+          };
+          if (typeof window !== 'undefined') {
+            (window as any).__PALLETTRACK_SCANNER_DIAGNOSTICS__ = next;
+          }
+          return next;
+        });
+      }
+    },
+    []
+  );
+
+  /**
+   * Single-flight, mode-isolated Native Barcode & QR scanning loop on video frames.
+   * - In GCI mode ('gci'): isolates strictly to ['qr_code'] at 45ms intervals with single-flight lock,
+   *   and suspends Html5Qrcode's redundant ZXing canvas loop so only one decoder processes each frame.
+   * - In Laser Central mode ('laser_central'): scans 1D barcodes + QR codes with single-flight lock.
+   * - In OCR Label mode ('ocr_label'): scans 1D barcodes only (ignores QR codes).
    */
   const startNativeBarcodeLoop = useCallback(() => {
     if (nativeDetectorIntervalRef.current) {
       clearInterval(nativeDetectorIntervalRef.current);
       nativeDetectorIntervalRef.current = null;
     }
+    isNativeDetectingRef.current = false;
+    decodeAttemptCountRef.current = 0;
+
+    const currentRuleId = activeSupplierRuleRef.current?.id || 'laser_central';
 
     if (
       typeof window === 'undefined' ||
       !('BarcodeDetector' in window) ||
       typeof (window as any).BarcodeDetector !== 'function'
     ) {
+      // Native BarcodeDetector unavailable: ensure Html5Qrcode ZXing fallback is active
+      const fallbackLabel =
+        currentRuleId === 'gci'
+          ? 'ZXing Fallback (GCI QR Mode)'
+          : 'ZXing Fallback (Html5Qrcode)';
+      activeDecodeMethodRef.current = fallbackLabel;
+      if (scannerRef.current) {
+        (scannerRef.current as any).shouldScan = true;
+      }
+      setActualCameraInfo((prev) =>
+        prev ? { ...prev, decodeMethod: fallbackLabel } : prev
+      );
       return;
     }
 
     try {
-      const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
-      const formats = isOcrMode
-        ? [
-            'code_128',
-            'code_39',
-            'ean_13',
-            'ean_8',
-            'data_matrix',
-            'itf',
-            'upc_a',
-            'upc_e',
-            'codabar',
-          ]
-        : [
-            'qr_code',
-            'code_128',
-            'code_39',
-            'ean_13',
-            'ean_8',
-            'data_matrix',
-            'itf',
-            'upc_a',
-            'upc_e',
-            'codabar',
-          ];
+      const formats =
+        currentRuleId === 'gci'
+          ? ['qr_code']
+          : currentRuleId === 'ocr_label'
+          ? [
+              'code_128',
+              'code_39',
+              'ean_13',
+              'ean_8',
+              'data_matrix',
+              'itf',
+              'upc_a',
+              'upc_e',
+              'codabar',
+            ]
+          : [
+              'qr_code',
+              'code_128',
+              'code_39',
+              'ean_13',
+              'ean_8',
+              'data_matrix',
+              'itf',
+              'upc_a',
+              'upc_e',
+              'codabar',
+            ];
 
       const detector = new (window as any).BarcodeDetector({ formats });
+      const methodLabel =
+        currentRuleId === 'gci'
+          ? 'Native BarcodeDetector (QR Fast-Path)'
+          : currentRuleId === 'ocr_label'
+          ? 'Native BarcodeDetector (1D + Live OCR)'
+          : 'Native BarcodeDetector (1D + QR)';
+      activeDecodeMethodRef.current = methodLabel;
+
+      // Prevent Html5Qrcode's internal ZXing canvas decoder from running in parallel on the same frame
+      if (scannerRef.current) {
+        (scannerRef.current as any).shouldScan = false;
+        if ((scannerRef.current as any).foreverScanTimeout) {
+          clearTimeout((scannerRef.current as any).foreverScanTimeout);
+        }
+      }
+
+      setActualCameraInfo((prev) =>
+        prev ? { ...prev, decodeMethod: methodLabel } : prev
+      );
+
+      // Fast 45ms cadence for GCI QR codes (~22fps), 80ms for multi-format 1D+QR
+      const intervalMs = currentRuleId === 'gci' ? 45 : 80;
 
       nativeDetectorIntervalRef.current = setInterval(async () => {
+        // Strict single-flight guard: never start decoding a frame if the previous frame is still decoding
         if (
+          isNativeDetectingRef.current ||
           !isMountedRef.current ||
           activeScanConfirmationRef.current !== null ||
           activeDuplicateWarningRef.current !== null ||
@@ -905,8 +1100,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         const video = container?.querySelector('video') as HTMLVideoElement | null;
         if (!video || video.readyState < 2 || video.videoWidth === 0) return;
 
+        isNativeDetectingRef.current = true;
+        const t0 = performance.now();
         try {
           const barcodes = await detector.detect(video);
+          const elapsedMs = performance.now() - t0;
+
           if (
             barcodes &&
             barcodes.length > 0 &&
@@ -920,20 +1119,38 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               currentIsOcr &&
               (fmt === 'qr_code' || fmt === 'qrcode' || fmt === 'qr')
             ) {
+              recordDecodeDiagnostics(elapsedMs, false, methodLabel);
               return; // Do NOT scan QR codes in OCR label scan mode
             }
-            const rawVal = first.rawValue || first.raw_value || '';
+            const rawVal = (first.rawValue || first.raw_value || '').trim();
             if (rawVal) {
+              recordDecodeDiagnostics(elapsedMs, true, methodLabel);
               handleScannedCode(rawVal, 'camera_barcode_qr', fmt);
+              return;
             }
           }
-        } catch {}
-      }, 140);
-    } catch {}
-  }, [handleScannedCode]);
+
+          recordDecodeDiagnostics(elapsedMs, false, methodLabel);
+        } catch {
+          // If native BarcodeDetector fails at runtime, re-enable ZXing fallback
+          if (scannerRef.current) {
+            (scannerRef.current as any).shouldScan = true;
+          }
+        } finally {
+          isNativeDetectingRef.current = false;
+        }
+      }, intervalMs);
+    } catch {
+      // Fallback to Html5Qrcode ZXing decoder if BarcodeDetector constructor fails
+      activeDecodeMethodRef.current = 'ZXing Fallback (Html5Qrcode)';
+      if (scannerRef.current) {
+        (scannerRef.current as any).shouldScan = true;
+      }
+    }
+  }, [handleScannedCode, recordDecodeDiagnostics]);
 
   /**
-   * Background Live Pallet Label OCR loop
+   * Background Live Pallet Label OCR loop (isolated strictly to OCR Label Mode)
    */
   const startLiveOcrDetectionLoop = useCallback(() => {
     if (liveOcrIntervalRef.current) {
@@ -941,9 +1158,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       liveOcrIntervalRef.current = null;
     }
 
+    // Do NOT run background Tesseract OCR during GCI QR or Laser Central barcode scanning
+    if (activeSupplierRuleRef.current?.id !== 'ocr_label') {
+      return;
+    }
+
     liveOcrIntervalRef.current = setInterval(async () => {
       if (
         !isMountedRef.current ||
+        activeSupplierRuleRef.current?.id !== 'ocr_label' ||
         isLiveOcrBusyRef.current ||
         isProcessingOcrLabel ||
         activeScanConfirmationRef.current !== null ||
@@ -1048,6 +1271,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     }, 1800);
   }, [appendDiagnosticLog, appSettings, isProcessingOcrLabel, triggerDuplicateWarning]);
 
+  // Reconfigure active decoder loops in-place when switching between GCI, Laser Central, and OCR Label modes
+  const reconfigureActiveMode = useCallback(() => {
+    configureTrackFocusAndCapabilities(zoomLevelRef.current);
+    startNativeBarcodeLoop();
+    startLiveOcrDetectionLoop();
+  }, [configureTrackFocusAndCapabilities, startLiveOcrDetectionLoop, startNativeBarcodeLoop]);
+  reconfigureActiveModeRef.current = reconfigureActiveMode;
+
   /**
    * Initializes the continuous video camera scanner
    */
@@ -1063,6 +1294,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         if (nativeDetectorIntervalRef.current) {
           clearInterval(nativeDetectorIntervalRef.current);
           nativeDetectorIntervalRef.current = null;
+        }
+        if (focusMaintenanceIntervalRef.current) {
+          clearInterval(focusMaintenanceIntervalRef.current);
+          focusMaintenanceIntervalRef.current = null;
         }
         if (liveOcrIntervalRef.current) {
           clearInterval(liveOcrIntervalRef.current);
@@ -1084,8 +1319,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           scannerRef.current = null;
         }
 
-        // 2. Discover available devices
-        let devices = await enumerateAllVideoInputs();
+        // 2. Discover available devices & prioritize rear/environment cameras when no explicit camera is saved
+        const devices = await enumerateAllVideoInputs();
         const savedCamId =
           typeof window !== 'undefined'
             ? localStorage.getItem(SELECTED_CAMERA_STORAGE_KEY) || ''
@@ -1097,89 +1332,165 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           orderedCameraIds.push(requestedId);
         }
         if (devices.length > 0) {
-          devices.forEach((d) => {
+          // Sort rear/back/environment cameras ahead of front cameras
+          const sortedDevices = [...devices].sort((a, b) => {
+            const aBack = /back|rear|environment|0/i.test(a.label) ? 0 : 1;
+            const bBack = /back|rear|environment|0/i.test(b.label) ? 0 : 1;
+            return aBack - bBack;
+          });
+          sortedDevices.forEach((d) => {
             if (!orderedCameraIds.includes(d.id)) {
               orderedCameraIds.push(d.id);
             }
           });
         }
 
-        const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
-        const formatsToSupport = isOcrMode
-          ? [
-              Html5QrcodeSupportedFormats.CODE_128,
-              Html5QrcodeSupportedFormats.CODE_39,
-              Html5QrcodeSupportedFormats.EAN_13,
-              Html5QrcodeSupportedFormats.EAN_8,
-              Html5QrcodeSupportedFormats.DATA_MATRIX,
-              Html5QrcodeSupportedFormats.ITF,
-              Html5QrcodeSupportedFormats.UPC_A,
-              Html5QrcodeSupportedFormats.UPC_E,
-              Html5QrcodeSupportedFormats.CODABAR,
-            ]
-          : [
-              Html5QrcodeSupportedFormats.QR_CODE,
-              Html5QrcodeSupportedFormats.CODE_128,
-              Html5QrcodeSupportedFormats.CODE_39,
-              Html5QrcodeSupportedFormats.EAN_13,
-              Html5QrcodeSupportedFormats.EAN_8,
-              Html5QrcodeSupportedFormats.DATA_MATRIX,
-              Html5QrcodeSupportedFormats.ITF,
-              Html5QrcodeSupportedFormats.UPC_A,
-              Html5QrcodeSupportedFormats.UPC_E,
-              Html5QrcodeSupportedFormats.CODABAR,
-            ];
+        const currentRuleId = activeSupplierRuleRef.current?.id || 'laser_central';
+        const formatsToSupport =
+          currentRuleId === 'gci'
+            ? [Html5QrcodeSupportedFormats.QR_CODE]
+            : currentRuleId === 'ocr_label'
+            ? [
+                Html5QrcodeSupportedFormats.CODE_128,
+                Html5QrcodeSupportedFormats.CODE_39,
+                Html5QrcodeSupportedFormats.EAN_13,
+                Html5QrcodeSupportedFormats.EAN_8,
+                Html5QrcodeSupportedFormats.DATA_MATRIX,
+                Html5QrcodeSupportedFormats.ITF,
+                Html5QrcodeSupportedFormats.UPC_A,
+                Html5QrcodeSupportedFormats.UPC_E,
+                Html5QrcodeSupportedFormats.CODABAR,
+              ]
+            : [
+                Html5QrcodeSupportedFormats.QR_CODE,
+                Html5QrcodeSupportedFormats.CODE_128,
+                Html5QrcodeSupportedFormats.CODE_39,
+                Html5QrcodeSupportedFormats.EAN_13,
+                Html5QrcodeSupportedFormats.EAN_8,
+                Html5QrcodeSupportedFormats.DATA_MATRIX,
+                Html5QrcodeSupportedFormats.ITF,
+                Html5QrcodeSupportedFormats.UPC_A,
+                Html5QrcodeSupportedFormats.UPC_E,
+                Html5QrcodeSupportedFormats.CODABAR,
+              ];
 
         const scanner = new Html5Qrcode('camera-scanner-view', {
           formatsToSupport,
+          useBarCodeDetectorIfSupported: true,
           verbose: false,
         });
         scannerRef.current = scanner;
 
-        const scanConfig: any = {
-          fps: 15,
-          disableFlip: false,
+        let lastZxingAttemptTs = performance.now();
+        const onZxingSuccess = (decodedText: string, decodedResult: any) => {
+          const nowTs = performance.now();
+          const elapsed = Math.max(1, nowTs - lastZxingAttemptTs);
+          lastZxingAttemptTs = nowTs;
+          const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
+          const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
+          const formatEnum = decodedResult?.result?.format?.format;
+          if (
+            currentIsOcr &&
+            (formatName === 'QR_CODE' ||
+              formatName === 'QRCODE' ||
+              formatEnum === Html5QrcodeSupportedFormats.QR_CODE ||
+              formatName.includes('QR'))
+          ) {
+            return; // Don't scan QR codes in OCR label scan mode
+          }
+          recordDecodeDiagnostics(elapsed, true, activeDecodeMethodRef.current);
+          handleScannedCode(decodedText, 'camera_barcode_qr', formatName);
+        };
+
+        const onZxingFrameAttempt = () => {
+          const nowTs = performance.now();
+          const elapsed = Math.max(1, nowTs - lastZxingAttemptTs);
+          lastZxingAttemptTs = nowTs;
+          recordDecodeDiagnostics(elapsed, false, activeDecodeMethodRef.current);
+        };
+
+        const baseScanConfig: any = {
+          fps: currentRuleId === 'gci' ? 24 : 18,
+          disableFlip: currentRuleId === 'gci',
           qrbox: (w: number, h: number) => ({
-            width: Math.max(160, Math.floor(w * 0.88)),
-            height: Math.max(100, Math.floor(h * 0.65)),
+            width: Math.max(180, Math.floor(w * 0.88)),
+            height: Math.max(140, Math.floor(h * 0.72)),
           }),
         };
 
         let started = false;
         let lastErrorMsg = '';
 
-        for (const camId of orderedCameraIds) {
+        // Prefer environment-facing camera with 1280x720 HD resolution & continuous autofocus first when no specific camera ID was forced
+        if (!requestedId) {
           try {
             await scanner.start(
-              { deviceId: { exact: camId } },
-              scanConfig,
-              (decodedText, decodedResult) => {
-                const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
-                const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
-                const formatEnum = decodedResult?.result?.format?.format;
-                if (
-                  currentIsOcr &&
-                  (formatName === 'QR_CODE' ||
-                    formatName === 'QRCODE' ||
-                    formatEnum === Html5QrcodeSupportedFormats.QR_CODE ||
-                    formatName.includes('QR'))
-                ) {
-                  return; // Don't scan QR codes in OCR label scan mode
-                }
-                handleScannedCode(decodedText, 'camera_barcode_qr', formatName);
+              { facingMode: 'environment' },
+              {
+                ...baseScanConfig,
+                videoConstraints: {
+                  facingMode: { ideal: 'environment' },
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                  frameRate: { ideal: 30 },
+                  advanced: [{ focusMode: 'continuous' } as any],
+                } as any,
               },
-              () => {}
+              onZxingSuccess,
+              onZxingFrameAttempt
             );
             started = true;
-            setSelectedCameraId(camId);
-            if (typeof window !== 'undefined') {
+          } catch {
+            // Fall through to deviceId loop or standard facingMode: 'environment'
+          }
+        }
+
+        if (!started) {
+          for (const camId of orderedCameraIds) {
+            try {
+              await scanner.start(
+                { deviceId: { exact: camId } },
+                {
+                  ...baseScanConfig,
+                  videoConstraints: {
+                    deviceId: { exact: camId },
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 },
+                    frameRate: { ideal: 30 },
+                    advanced: [{ focusMode: 'continuous' } as any],
+                  } as any,
+                },
+                onZxingSuccess,
+                onZxingFrameAttempt
+              );
+              started = true;
+              setSelectedCameraId(camId);
+              if (typeof window !== 'undefined') {
+                try {
+                  localStorage.setItem(SELECTED_CAMERA_STORAGE_KEY, camId);
+                } catch {}
+              }
+              break;
+            } catch {
               try {
-                localStorage.setItem(SELECTED_CAMERA_STORAGE_KEY, camId);
-              } catch {}
+                await scanner.start(
+                  { deviceId: { exact: camId } },
+                  baseScanConfig,
+                  onZxingSuccess,
+                  onZxingFrameAttempt
+                );
+                started = true;
+                setSelectedCameraId(camId);
+                if (typeof window !== 'undefined') {
+                  try {
+                    localStorage.setItem(SELECTED_CAMERA_STORAGE_KEY, camId);
+                  } catch {}
+                }
+                break;
+              } catch (camErr: any) {
+                lastErrorMsg = camErr?.message || String(camErr);
+              }
             }
-            break;
-          } catch (camErr: any) {
-            lastErrorMsg = camErr?.message || String(camErr);
           }
         }
 
@@ -1187,23 +1498,9 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           try {
             await scanner.start(
               { facingMode: 'environment' },
-              scanConfig,
-              (decodedText, decodedResult) => {
-                const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
-                const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
-                const formatEnum = decodedResult?.result?.format?.format;
-                if (
-                  currentIsOcr &&
-                  (formatName === 'QR_CODE' ||
-                    formatName === 'QRCODE' ||
-                    formatEnum === Html5QrcodeSupportedFormats.QR_CODE ||
-                    formatName.includes('QR'))
-                ) {
-                  return; // Don't scan QR codes in OCR label scan mode
-                }
-                handleScannedCode(decodedText, 'camera_barcode_qr', formatName);
-              },
-              () => {}
+              baseScanConfig,
+              onZxingSuccess,
+              onZxingFrameAttempt
             );
             started = true;
           } catch (envErr: any) {
@@ -1250,6 +1547,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       enumerateAllVideoInputs,
       getActiveVideoTrack,
       handleScannedCode,
+      recordDecodeDiagnostics,
       selectedCameraId,
       startLiveOcrDetectionLoop,
       startNativeBarcodeLoop,
@@ -1265,10 +1563,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       clearInterval(nativeDetectorIntervalRef.current);
       nativeDetectorIntervalRef.current = null;
     }
+    if (focusMaintenanceIntervalRef.current) {
+      clearInterval(focusMaintenanceIntervalRef.current);
+      focusMaintenanceIntervalRef.current = null;
+    }
     if (liveOcrIntervalRef.current) {
       clearInterval(liveOcrIntervalRef.current);
       liveOcrIntervalRef.current = null;
     }
+    isNativeDetectingRef.current = false;
     const track = getActiveVideoTrack();
     if (track) {
       try {
@@ -1751,14 +2054,88 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             )}
           </div>
 
-          {/* Right: Live Scanning Status Indicator */}
+          {/* Right: Live Scanning Status Indicator + Diagnostics Toggle */}
           <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowDiagnosticsHud((prev) => !prev)}
+              className={`px-2 py-1 rounded-full border font-mono text-[10px] font-bold transition-colors cursor-pointer ${
+                showDiagnosticsHud
+                  ? 'bg-cyan-500 text-black border-cyan-400'
+                  : 'bg-black/60 text-zinc-300 border-white/15 hover:border-cyan-400/50'
+              }`}
+              title="Toggle Camera & QR Decoder Diagnostics"
+            >
+              DIAG
+            </button>
             <div className="px-2.5 py-1 rounded-full bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_10px_rgba(6,182,212,0.25)]">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-              <span>LIVE SCAN</span>
+              <span>
+                {activeSupplierRule.id === 'gci' ? 'GCI QR FAST' : 'LIVE SCAN'}
+              </span>
             </div>
           </div>
         </div>
+
+        {/* ============================================================ */}
+        {/* LIVE CAMERA & QR DECODER DIAGNOSTICS OVERLAY                 */}
+        {/* ============================================================ */}
+        {showDiagnosticsHud && (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="absolute top-13 right-3 z-30 w-72 p-3 rounded-xl bg-black/90 backdrop-blur-md border border-cyan-500/40 text-[10px] font-mono text-zinc-200 shadow-2xl space-y-1"
+          >
+            <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1 text-cyan-400 font-bold uppercase">
+              <span>Scanner Diagnostics</span>
+              <span>{activeSupplierRule.name}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Camera:</span>
+              <span className="text-white truncate max-w-[160px]">
+                {actualCameraInfo?.deviceLabel || 'Environment Rear'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Resolution / FPS:</span>
+              <span className="text-white">
+                {actualCameraInfo?.width || 0}×{actualCameraInfo?.height || 0}
+                {actualCameraInfo?.frameRate ? ` @ ${actualCameraInfo.frameRate}fps` : ''}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Supported Focus:</span>
+              <span className="text-white truncate max-w-[160px]">
+                {actualCameraInfo?.supportedFocusModes?.join(', ') || 'continuous'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Active Focus Mode:</span>
+              <span className="text-emerald-400 font-bold">
+                {actualCameraInfo?.focusMode || 'continuous'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Decode Engine:</span>
+              <span className="text-cyan-300 truncate max-w-[165px]">
+                {actualCameraInfo?.decodeMethod || activeDecodeMethodRef.current}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Avg Decode Time:</span>
+              <span className="text-white">
+                {actualCameraInfo?.avgDecodeTimeMs ?? 0} ms (last:{' '}
+                {actualCameraInfo?.lastDecodeTimeMs ?? 0} ms)
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">Attempts to Match:</span>
+              <span className="text-amber-300 font-bold">
+                {actualCameraInfo?.attemptsBeforeLastSuccess || 0} (live:{' '}
+                {actualCameraInfo?.currentAttemptCount || 0})
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* ============================================================ */}
         {/* BOTTOM ACCESSIBLE CONTROL BAR (ONE-HANDED MOBILE DOCK)        */}

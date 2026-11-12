@@ -1,140 +1,219 @@
-@import "tailwindcss" source("../src");
-@source "../index.html";
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* ============================================================================
+ * PARTTRACK GLOBAL THEME ENGINE (3 COMPLETE INDUSTRIAL THEMES)
+ * 1. Purple / Graphite (Default)
+ * 2. Emerald / Black
+ * 3. Electric Blue / Black
+ * ============================================================================ */
+
+:root,
+:root[data-theme="purple"] {
+  --pt-primary: #A020F0;
+  --pt-primary-light: #C084FC;
+  --pt-primary-deep: #6B21A8;
+  --pt-bg: #080B12;
+  --pt-bg-secondary: #101321;
+  --pt-card: #15182A;
+  --pt-border: #29243D;
+  --pt-text: #FFFFFF;
+  --pt-text-secondary: #A3A8BD;
+  --pt-text-muted: #737B94;
+  --pt-glow: rgba(160, 32, 240, 0.35);
+  --pt-glow-soft: rgba(160, 32, 240, 0.16);
+
+  /* Consistent Functional Status Colours Across All Themes */
+  --pt-success: #00D979;
+  --pt-warning: #F59E0B;
+  --pt-error: #EF4444;
+  --pt-info: #078BFF;
+}
+
+:root[data-theme="emerald"] {
+  --pt-primary: #00D979;
+  --pt-primary-light: #34D399;
+  --pt-primary-deep: #059669;
+  --pt-bg: #060A09;
+  --pt-bg-secondary: #0C1412;
+  --pt-card: #111C19;
+  --pt-border: #1E332C;
+  --pt-text: #FFFFFF;
+  --pt-text-secondary: #9FB5AD;
+  --pt-text-muted: #688279;
+  --pt-glow: rgba(0, 217, 121, 0.32);
+  --pt-glow-soft: rgba(0, 217, 121, 0.14);
+
+  --pt-success: #00D979;
+  --pt-warning: #F59E0B;
+  --pt-error: #EF4444;
+  --pt-info: #078BFF;
+}
+
+:root[data-theme="blue"] {
+  --pt-primary: #078BFF;
+  --pt-primary-light: #38BDF8;
+  --pt-primary-deep: #0284C7;
+  --pt-bg: #070A0F;
+  --pt-bg-secondary: #0E1522;
+  --pt-card: #131C2E;
+  --pt-border: #1E2D44;
+  --pt-text: #FFFFFF;
+  --pt-text-secondary: #9BA8BD;
+  --pt-text-muted: #6A7891;
+  --pt-glow: rgba(7, 139, 255, 0.35);
+  --pt-glow-soft: rgba(7, 139, 255, 0.15);
+
+  --pt-success: #00D979;
+  --pt-warning: #F59E0B;
+  --pt-error: #EF4444;
+  --pt-info: #078BFF;
+}
 
 @layer base {
-  :root {
-    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    --bg-canvas: #070A0F;
-    --bg-surface: #0E1626;
-    --text-primary: #F8FAFC;
-    --text-secondary: #94A3B8;
-    --border-hairline: #1E2D44;
-    --accent-blue: #00A8FF;
-  }
-
   html,
   body {
     font-family: var(--font-sans);
-    background-color: var(--bg-canvas);
-    color: var(--text-primary);
-    min-height: 100dvh;
-    overflow-x: hidden;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    letter-spacing: -0.014em;
+    background-color: var(--pt-bg);
+    color: var(--pt-text);
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior-y: none;
+  }
+
+  /* Tabular numerals for all numbers, counters, quantities, and timestamps */
+  .font-mono,
+  input[type="number"],
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
   }
 }
 
-.font-mono-numbers {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
+/* Reusable Theme-Aware Surface & Accent Classes */
+.pt-surface-bg {
+  background-color: var(--pt-bg);
 }
 
-/* Custom subtle scrollbars */
-::-webkit-scrollbar {
-  width: 3px;
-  height: 3px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: #D4D3CD;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #A1A09A;
+.pt-surface-secondary {
+  background-color: var(--pt-bg-secondary);
 }
 
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}
-.no-scrollbar {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
+.pt-surface-card {
+  background-color: var(--pt-card);
+  border-color: var(--pt-border);
 }
 
-/* Native Safe Area Insets */
+.pt-border-color {
+  border-color: var(--pt-border);
+}
+
+.pt-accent-text {
+  color: var(--pt-primary-light);
+}
+
+.pt-accent-bg {
+  background-color: var(--pt-primary);
+}
+
+.pt-btn-primary {
+  background: linear-gradient(135deg, var(--pt-primary) 0%, var(--pt-primary-deep) 100%);
+  color: #FFFFFF;
+  box-shadow: 0 0 22px var(--pt-glow);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.pt-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+  box-shadow: 0 0 28px var(--pt-glow);
+}
+
+/* Safe area padding for mobile notch / home indicator */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 16px);
+}
+
 .pt-safe {
   padding-top: env(safe-area-inset-top, 0px);
 }
-.pb-safe {
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-}
 
-@keyframes laserScanAnimation {
+@keyframes scan-line {
   0% {
-    top: 6%;
-    opacity: 0.45;
+    top: 8%;
+    opacity: 0.4;
   }
   50% {
-    top: 92%;
-    opacity: 0.95;
-  }
-  100% {
-    top: 6%;
-    opacity: 0.45;
-  }
-}
-
-.animate-laser-scan {
-  animation: laserScanAnimation 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-}
-
-@keyframes barcodeScanSweep {
-  0% {
-    top: 14%;
-    opacity: 0.3;
-  }
-  50% {
-    top: 36%;
+    top: 88%;
     opacity: 1;
   }
   100% {
-    top: 14%;
-    opacity: 0.3;
+    top: 8%;
+    opacity: 0.4;
   }
 }
 
-.animate-barcode-scan {
-  animation: barcodeScanSweep 1.8s ease-in-out infinite;
+.animate-scan-line {
+  animation: scan-line 2.2s ease-in-out infinite;
 }
 
-@keyframes pulseGlow {
-  0%, 100% {
-    box-shadow: 0 0 30px rgba(0, 168, 255, 0.35), 0 0 60px rgba(0, 168, 255, 0.15);
-  }
-  50% {
-    box-shadow: 0 0 50px rgba(0, 210, 255, 0.55), 0 0 90px rgba(0, 168, 255, 0.3);
-  }
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-6px); }
+  40%, 80% { transform: translateX(6px); }
 }
 
-.animate-pulse-glow {
-  animation: pulseGlow 2.8s ease-in-out infinite;
+.animate-shake {
+  animation: shake 0.4s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
 }
 
-@keyframes fadeInAnim {
+/* Splash Screen & Scanner Laser Animations */
+@keyframes fade-in {
   from {
     opacity: 0;
-    transform: scale(0.97);
+    transform: translateY(6px) scale(0.98);
   }
   to {
     opacity: 1;
-    transform: scale(1);
+    transform: translateY(0) scale(1);
   }
 }
 
 .animate-fade-in {
-  animation: fadeInAnim 0.45s ease-out forwards;
+  animation: fade-in 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-#camera-scanner-view {
-  width: 100%;
-  height: 100%;
+@keyframes barcode-scan {
+  0% {
+    top: 12%;
+    opacity: 0.55;
+  }
+  50% {
+    top: 88%;
+    opacity: 1;
+  }
+  100% {
+    top: 12%;
+    opacity: 0.55;
+  }
 }
 
-#camera-scanner-view video {
-  width: 100% !important;
-  height: 100% !important;
-  object-fit: cover !important;
+.animate-barcode-scan {
+  animation: barcode-scan 2.1s ease-in-out infinite;
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.03);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2.8s ease-in-out infinite;
 }

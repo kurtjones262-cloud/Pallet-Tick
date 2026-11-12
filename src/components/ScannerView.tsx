@@ -336,7 +336,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   const appendDiagnosticLog = useCallback(
     (category: DiagnosticCategory, message: string) => {
-      const prefix = `[PalletTick ${category.toUpperCase()}]`;
+      const prefix = `[PartTrack ${category.toUpperCase()}]`;
       if (category === 'error') {
         console.warn(prefix, message);
       } else {
@@ -1996,7 +1996,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       : undefined;
 
   return (
-    <div className="fixed inset-x-0 top-11 bottom-12 z-20 bg-[#070A0F] overflow-hidden select-none flex flex-col">
+    <div className="fixed inset-x-0 top-13 bottom-15 z-20 bg-[var(--pt-bg,#080B12)] overflow-hidden select-none flex flex-col">
       {/* Hidden file pickers for shutter & gallery uploads */}
       <input
         ref={snapFileInputRef}
@@ -2039,10 +2039,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           {/* Tap-to-Focus Indicator Ring */}
           {focusRingPos && (
             <div
-              style={{ left: focusRingPos.x - 24, top: focusRingPos.y - 24 }}
-              className="pointer-events-none absolute z-30 w-12 h-12 rounded-full border-2 border-cyan-400 bg-cyan-400/10 flex items-center justify-center animate-ping"
+              style={{
+                left: focusRingPos.x - 24,
+                top: focusRingPos.y - 24,
+                borderColor: 'var(--pt-primary-light, #C084FC)',
+              }}
+              className="pointer-events-none absolute z-30 w-12 h-12 rounded-full border-2 bg-[var(--pt-primary,#A020F0)]/15 flex items-center justify-center animate-ping"
             >
-              <div className="w-2 h-2 rounded-full bg-cyan-400" />
+              <div
+                className="w-2 h-2 rounded-full"
+                style={{ backgroundColor: 'var(--pt-primary-light, #C084FC)' }}
+              />
             </div>
           )}
 
@@ -2051,10 +2058,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <div
               className={`pointer-events-none absolute inset-0 z-20 border-[6px] transition-all duration-150 ${
                 flashColor === 'green'
-                  ? 'border-cyan-400 bg-cyan-400/20 shadow-[inset_0_0_80px_rgba(6,182,212,0.4)]'
+                  ? 'border-[#00D979] bg-[#00D979]/20 shadow-[inset_0_0_80px_rgba(0,217,121,0.45)]'
                   : flashColor === 'orange'
-                  ? 'border-amber-400 bg-amber-400/20 shadow-[inset_0_0_80px_rgba(245,158,11,0.4)]'
-                  : 'border-red-500 bg-red-500/20 shadow-[inset_0_0_80px_rgba(239,68,68,0.4)]'
+                  ? 'border-[#F59E0B] bg-[#F59E0B]/20 shadow-[inset_0_0_80px_rgba(245,158,11,0.45)]'
+                  : 'border-[#EF4444] bg-[#EF4444]/20 shadow-[inset_0_0_80px_rgba(239,68,68,0.45)]'
               }`}
             />
           )}
@@ -2064,39 +2071,88 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           {/* ============================================================ */}
           <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center p-4">
             {/* Viewfinder Target Reticle */}
-            <div className="relative w-[84%] max-w-[340px] aspect-[4/3] rounded-2xl flex items-center justify-center">
-              {/* Electric Blue Corner Guides */}
-              <div className="absolute top-0 left-0 w-8 h-8 border-t-3 border-l-3 border-cyan-400 rounded-tl-xl shadow-[0_0_12px_rgba(6,182,212,0.6)]" />
-              <div className="absolute top-0 right-0 w-8 h-8 border-t-3 border-r-3 border-cyan-400 rounded-tr-xl shadow-[0_0_12px_rgba(6,182,212,0.6)]" />
-              <div className="absolute bottom-0 left-0 w-8 h-8 border-b-3 border-l-3 border-cyan-400 rounded-bl-xl shadow-[0_0_12px_rgba(6,182,212,0.6)]" />
-              <div className="absolute bottom-0 right-0 w-8 h-8 border-b-3 border-r-3 border-cyan-400 rounded-br-xl shadow-[0_0_12px_rgba(6,182,212,0.6)]" />
+            <div className="relative w-[84%] max-w-[350px] aspect-[4/3] rounded-2xl flex items-center justify-center">
+              {/* Theme-Aware Purple / Neon Targeting Corner Guides */}
+              <div
+                className="absolute top-0 left-0 w-9 h-9 border-t-3 border-l-3 rounded-tl-xl"
+                style={{
+                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
+                }}
+              />
+              <div
+                className="absolute top-0 right-0 w-9 h-9 border-t-3 border-r-3 rounded-tr-xl"
+                style={{
+                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
+                }}
+              />
+              <div
+                className="absolute bottom-0 left-0 w-9 h-9 border-b-3 border-l-3 rounded-bl-xl"
+                style={{
+                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
+                }}
+              />
+              <div
+                className="absolute bottom-0 right-0 w-9 h-9 border-b-3 border-r-3 rounded-br-xl"
+                style={{
+                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
+                }}
+              />
 
-              {/* Subtle Animated Electric-Blue Scanning Laser Beam */}
+              {/* Subtle Animated Theme Laser Beam */}
               {isScanning && !activeScanConfirmation && (
                 <div className="absolute inset-x-2 pointer-events-none animate-barcode-scan">
-                  <div className="h-[2px] w-full bg-gradient-to-r from-transparent via-cyan-300 to-transparent shadow-[0_0_12px_#00d2ff,0_0_24px_#0088ff]" />
-                  <div className="h-5 -mt-2.5 w-full bg-gradient-to-b from-cyan-400/20 to-transparent blur-xs" />
+                  <div
+                    className="h-[2px] w-full"
+                    style={{
+                      background:
+                        'linear-gradient(90deg, transparent 0%, var(--pt-primary-light, #C084FC) 50%, transparent 100%)',
+                      boxShadow: '0 0 14px var(--pt-primary, #A020F0)',
+                    }}
+                  />
+                  <div
+                    className="h-5 -mt-2.5 w-full blur-xs"
+                    style={{
+                      background:
+                        'linear-gradient(180deg, var(--pt-glow-soft, rgba(160, 32, 240, 0.25)) 0%, transparent 100%)',
+                    }}
+                  />
                 </div>
               )}
 
-              {/* Central Target Crosshairs */}
-              <div className="w-4 h-4 border border-cyan-400/30 rounded-full flex items-center justify-center opacity-60">
-                <div className="w-1 h-1 rounded-full bg-cyan-400" />
+              {/* Subtle Central Scanning Reticle */}
+              <div
+                className="w-4 h-4 border rounded-full flex items-center justify-center opacity-70"
+                style={{ borderColor: 'var(--pt-primary-light, #C084FC)' }}
+              >
+                <div
+                  className="w-1.5 h-1.5 rounded-full"
+                  style={{ backgroundColor: 'var(--pt-primary-light, #C084FC)' }}
+                />
               </div>
             </div>
 
             {/* Instruction Tagline below reticle */}
-            <div className="mt-4 px-3 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-center">
-              <span className="font-mono text-[10px] font-bold tracking-wider text-cyan-300 uppercase">
+            <div className="mt-4 px-3.5 py-1.5 rounded-full bg-[#080B12]/80 backdrop-blur-md border border-[var(--pt-border,#29243D)] text-center shadow-lg">
+              <span className="font-mono text-[10px] font-bold tracking-wider text-[var(--pt-primary-light,#C084FC)] uppercase">
                 {activeSupplierRule.id === 'ocr_label'
-                  ? 'OCR Label Mode · Reading printed label text (QR auto-scan disabled)'
-                  : `${activeSupplierRule.name} · Align barcode, QR code or pallet label`}
+                  ? 'OCR Label Mode • Reading printed label text (QR auto-scan disabled)'
+                  : `${activeSupplierRule.name} • Align barcode, QR code or pallet label`}
               </span>
             </div>
 
-            {/* Temporary Toast Feedback Notification */}
+            {/* Immediate High-Contrast Scan Feedback Banner */}
             {scanFeedback && (
-              <div className="mt-2 px-3 py-1.5 rounded-lg bg-emerald-950/90 border border-emerald-400 text-emerald-200 font-mono text-xs font-bold shadow-xl animate-in zoom-in-95 duration-150">
+              <div
+                className={`mt-2.5 px-4 py-2 rounded-xl border font-mono text-xs font-extrabold shadow-2xl animate-in zoom-in-95 duration-150 ${
+                  scanFeedback.type === 'unexpected'
+                    ? 'bg-amber-950/95 border-[#F59E0B] text-[#F59E0B]'
+                    : 'bg-emerald-950/95 border-[#00D979] text-[#00D979]'
+                }`}
+              >
                 {scanFeedback.message}
               </div>
             )}
@@ -2106,18 +2162,20 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           {/* CAMERA ERROR OVERLAY & RETRY ACTION                         */}
           {/* ============================================================ */}
           {cameraError && (
-            <div className="absolute inset-0 z-40 bg-[#070A0F]/95 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
-              <div className="w-14 h-14 rounded-2xl bg-red-950/80 border border-red-500/40 text-red-400 flex items-center justify-center mb-4 shadow-[0_0_30px_rgba(239,68,68,0.3)]">
+            <div className="absolute inset-0 z-40 bg-[var(--pt-bg,#080B12)]/95 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+              <div className="w-14 h-14 rounded-2xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] flex items-center justify-center mb-4 shadow-[0_0_30px_rgba(239,68,68,0.3)]">
                 <AlertTriangle className="w-7 h-7" />
               </div>
               <h3 className="font-bold text-base text-white mb-2">Camera Feed Restricted</h3>
-              <p className="text-xs text-zinc-400 max-w-xs mb-5 leading-relaxed">{cameraError}</p>
+              <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] max-w-xs mb-5 leading-relaxed">
+                {cameraError}
+              </p>
 
-              <div className="flex flex-col gap-2 w-full max-w-xs">
+              <div className="flex flex-col gap-2.5 w-full max-w-xs">
                 <button
                   type="button"
                   onClick={() => startScanner()}
-                  className="w-full h-11 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-2 cursor-pointer shadow-[0_0_15px_rgba(6,182,212,0.4)]"
+                  className="w-full h-11 rounded-xl pt-btn-primary font-mono font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <RefreshCw className="w-4 h-4" />
                   <span>Retry Camera</span>
@@ -2126,9 +2184,9 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setIsManualModalOpen(true)}
-                  className="w-full h-10 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer"
+                  className="w-full h-10 rounded-xl bg-[var(--pt-card,#15182A)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-white font-mono font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer"
                 >
-                  <Keyboard className="w-4 h-4 text-cyan-400" />
+                  <Keyboard className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)]" />
                   <span>Enter Code Manually</span>
                 </button>
               </div>
@@ -2141,15 +2199,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         {/* ============================================================ */}
         <div
           onClick={(e) => e.stopPropagation()}
-          className="absolute top-0 inset-x-0 z-30 px-3 py-2.5 bg-gradient-to-b from-black/90 via-black/60 to-transparent flex items-center justify-between gap-2"
+          className="absolute top-0 inset-x-0 z-30 px-3 py-2.5 bg-gradient-to-b from-[#080B12]/90 via-[#080B12]/60 to-transparent flex items-center justify-between gap-2"
         >
-          {/* Left: Back/Close button + PalletTick branding + Docket number */}
+          {/* Left: Back/Close button + PartTrack branding + Docket number */}
           <div className="flex items-center gap-2 min-w-0">
             {onClose && (
               <button
                 type="button"
                 onClick={onClose}
-                className="w-8 h-8 rounded-full bg-black/60 hover:bg-zinc-800 border border-white/15 text-zinc-300 hover:text-white flex items-center justify-center cursor-pointer transition-colors shrink-0"
+                className="w-8 h-8 rounded-full bg-black/70 hover:bg-[var(--pt-card,#15182A)] border border-white/15 text-zinc-200 hover:text-white flex items-center justify-center cursor-pointer transition-colors shrink-0"
                 title="Return to Dashboard"
                 aria-label="Back to dashboard"
               >
@@ -2159,17 +2217,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
             <div className="flex items-center gap-1.5 shrink-0">
               <img
-                src="/pallettrack-icon.png"
-                alt="PalletTick"
+                src="/parttrack-icon.png"
+                alt="PartTrack"
                 className="w-5 h-5 rounded-[4px] object-cover shadow-xs"
               />
               <span className="font-bold text-xs text-white tracking-tight hidden sm:inline">
-                PalletTick
+                PartTrack
               </span>
             </div>
 
             {delivery ? (
-              <span className="px-2 py-0.5 rounded-md bg-white/10 border border-white/15 text-zinc-200 font-mono text-[11px] font-semibold truncate max-w-[130px] sm:max-w-[200px]">
+              <span className="px-2.5 py-0.5 rounded-lg bg-[#15182A]/90 border border-[var(--pt-border,#29243D)] text-white font-mono text-[11px] font-bold truncate max-w-[140px] sm:max-w-[220px]">
                 Docket #{delivery.docketNumber}
               </span>
             ) : (
@@ -2182,17 +2240,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={() => setShowDiagnosticsHud((prev) => !prev)}
-              className={`px-2 py-1 rounded-full border font-mono text-[10px] font-bold transition-colors cursor-pointer ${
+              className={`px-2.5 py-1 rounded-full border font-mono text-[10px] font-bold transition-colors cursor-pointer ${
                 showDiagnosticsHud
-                  ? 'bg-cyan-500 text-black border-cyan-400'
-                  : 'bg-black/60 text-zinc-300 border-white/15 hover:border-cyan-400/50'
+                  ? 'pt-btn-primary text-white'
+                  : 'bg-black/70 text-zinc-300 border-white/15 hover:border-[var(--pt-primary,#A020F0)]'
               }`}
               title="Toggle Camera & QR Decoder Diagnostics"
             >
               DIAG
             </button>
-            <div className="px-2.5 py-1 rounded-full bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_10px_rgba(6,182,212,0.25)]">
-              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            <div className="px-2.5 py-1 rounded-full bg-[#15182A]/90 border border-[var(--pt-primary,#A020F0)]/50 text-[var(--pt-primary-light,#C084FC)] font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_12px_var(--pt-glow,rgba(160,32,240,0.35))]">
+              <span className="w-2 h-2 rounded-full bg-[#00D979] animate-pulse" />
               <span>
                 {activeSupplierRule.id === 'gci'
                   ? 'GCI QR FAST'
@@ -2210,15 +2268,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         {showDiagnosticsHud && (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="absolute top-13 right-3 z-30 w-80 p-3 rounded-xl bg-black/92 backdrop-blur-md border border-cyan-500/40 text-[10px] font-mono text-zinc-200 shadow-2xl space-y-1"
+            className="absolute top-13 right-3 z-30 w-80 p-3.5 rounded-2xl bg-[#080B12]/95 backdrop-blur-md border border-[var(--pt-primary,#A020F0)]/50 text-[10px] font-mono text-zinc-200 shadow-2xl space-y-1"
           >
-            <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1 text-cyan-400 font-bold uppercase">
-              <span>Camera & Scanner Diag</span>
+            <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1 text-[var(--pt-primary-light,#C084FC)] font-bold uppercase">
+              <span>Camera &amp; Scanner Diag</span>
               <span>{activeSupplierRule.name}</span>
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">1. Profile:</span>
-              <span className="text-cyan-300 font-bold truncate max-w-[180px]">
+              <span className="text-[var(--pt-primary-light,#C084FC)] font-bold truncate max-w-[180px]">
                 {actualCameraInfo?.cameraProfile ||
                   CAMERA_PROFILES[(activeSupplierRule.id as ScanMode) || 'laser_central']
                     ?.profileLabel}
@@ -2245,7 +2303,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">5. Active Focus Mode:</span>
-              <span className="text-emerald-400 font-bold">
+              <span className="text-[#00D979] font-bold">
                 {actualCameraInfo?.focusMode || 'continuous'}
               </span>
             </div>
@@ -2258,7 +2316,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">7. Active Decoder:</span>
-              <span className="text-cyan-300 truncate max-w-[180px]">
+              <span className="text-[var(--pt-primary-light,#C084FC)] truncate max-w-[180px]">
                 {actualCameraInfo?.decodeMethod || activeDecodeMethodRef.current}
               </span>
             </div>
@@ -2278,7 +2336,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">10. Last Match Time:</span>
-              <span className="text-emerald-300">
+              <span className="text-[#00D979]">
                 {actualCameraInfo?.lastRecognitionTimeMs != null
                   ? `${actualCameraInfo.lastRecognitionTimeMs} ms (${
                       actualCameraInfo.lastRecognitionTimestamp || 'just now'
@@ -2288,7 +2346,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">11. Attempts to Match:</span>
-              <span className="text-amber-300 font-bold">
+              <span className="text-[#F59E0B] font-bold">
                 {actualCameraInfo?.attemptsBeforeLastSuccess || 0} (live:{' '}
                 {actualCameraInfo?.currentAttemptCount || 0})
               </span>
@@ -2298,8 +2356,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               <span
                 className={
                   actualCameraInfo?.multipleDecodersActive
-                    ? 'text-red-400 font-bold'
-                    : 'text-emerald-400 font-bold'
+                    ? 'text-[#EF4444] font-bold'
+                    : 'text-[#00D979] font-bold'
                 }
               >
                 {actualCameraInfo?.multipleDecodersActive
@@ -2309,7 +2367,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-zinc-400">13. Stream Status:</span>
-              <span className="text-emerald-400 font-bold uppercase">
+              <span className="text-[#00D979] font-bold uppercase">
                 {isScanning
                   ? actualCameraInfo?.streamStatus || 'ACTIVE'
                   : isStarting
@@ -2327,7 +2385,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           onClick={(e) => e.stopPropagation()}
           className="absolute bottom-4 inset-x-2.5 z-30 flex justify-center pointer-events-auto"
         >
-          <div className="w-full max-w-md px-2.5 py-2 rounded-2xl bg-black/85 backdrop-blur-xl border border-white/15 shadow-[0_10px_35px_rgba(0,0,0,0.8)] flex items-center justify-between gap-1">
+          <div className="w-full max-w-md px-2.5 py-2 rounded-2xl bg-[#101321]/90 backdrop-blur-xl border border-[var(--pt-border,#29243D)] shadow-[0_12px_36px_rgba(0,0,0,0.85)] flex items-center justify-between gap-1">
             {/* 1. Flashlight Toggle */}
             <button
               type="button"
@@ -2335,10 +2393,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               disabled={!hasTorch}
               className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-all cursor-pointer shrink-0 ${
                 torchOn
-                  ? 'bg-amber-400 text-black shadow-[0_0_15px_rgba(251,191,36,0.6)]'
+                  ? 'bg-[#F59E0B] text-black shadow-[0_0_15px_rgba(245,158,11,0.6)]'
                   : hasTorch
-                  ? 'bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300'
-                  : 'bg-zinc-900/40 text-zinc-600 opacity-40 cursor-not-allowed'
+                  ? 'bg-[#15182A] hover:bg-white/10 text-zinc-200 border border-[var(--pt-border,#29243D)]'
+                  : 'bg-[#15182A]/40 text-zinc-600 opacity-40 cursor-not-allowed'
               }`}
               title={hasTorch ? (torchOn ? 'Torch ON' : 'Torch OFF') : 'Torch unavailable'}
               aria-label="Toggle flashlight"
@@ -2356,7 +2414,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 enumerateAllVideoInputs();
                 setIsCameraSelectModalOpen(true);
               }}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
+              className="w-11 h-11 rounded-xl bg-[#15182A] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-zinc-200 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
               title="Switch camera device"
               aria-label="Switch camera"
             >
@@ -2369,12 +2427,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               type="button"
               onClick={handleShutterCapture}
               disabled={isProcessingOcrLabel || isSnappingPhoto || activeScanConfirmation !== null}
-              className="w-14 h-14 -my-2 rounded-full bg-gradient-to-b from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 text-black flex items-center justify-center shadow-[0_0_25px_rgba(6,182,212,0.6)] active:scale-95 transition-all cursor-pointer border-2 border-white/40 shrink-0"
+              className="w-14 h-14 -my-2 rounded-full pt-btn-primary text-white flex items-center justify-center active:scale-95 transition-all cursor-pointer border-2 border-white/30 shrink-0"
               title="Capture label or barcode snapshot"
               aria-label="Capture snapshot"
             >
               {isProcessingOcrLabel ? (
-                <RefreshCw className="w-6 h-6 animate-spin text-black" />
+                <RefreshCw className="w-6 h-6 animate-spin text-white" />
               ) : (
                 <Camera className="w-6 h-6 stroke-[2.5]" />
               )}
@@ -2384,7 +2442,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={() => setIsManualModalOpen(true)}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
+              className="w-11 h-11 rounded-xl bg-[#15182A] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-zinc-200 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
               title="Type part number or code manually"
               aria-label="Manual code entry"
             >
@@ -2396,7 +2454,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={() => galleryFileInputRef.current?.click()}
-              className="w-11 h-11 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
+              className="w-11 h-11 rounded-xl bg-[#15182A] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-zinc-200 hover:text-white flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0"
               title="Import photo from gallery"
               aria-label="Import photo from gallery"
             >
@@ -2408,16 +2466,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={() => setIsSupplierModalOpen(true)}
-              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0 ${
+              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center transition-colors cursor-pointer shrink-0 border ${
                 isSupplierModalOpen
-                  ? 'bg-cyan-500 text-black shadow-[0_0_15px_rgba(6,182,212,0.5)]'
-                  : 'bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white'
+                  ? 'pt-btn-primary text-white'
+                  : 'bg-[#15182A] hover:bg-white/10 border-[var(--pt-border,#29243D)] text-zinc-200 hover:text-white'
               }`}
               title={`Supplier Format: ${activeSupplierRule.name}`}
               aria-label="Select supplier label format"
             >
               <Tag className="w-4 h-4 stroke-[2.2]" />
-              <span className="text-[8px] font-mono mt-0.5 font-bold uppercase">SUPPLIER</span>
+              <span className="text-[8px] font-mono mt-0.5 font-bold uppercase">MODE</span>
             </button>
           </div>
         </div>
@@ -2455,30 +2513,30 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           onClick={() => setIsCameraSelectModalOpen(false)}
         >
           <div
-            className="w-full max-w-sm bg-[#0B0F17] border border-cyan-500/40 rounded-2xl shadow-2xl p-5 text-white"
+            className="w-full max-w-sm bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl p-5 text-white"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
-                <Camera className="w-5 h-5 text-cyan-400" />
+                <Camera className="w-5 h-5 text-[var(--pt-primary-light,#C084FC)]" />
                 <h3 className="font-bold text-sm">Select Camera Device</h3>
               </div>
               <button
                 type="button"
                 onClick={() => setIsCameraSelectModalOpen(false)}
-                className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
+                className="w-7 h-7 rounded-full bg-[var(--pt-bg-secondary,#101321)] text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <p className="text-xs text-zinc-400 mb-3">
+            <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mb-3">
               Choose from all detected optical sensors and connected USB/Bluetooth cameras:
             </p>
 
             <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
               {availableCameras.length === 0 ? (
-                <div className="p-3 rounded-lg bg-zinc-900/60 text-xs text-zinc-400 text-center">
+                <div className="p-3 rounded-lg bg-[var(--pt-bg,#080B12)] text-xs text-zinc-400 text-center">
                   Scanning for device cameras...
                 </div>
               ) : (
@@ -2491,19 +2549,21 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                       onClick={() => handleSelectCameraDevice(cam.id)}
                       className={`w-full p-3 rounded-xl border text-left flex items-center justify-between gap-2 cursor-pointer transition-all ${
                         isSelected
-                          ? 'bg-cyan-950/60 border-cyan-400 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
-                          : 'bg-zinc-900/60 hover:bg-zinc-800 border-zinc-800 text-zinc-300'
+                          ? 'bg-[var(--pt-bg,#080B12)] border-[var(--pt-primary,#A020F0)] text-white shadow-[0_0_15px_var(--pt-glow,rgba(160,32,240,0.3))]'
+                          : 'bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/5 border-[var(--pt-border,#29243D)] text-zinc-300'
                       }`}
                     >
                       <div className="min-w-0 flex-1">
                         <div className="font-mono text-xs font-bold truncate">
                           {cam.label || `Camera ${idx + 1}`}
                         </div>
-                        <div className="text-[10px] text-zinc-500 font-mono truncate">
+                        <div className="text-[10px] text-[var(--pt-text-muted,#737B94)] font-mono truncate">
                           ID: {cam.id ? cam.id.slice(0, 16) + '...' : 'Default'}
                         </div>
                       </div>
-                      {isSelected && <Check className="w-4 h-4 text-cyan-400 shrink-0" />}
+                      {isSelected && (
+                        <Check className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)] shrink-0" />
+                      )}
                     </button>
                   );
                 })
@@ -2522,27 +2582,29 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           onClick={() => setIsSupplierModalOpen(false)}
         >
           <div
-            className="w-full max-w-sm bg-[#0B0F17] border border-cyan-500/40 rounded-2xl shadow-2xl p-5 text-white"
+            className="w-full max-w-sm bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl p-5 text-white"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <Tag className="w-5 h-5 text-cyan-400" />
-                <h3 className="font-bold text-sm">Supplier Label Format</h3>
+                <Tag className="w-5 h-5 text-[var(--pt-primary-light,#C084FC)]" />
+                <h3 className="font-bold text-sm">Scanning Mode &amp; Supplier Format</h3>
               </div>
               <button
                 type="button"
                 onClick={() => setIsSupplierModalOpen(false)}
-                className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
+                className="w-7 h-7 rounded-full bg-[var(--pt-bg-secondary,#101321)] text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
                 aria-label="Close supplier format selector"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="mb-3 px-3 py-2 rounded-xl bg-zinc-900/80 border border-zinc-800 flex items-center justify-between text-xs">
-              <span className="text-zinc-400">Active Format:</span>
-              <span className="font-mono font-bold text-cyan-400">{activeSupplierRule.name}</span>
+            <div className="mb-3 px-3 py-2 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] flex items-center justify-between text-xs">
+              <span className="text-[var(--pt-text-secondary,#A3A8BD)]">Active Format:</span>
+              <span className="font-mono font-bold text-[var(--pt-primary-light,#C084FC)]">
+                {activeSupplierRule.name}
+              </span>
             </div>
 
             <div className="space-y-2">
@@ -2577,28 +2639,30 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                     onClick={() => handleSelectSupplierRule(option.id)}
                     className={`w-full p-3 rounded-xl border text-left flex items-center justify-between gap-3 cursor-pointer transition-all ${
                       isSelected
-                        ? 'bg-cyan-950/60 border-cyan-400 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
-                        : 'bg-zinc-900/60 hover:bg-zinc-800 border-zinc-800 text-zinc-300'
+                        ? 'bg-[var(--pt-bg,#080B12)] border-[var(--pt-primary,#A020F0)] text-white shadow-[0_0_15px_var(--pt-glow,rgba(160,32,240,0.3))]'
+                        : 'bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/5 border-[var(--pt-border,#29243D)] text-zinc-300'
                     }`}
                   >
                     <div className="flex items-center gap-2.5 min-w-0 flex-1">
                       <div
                         className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
                           isSelected
-                            ? 'bg-cyan-400/20 text-cyan-300 border border-cyan-400/40'
-                            : 'bg-zinc-800 text-zinc-400'
+                            ? 'bg-[var(--pt-primary,#A020F0)]/20 text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-primary,#A020F0)]/40'
+                            : 'bg-[var(--pt-card,#15182A)] text-zinc-400'
                         }`}
                       >
                         <OptionIcon className="w-4 h-4" />
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="font-mono text-xs font-bold truncate">{option.name}</div>
-                        <div className="text-[10px] text-zinc-400 truncate mt-0.5">
+                        <div className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] truncate mt-0.5">
                           {option.subtitle}
                         </div>
                       </div>
                     </div>
-                    {isSelected && <Check className="w-4 h-4 text-cyan-400 shrink-0" />}
+                    {isSelected && (
+                      <Check className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)] shrink-0" />
+                    )}
                   </button>
                 );
               })}
@@ -2616,18 +2680,18 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           onClick={() => setIsManualModalOpen(false)}
         >
           <div
-            className="w-full max-w-sm bg-[#0B0F17] border border-cyan-500/40 rounded-2xl shadow-2xl p-5 text-white"
+            className="w-full max-w-sm bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl p-5 text-white"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
-                <Keyboard className="w-5 h-5 text-cyan-400" />
+                <Keyboard className="w-5 h-5 text-[var(--pt-primary-light,#C084FC)]" />
                 <h3 className="font-bold text-sm">Manual Part / Barcode Entry</h3>
               </div>
               <button
                 type="button"
                 onClick={() => setIsManualModalOpen(false)}
-                className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
+                className="w-7 h-7 rounded-full bg-[var(--pt-bg-secondary,#101321)] text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2635,7 +2699,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
             <form onSubmit={handleManualCodeSubmit} className="space-y-4">
               <div>
-                <label className="text-[11px] font-mono uppercase text-zinc-400 block mb-1.5 font-semibold">
+                <label className="text-[11px] font-mono uppercase text-[var(--pt-text-secondary,#A3A8BD)] block mb-1.5 font-semibold">
                   Enter Part #, Last 4 Digits or Barcode:
                 </label>
                 <input
@@ -2644,31 +2708,31 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                   value={manualCodeInput}
                   onChange={(e) => setManualCodeInput(e.target.value.toUpperCase())}
                   placeholder="e.g. 2048, BRK, or PART-9002"
-                  className="w-full h-11 px-3.5 rounded-xl bg-[#070A0F] border border-zinc-700 focus:border-cyan-400 text-white font-mono font-bold text-base outline-none uppercase shadow-inner"
+                  className="w-full h-11 px-3.5 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] focus:border-[var(--pt-primary,#A020F0)] text-white font-mono font-bold text-base outline-none uppercase shadow-inner"
                 />
 
                 {manualCandidates.length > 0 && (
                   <div className="mt-2 space-y-1">
-                    <span className="text-[10px] font-mono uppercase text-cyan-400/80 block font-semibold">
+                    <span className="text-[10px] font-mono uppercase text-[var(--pt-primary-light,#C084FC)] block font-semibold">
                       Matching parts in docket:
                     </span>
-                    <div className="max-h-36 overflow-y-auto space-y-1 pr-1 divide-y divide-zinc-800/80">
+                    <div className="max-h-36 overflow-y-auto space-y-1 pr-1 divide-y divide-[var(--pt-border,#29243D)]">
                       {manualCandidates.map((cand) => (
                         <button
                           key={cand.id}
                           type="button"
                           onClick={() => handleSelectCandidate(cand.partNumber)}
-                          className="w-full text-left p-2 rounded-lg bg-zinc-900/90 hover:bg-cyan-950/50 border border-zinc-800 hover:border-cyan-500/50 text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                          className="w-full text-left p-2 rounded-lg bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer"
                         >
                           <div className="min-w-0">
                             <span className="font-mono font-bold text-white block truncate">
                               <HighlightMatch text={cand.partNumber} query={manualCodeInput} />
                             </span>
-                            <span className="text-[11px] text-zinc-400 truncate block">
+                            <span className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] truncate block">
                               <HighlightMatch text={cand.description} query={manualCodeInput} />
                             </span>
                           </div>
-                          <span className="text-[10px] font-mono text-cyan-400 shrink-0 font-bold">
+                          <span className="text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)] shrink-0 font-bold">
                             Select ↵
                           </span>
                         </button>
@@ -2682,14 +2746,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setIsManualModalOpen(false)}
-                  className="flex-1 h-10 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-semibold text-xs cursor-pointer"
+                  className="flex-1 h-10 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-zinc-300 font-mono font-semibold text-xs cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={!manualCodeInput.trim()}
-                  className="flex-1 h-10 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-black font-bold text-xs tracking-wider uppercase cursor-pointer shadow-[0_0_15px_rgba(6,182,212,0.4)]"
+                  className="flex-1 h-10 rounded-xl pt-btn-primary disabled:opacity-40 text-white font-mono font-bold text-xs tracking-wider uppercase cursor-pointer"
                 >
                   Process Code
                 </button>
@@ -2701,3 +2765,4 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     </div>
   );
 };
+

@@ -53,7 +53,7 @@ function logWorkerOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta
     if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
     safe[k] = typeof v === 'string' ? v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300) : v;
   }
-  const msg = JSON.stringify({ timestamp: new Date().toISOString(), component: 'PalletTrack-Worker-OCR', event, ...safe });
+  const msg = JSON.stringify({ timestamp: new Date().toISOString(), component: 'PartTrack-Worker-OCR', event, ...safe });
   if (level === 'error') console.error(msg);
   else if (level === 'warn') console.warn(msg);
   else console.log(msg);
@@ -577,7 +577,8 @@ export default {
       return new Response(
         JSON.stringify({
           status: 'ok',
-          app: 'PalletTrack',
+          app: 'PartTrack',
+          tagline: 'Track every part. Every pallet. Every order.',
           runtime: 'cloudflare-worker',
           geminiConfigured: Boolean(env.GEMINI_API_KEY),
           d1Configured: Boolean(env.DB),

@@ -435,7 +435,7 @@ export async function executeGeminiFallbackExtraction(
         if (isRetryableStatus && retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES) {
           const delayMs = computeClientBackoffWithJitter(retryAttempt, baseBackoffMs);
           console.warn(
-            `[PalletTrack OCR] HTTP ${response.status} (${code || 'TRANSIENT_ERROR'}) — automatic retry ${
+            `[PartTrack OCR] HTTP ${response.status} (${code || 'TRANSIENT_ERROR'}) — automatic retry ${
               retryAttempt + 1
             }/${CLIENT_MAX_AUTOMATIC_RETRIES} in ${delayMs}ms`
           );
@@ -596,7 +596,7 @@ export async function performSmartDocketExtraction(
     });
   } catch (err: any) {
     tesseractError = err instanceof Error ? err : new Error(String(err || 'Tesseract OCR error'));
-    console.warn('[PalletTrack OCR] Primary Tesseract extraction error:', tesseractError.message);
+    console.warn('[PartTrack OCR] Primary Tesseract extraction error:', tesseractError.message);
   }
 
   // Check if Tesseract extraction passed strict completeness and confidence validation
@@ -683,7 +683,7 @@ export async function performSmartDocketExtraction(
     'Tesseract confidence below threshold';
 
   console.info(
-    `[PalletTrack OCR] Triggering Gemini fallback [${fallbackDiagnostics.outcomeCode}] (${fallbackReason})`
+    `[PartTrack OCR] Triggering Gemini fallback [${fallbackDiagnostics.outcomeCode}] (${fallbackReason})`
   );
 
   if (!isOnline || forceOffline) {
@@ -729,7 +729,7 @@ export async function performSmartDocketExtraction(
     // for manual operator review rather than crashing when Gemini fallback is unreachable.
     if (tesseractResult && tesseractResult.extractedData.items.length > 0) {
       console.warn(
-        '[PalletTrack OCR] Gemini fallback unavailable; returning Tesseract extracted rows for manual review:',
+        '[PartTrack OCR] Gemini fallback unavailable; returning Tesseract extracted rows for manual review:',
         geminiErr?.message || String(geminiErr)
       );
       const existingFlags = tesseractResult.extractedData.validationFlags || [];

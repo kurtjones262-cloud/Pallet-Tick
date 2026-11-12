@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Navbar } from './components/Navbar';
+import { Navbar, NavTabId } from './components/Navbar';
 import { ScannerView } from './components/ScannerView';
 import { ChecklistView } from './components/ChecklistView';
 import { DeliveryDashboard } from './components/DeliveryDashboard';
@@ -8,6 +8,7 @@ import { DeliveriesListModal } from './components/DeliveriesListModal';
 import { TestBarcodesModal } from './components/TestBarcodesModal';
 import { UnexpectedPartsModal } from './components/UnexpectedPartsModal';
 import { SettingsModal } from './components/SettingsModal';
+import { ReportsView } from './components/ReportsView';
 import { Delivery, PendingQuantityConfirmation, UserAccount } from './types/delivery';
 import {
   getActiveDelivery,
@@ -37,6 +38,7 @@ import {
   getStoredUser,
 } from './services/palletTrackApi';
 import { realtimeClient } from './services/realtimeSync';
+import { getStoredTheme, applyThemeToDocument } from './config/theme';
 
 export function App() {
   // Phase 2 Multi-User & RBAC State
@@ -47,7 +49,7 @@ export function App() {
   const [isUserManagementOpen, setIsUserManagementOpen] = useState(false);
 
   // Application views & state
-  const [activeTab, setActiveTab] = useState<'scanner' | 'checklist' | 'dashboard' | 'orders'>('dashboard');
+  const [activeTab, setActiveTab] = useState<NavTabId>('dashboard');
   const [activeDelivery, setActiveDelivery] = useState<Delivery | null>(null);
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
   const [externalPendingQuantity, setExternalPendingQuantity] =
@@ -70,6 +72,12 @@ export function App() {
   const [initError, setInitError] = useState<string | null>(null);
   const [showSplash, setShowSplash] = useState(true);
 
+  // Apply stored PartTrack theme immediately and when user changes
+  useEffect(() => {
+    const themeId = getStoredTheme(currentUser?.id || currentUser?.employeeCode);
+    applyThemeToDocument(themeId);
+  }, [currentUser]);
+
   const reloadDelivery = useCallback(() => {
     const current = getActiveDelivery();
     setActiveDelivery(current);
@@ -82,8 +90,8 @@ export function App() {
       setActiveDelivery(current);
       setIsAppReady(true);
     } catch (err: any) {
-      console.error('PalletTrack startup initialisation error:', err);
-      setInitError(err?.message || 'Could not initialise PalletTrack storage.');
+      console.error('PartTrack startup initialisation error:', err);
+      setInitError(err?.message || 'Could not initialise PartTrack storage.');
     }
   }, []);
 
@@ -326,7 +334,7 @@ export function App() {
     }
   };
 
-  const handleSelectTab = (tab: 'scanner' | 'checklist' | 'dashboard' | 'orders') => {
+  const handleSelectTab = (tab: NavTabId) => {
     if (tab !== 'checklist') {
       setChecklistPalletFilter('all');
     }
@@ -336,7 +344,7 @@ export function App() {
   // If not logged in, display the PIN login screen
   if (!isCheckingAuth && !currentUser) {
     return (
-      <div className="min-h-dvh bg-[#070A0F]">
+      <div className="min-h-dvh bg-[var(--pt-bg)]">
         <LoginView
           onLoginSuccess={handleLoginSuccess}
           onOpenSetupAdmin={() => setIsFirstTimeSetupOpen(true)}
@@ -355,7 +363,7 @@ export function App() {
     <div
       className={`${
         activeTab === 'scanner' ? 'h-dvh overflow-hidden' : 'min-h-dvh'
-      } bg-[#070A0F] text-slate-100 flex flex-col font-sans selection:bg-cyan-500/20 selection:text-cyan-200`}
+      } bg-[var(--pt-bg)] text-white flex flex-col font-sans`}
     >
       {/* Startup Splash Screen */}
       {showSplash && (
@@ -400,10 +408,14 @@ export function App() {
               setActiveTab('checklist');
             }}
             onNavigateToOrders={() => setActiveTab('orders')}
+            onNavigateToReports={() => setActiveTab('reports')}
             onStartScanning={() => setActiveTab('scanner')}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
             onOpenSettings={() => setIsSettingsOpen(true)}
+            onOpenUserManagement={() => setIsUserManagementOpen(true)}
+            onLogout={handleLogout}
+            currentUser={currentUser}
           />
         )}
 
@@ -411,12 +423,23 @@ export function App() {
           <OrdersView
             activeDelivery={activeDelivery}
             onSelectDelivery={handleUpdateDelivery}
-            onNavigateToChecklist={(pallet) => {
+            onUpdateDelivery={handleUpdateDelivery}
+            onNavigateToChecklist={(pallet?: string) => {
               setChecklistPalletFilter(pallet || 'all');
               setActiveTab('checklist');
             }}
             onStartScanning={() => setActiveTab('scanner')}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+          />
+        )}
+
+        {activeTab === 'reports' && (
+          <ReportsView
+            activeDelivery={activeDelivery}
+            onSelectDelivery={(del) => {
+              handleUpdateDelivery(del);
+              setActiveTab('checklist');
+            }}
           />
         )}
 
@@ -441,6 +464,8 @@ export function App() {
             onOpenUnexpectedModal={() => setIsUnexpectedOpen(true)}
             initialPalletFilter={checklistPalletFilter}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+            onStartScanning={() => setActiveTab('scanner')}
+            onNavigateToOrders={() => setActiveTab('orders')}
           />
         )}
       </main>
@@ -488,6 +513,8 @@ export function App() {
           onClose={() => setIsSettingsOpen(false)}
           onSettingsSaved={() => reloadDelivery()}
           onOpenMigration={() => setIsMigrationModalOpen(true)}
+          currentUser={currentUser}
+          onOpenUserManagement={() => setIsUserManagementOpen(true)}
         />
       )}
 

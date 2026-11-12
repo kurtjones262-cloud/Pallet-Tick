@@ -334,7 +334,7 @@ export async function getOrInitDocketTesseractWorker(
         return worker;
       } catch (firstErr: any) {
         console.warn(
-          '[PalletTrack Docket Tesseract] Primary worker init failed, clearing stale IndexedDB cache and retrying with blob URL fallback:',
+          '[PartTrack Docket Tesseract] Primary worker init failed, clearing stale IndexedDB cache and retrying with blob URL fallback:',
           firstErr?.message || String(firstErr)
         );
         // Clear stale/corrupted IndexedDB keyval-store entries ONLY when recovering from an init error
@@ -1258,7 +1258,7 @@ export async function extractDocketWithTesseractFirst(
   extractedData.tesseractDiagnostics = diagnostics;
 
   // Safe operational telemetry (never logs document contents, API keys, or secrets)
-  console.info('[PalletTrack Tesseract Diagnostics]', {
+  console.info('[PartTrack Tesseract Diagnostics]', {
     outcomeCode: diagnostics.outcomeCode,
     outcomeLabel: diagnostics.outcomeLabel,
     totalElapsedMs: diagnostics.totalElapsedMs,

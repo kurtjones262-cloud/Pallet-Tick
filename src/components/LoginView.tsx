@@ -13,6 +13,8 @@ import {
 } from 'lucide-react';
 import { apiLogin, getStoredUser } from '../services/palletTrackApi';
 import { UserAccount } from '../types/delivery';
+import { BRANDING } from '../config/branding';
+import { PartTrackLogo } from './PartTrackLogo';
 
 interface LoginViewProps {
   onLoginSuccess: (user: UserAccount) => void;
@@ -37,14 +39,12 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
   const codeInputRef = useRef<HTMLInputElement>(null);
 
-  // Focus employee code on mount if empty
   useEffect(() => {
     if (!employeeCode) {
       codeInputRef.current?.focus();
     }
   }, [employeeCode]);
 
-  // Lockout countdown timer
   useEffect(() => {
     if (!isLocked || lockoutRemainingSeconds <= 0) return;
     const timer = setInterval(() => {
@@ -92,7 +92,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
         if (err.code === 'ACCOUNT_LOCKED' || msg.includes('locked')) {
           setIsLocked(true);
-          setLockoutRemainingSeconds(15 * 60); // 15 minutes lockout
+          setLockoutRemainingSeconds(15 * 60);
           setErrorMessage(msg);
         } else {
           setErrorMessage(msg);
@@ -104,14 +104,12 @@ export const LoginView: React.FC<LoginViewProps> = ({
     [employeeCode, pin, isLocked, onLoginSuccess]
   );
 
-  // Number key press handler
   const handleDigitPress = (digit: string) => {
     if (isLoading || isLocked) return;
     if (pin.length < 4) {
       const nextPin = pin + digit;
       setPin(nextPin);
       setErrorMessage(null);
-      // Auto-submit when 4th digit is entered
       if (nextPin.length === 4 && employeeCode.trim()) {
         handleLogin(employeeCode, nextPin);
       }
@@ -130,10 +128,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
     setErrorMessage(null);
   };
 
-  // Keyboard listener for physical keyboard & barcode scanner entry
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't capture when typing inside the employee code text input
       if (document.activeElement === codeInputRef.current) {
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -170,32 +166,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
   };
 
   return (
-    <div className="min-h-dvh w-full bg-[#070A0F] text-slate-100 flex flex-col justify-between p-4 sm:p-6 selection:bg-cyan-500/20">
+    <div className="min-h-dvh w-full bg-[var(--pt-bg,#080B12)] text-white flex flex-col justify-between p-4 sm:p-6 selection:bg-[var(--pt-primary,#A020F0)]/30">
       {/* Top Header / Branding */}
       <div className="w-full max-w-sm mx-auto flex items-center justify-between pt-2">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg overflow-hidden bg-black border border-cyan-500/30 shadow-[0_0_12px_rgba(0,168,255,0.3)]">
-            <img
-              src="/pallettrack-icon.png"
-              alt="PalletTrack"
-              className="w-full h-full object-cover"
-            />
-          </div>
-          <div>
-            <div className="text-sm font-bold tracking-tight text-white font-mono flex items-center gap-1.5">
-              PALLETTRACK
-              <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950/80 border border-cyan-500/30 text-cyan-400 font-sans font-semibold">
-                PHASE 2
-              </span>
-            </div>
-            <div className="text-[10px] text-slate-400 tracking-wider uppercase font-mono">
-              Workshop Terminal Access
-            </div>
-          </div>
-        </div>
+        <PartTrackLogo size="sm" showTagline />
 
-        <div className="flex items-center gap-1.5 text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-950/50 border border-emerald-500/30 text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+        <div className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-[#00D979]/15 border border-[#00D979]/40 text-[#00D979]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#00D979] animate-pulse" />
           <span>D1 Online</span>
         </div>
       </div>
@@ -204,8 +181,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
       <div className="w-full max-w-sm mx-auto my-auto py-4">
         {/* First-time Setup Prompt if no Super Admin exists */}
         {!hasAdmin && (
-          <div className="mb-4 p-4 rounded-xl bg-amber-950/40 border border-amber-500/40 text-amber-200">
-            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-300 mb-1">
+          <div className="mb-4 p-4 rounded-2xl bg-[#F59E0B]/15 border border-[#F59E0B]/40 text-amber-200">
+            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#F59E0B] mb-1">
               <ShieldAlert className="w-4 h-4" />
               Initial Super Admin Setup Required
             </div>
@@ -214,7 +191,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
             </p>
             <button
               onClick={onOpenSetupAdmin}
-              className="w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+              className="w-full py-2.5 px-3 rounded-xl bg-[#F59E0B] hover:bg-amber-400 text-black font-mono font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer flex items-center justify-center gap-1.5"
             >
               <span>Setup Initial Super Admin</span>
               <ArrowRight className="w-3.5 h-3.5" />
@@ -224,25 +201,25 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
         {/* Lockout Banner */}
         {isLocked && (
-          <div className="mb-4 p-4 rounded-xl bg-rose-950/60 border border-rose-500/50 text-rose-200 animate-pulse">
-            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-rose-400 mb-1">
+          <div className="mb-4 p-4 rounded-2xl bg-[#EF4444]/15 border border-[#EF4444]/50 text-red-200 animate-pulse">
+            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#EF4444] mb-1">
               <AlertTriangle className="w-4 h-4" />
               Terminal Account Locked
             </div>
-            <p className="text-xs text-rose-200/90 leading-relaxed">
+            <p className="text-xs text-red-200/90 leading-relaxed">
               Exceeded 5 consecutive failed login attempts. Account access is temporarily suspended for security.
             </p>
-            <div className="mt-2 text-lg font-mono font-bold text-rose-300">
+            <div className="mt-2 text-lg font-mono font-bold text-[#EF4444]">
               Unlock in: {formatLockoutTime(lockoutRemainingSeconds)}
             </div>
           </div>
         )}
 
         {/* Credentials Form Box */}
-        <div className="bg-[#0E1626]/90 border border-[#1E2D44] rounded-2xl p-5 shadow-2xl backdrop-blur-md">
+        <div className="bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl p-5 shadow-2xl">
           {/* Employee Identifier Input */}
           <div className="mb-4">
-            <label className="block text-[11px] font-mono uppercase tracking-wider text-slate-400 mb-1.5">
+            <label className="block text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] mb-1.5">
               Employee Identifier
             </label>
             <div className="relative">
@@ -256,24 +233,24 @@ export const LoginView: React.FC<LoginViewProps> = ({
                 }}
                 disabled={isLoading || isLocked}
                 placeholder="e.g. EMP-101 or ADMIN-01"
-                className="w-full px-3.5 py-2.5 bg-[#070A0F] border border-[#1E2D44] rounded-xl text-white font-mono text-sm tracking-wider uppercase focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 transition-all placeholder:text-slate-600 disabled:opacity-50"
+                className="w-full px-3.5 py-2.5 bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] rounded-xl text-white font-mono text-sm tracking-wider uppercase focus:outline-none focus:border-[var(--pt-primary,#A020F0)] transition-all placeholder:text-[var(--pt-text-muted,#737B94)] disabled:opacity-50"
               />
-              <User className="absolute right-3 top-3 w-4 h-4 text-slate-500 pointer-events-none" />
+              <User className="absolute right-3 top-3 w-4 h-4 text-[var(--pt-text-muted,#737B94)] pointer-events-none" />
             </div>
           </div>
 
           {/* 4-Digit PIN Status Display */}
           <div className="mb-5">
             <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[11px] font-mono uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                <KeyRound className="w-3.5 h-3.5 text-cyan-400" />
+              <label className="text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] flex items-center gap-1.5">
+                <KeyRound className="w-3.5 h-3.5 text-[var(--pt-primary-light,#C084FC)]" />
                 4-Digit Security PIN
               </label>
               {pin.length > 0 && (
                 <button
                   type="button"
                   onClick={handleClearPin}
-                  className="text-[10px] font-mono text-cyan-400 hover:text-cyan-300 cursor-pointer"
+                  className="text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)] hover:underline cursor-pointer"
                 >
                   Clear
                 </button>
@@ -290,16 +267,24 @@ export const LoginView: React.FC<LoginViewProps> = ({
                     key={index}
                     className={`rounded-xl flex items-center justify-center transition-all ${
                       isFilled
-                        ? 'bg-cyan-500/20 border-2 border-cyan-400 shadow-[0_0_12px_rgba(0,168,255,0.4)]'
+                        ? 'bg-[var(--pt-primary,#A020F0)]/20 border-2 border-[var(--pt-primary-light,#C084FC)] shadow-[0_0_12px_var(--pt-glow,rgba(160,32,240,0.4))]'
                         : isCurrent
-                        ? 'bg-[#070A0F] border-2 border-cyan-500/60'
-                        : 'bg-[#070A0F] border border-[#1E2D44]'
+                        ? 'bg-[var(--pt-bg,#080B12)] border-2 border-[var(--pt-primary,#A020F0)]/60'
+                        : 'bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)]'
                     }`}
                   >
                     {isFilled ? (
-                      <div className="w-3.5 h-3.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(0,168,255,0.8)]" />
+                      <div
+                        className="w-3.5 h-3.5 rounded-full"
+                        style={{
+                          backgroundColor: 'var(--pt-primary-light, #C084FC)',
+                          boxShadow: '0 0 8px var(--pt-primary, #A020F0)',
+                        }}
+                      />
                     ) : (
-                      <span className="text-slate-700 text-xs font-mono">•</span>
+                      <span className="text-[var(--pt-text-muted,#737B94)] text-xs font-mono">
+                        •
+                      </span>
                     )}
                   </div>
                 );
@@ -309,8 +294,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
           {/* Error Message */}
           {errorMessage && !isLocked && (
-            <div className="mb-4 p-3 rounded-xl bg-rose-950/40 border border-rose-500/40 text-rose-300 text-xs flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+            <div className="mb-4 p-3 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-red-200 text-xs flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-[#EF4444]" />
               <span>{errorMessage}</span>
             </div>
           )}
@@ -323,7 +308,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                 type="button"
                 onClick={() => handleDigitPress(digit)}
                 disabled={isLoading || isLocked}
-                className="h-12 rounded-xl bg-[#070A0F] hover:bg-[#141D30] active:scale-95 border border-[#1E2D44] hover:border-cyan-500/40 text-white text-lg font-mono font-bold transition-all cursor-pointer shadow-sm disabled:opacity-40"
+                className="h-12 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-bg-secondary,#101321)] active:scale-95 border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)]/50 text-white text-lg font-mono font-bold transition-all cursor-pointer shadow-sm disabled:opacity-40"
               >
                 {digit}
               </button>
@@ -332,7 +317,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
               type="button"
               onClick={handleClearPin}
               disabled={isLoading || isLocked || pin.length === 0}
-              className="h-12 rounded-xl bg-[#070A0F] hover:bg-[#141D30] active:scale-95 border border-[#1E2D44] hover:border-slate-500 text-slate-400 hover:text-slate-200 text-xs font-mono uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center disabled:opacity-30"
+              className="h-12 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-bg-secondary,#101321)] active:scale-95 border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white text-xs font-mono uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center disabled:opacity-30"
               title="Clear PIN"
             >
               <RotateCcw className="w-4 h-4" />
@@ -341,7 +326,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
               type="button"
               onClick={() => handleDigitPress('0')}
               disabled={isLoading || isLocked}
-              className="h-12 rounded-xl bg-[#070A0F] hover:bg-[#141D30] active:scale-95 border border-[#1E2D44] hover:border-cyan-500/40 text-white text-lg font-mono font-bold transition-all cursor-pointer shadow-sm disabled:opacity-40"
+              className="h-12 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-bg-secondary,#101321)] active:scale-95 border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)]/50 text-white text-lg font-mono font-bold transition-all cursor-pointer shadow-sm disabled:opacity-40"
             >
               0
             </button>
@@ -349,7 +334,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
               type="button"
               onClick={handleBackspace}
               disabled={isLoading || isLocked || pin.length === 0}
-              className="h-12 rounded-xl bg-[#070A0F] hover:bg-[#141D30] active:scale-95 border border-[#1E2D44] hover:border-slate-500 text-slate-400 hover:text-slate-200 text-xs font-mono uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center disabled:opacity-30"
+              className="h-12 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-bg-secondary,#101321)] active:scale-95 border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white text-xs font-mono uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center disabled:opacity-30"
               title="Backspace"
             >
               <Delete className="w-5 h-5" />
@@ -361,11 +346,11 @@ export const LoginView: React.FC<LoginViewProps> = ({
             type="button"
             onClick={() => handleLogin()}
             disabled={isLoading || isLocked || !employeeCode.trim() || pin.length !== 4}
-            className="w-full py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-500 hover:from-cyan-400 hover:to-sky-400 text-black font-bold font-mono text-sm uppercase tracking-wider shadow-[0_0_20px_rgba(0,168,255,0.4)] transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center gap-2"
+            className="w-full py-3 rounded-xl pt-btn-primary text-white font-bold font-mono text-sm uppercase tracking-wider transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center gap-2"
           >
             {isLoading ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin text-black" />
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
                 <span>Verifying PIN...</span>
               </>
             ) : (
@@ -378,21 +363,45 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
           {/* Quick Terminal Access (One-Tap Preview / Workshop Role Switcher) */}
           {hasAdmin && (
-            <div className="mt-4 pt-3.5 border-t border-[#1E2D44]/80">
+            <div className="mt-4 pt-3.5 border-t border-[var(--pt-border,#29243D)]">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)]">
                   Quick Terminal Access (1-Tap Login)
                 </span>
-                <span className="text-[9px] font-mono text-cyan-400/80">
+                <span className="text-[9px] font-mono text-[var(--pt-primary-light,#C084FC)]">
                   Auto-fills ID &amp; PIN
                 </span>
               </div>
               <div className="grid grid-cols-2 gap-1.5">
                 {[
-                  { code: 'SUPER-01', pin: '1234', label: 'Super Admin', badgeClass: 'border-amber-500/40 text-amber-300 hover:bg-amber-950/40' },
-                  { code: 'ADMIN-01', pin: '1111', label: 'Admin', badgeClass: 'border-indigo-500/40 text-indigo-300 hover:bg-indigo-950/40' },
-                  { code: 'SUP-01', pin: '2222', label: 'Supervisor', badgeClass: 'border-cyan-500/40 text-cyan-300 hover:bg-cyan-950/40' },
-                  { code: 'EMP-01', pin: '3333', label: 'Employee', badgeClass: 'border-emerald-500/40 text-emerald-300 hover:bg-emerald-950/40' },
+                  {
+                    code: 'SUPER-01',
+                    pin: '1234',
+                    label: 'Super Admin',
+                    badgeClass:
+                      'border-[#F59E0B]/40 text-[#F59E0B] hover:bg-amber-950/40',
+                  },
+                  {
+                    code: 'ADMIN-01',
+                    pin: '1111',
+                    label: 'Admin',
+                    badgeClass:
+                      'border-[#A020F0]/50 text-[#C084FC] hover:bg-purple-950/40',
+                  },
+                  {
+                    code: 'SUP-01',
+                    pin: '2222',
+                    label: 'Supervisor',
+                    badgeClass:
+                      'border-[#078BFF]/40 text-[#38BDF8] hover:bg-sky-950/40',
+                  },
+                  {
+                    code: 'EMP-01',
+                    pin: '3333',
+                    label: 'Operator',
+                    badgeClass:
+                      'border-[#00D979]/40 text-[#00D979] hover:bg-emerald-950/40',
+                  },
                 ].map((acct) => (
                   <button
                     key={acct.code}
@@ -404,15 +413,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
                       setErrorMessage(null);
                       handleLogin(acct.code, acct.pin);
                     }}
-                    className={`px-2.5 py-1.5 rounded-lg bg-[#070A0F] border ${acct.badgeClass} transition-all cursor-pointer flex items-center justify-between text-left disabled:opacity-40`}
+                    className={`px-2.5 py-1.5 rounded-lg bg-[var(--pt-bg,#080B12)] border ${acct.badgeClass} transition-all cursor-pointer flex items-center justify-between text-left disabled:opacity-40`}
                   >
                     <div>
                       <div className="text-[11px] font-mono font-bold text-white leading-tight">
                         {acct.code}
                       </div>
-                      <div className="text-[9px] font-mono opacity-80">
-                        {acct.label}
-                      </div>
+                      <div className="text-[9px] font-mono opacity-85">{acct.label}</div>
                     </div>
                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-slate-300">
                       PIN {acct.pin}
@@ -426,31 +433,17 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
         {/* Roles information help */}
         <div className="mt-4 text-center">
-          <p className="text-[11px] text-slate-500 font-mono">
-            Fast 4-digit PIN authentication for workshop terminals
+          <p className="text-[11px] text-[var(--pt-text-muted,#737B94)] font-mono">
+            {BRANDING.tagline}
           </p>
-          <div className="flex flex-wrap items-center justify-center gap-3 mt-2 text-[10px] font-mono text-slate-400">
-            <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" /> Super Admin
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" /> Admin
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" /> Supervisor
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Employee
-            </span>
-          </div>
         </div>
       </div>
 
       {/* Footer Info */}
-      <div className="w-full max-w-sm mx-auto text-center pb-2 text-[10px] text-slate-600 font-mono flex items-center justify-between">
-        <span>PalletTrack v2.0-RBAC</span>
-        <span className="flex items-center gap-1 text-slate-500">
-          <Server className="w-3 h-3 text-slate-500" />
+      <div className="w-full max-w-sm mx-auto text-center pb-2 text-[10px] text-[var(--pt-text-muted,#737B94)] font-mono flex items-center justify-between">
+        <span>{BRANDING.versionLabel}</span>
+        <span className="flex items-center gap-1">
+          <Server className="w-3 h-3" />
           Multi-User D1 Auth
         </span>
       </div>

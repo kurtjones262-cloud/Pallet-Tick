@@ -118,7 +118,7 @@ export async function checkBackendConnection(): Promise<BackendHealth> {
       const data: any = await res.json().catch(() => ({}));
       const health: BackendHealth = {
         connected: Boolean(data.dbConnected !== false),
-        app: data.app || 'PalletTrack',
+        app: data.app || 'PartTrack',
         database: data.database || 'Cloudflare D1',
         dbConnected: data.dbConnected,
         hasAdmin: data.hasAdmin,

@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.pallettick.app',
-  appName: 'PalletTick',
+  appName: 'PartTrack',
   webDir: 'dist',
   backgroundColor: '#F6F5F2',
   server: {

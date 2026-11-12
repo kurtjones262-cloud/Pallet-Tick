@@ -13,7 +13,6 @@ import {
   ChevronDown,
   ChevronUp,
   Edit3,
-  Trash2,
   ArrowRight,
   ShieldCheck,
   AlertCircle,
@@ -94,13 +93,11 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
     if (!delivery || !delivery.parts || !partNumber.trim()) return null;
     const cleanNorm = partNumber.trim().toUpperCase().replace(/\s*-\s*/g, '-');
 
-    // 1. Exact partNumber match
     const exact = delivery.parts.find(
       (p) => p.partNumber.trim().toUpperCase().replace(/\s*-\s*/g, '-') === cleanNorm
     );
     if (exact) return exact;
 
-    // 2. Barcode item number match
     const itemMatch = delivery.parts.find((p) => {
       const itmClean = (p.itemNumber || '').trim().toUpperCase();
       return itmClean && (itmClean === cleanNorm || itmClean.replace(/^ITM-0*/, '') === cleanNorm);
@@ -110,7 +107,6 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
     return null;
   }, [delivery, partNumber]);
 
-  // Candidate suggestions if not exact match
   const candidateParts = useMemo(() => {
     if (resolvedMatchedPart || !delivery || !delivery.parts) return [];
     const q = partNumber.trim().toUpperCase();
@@ -125,7 +121,6 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
       .slice(0, 4);
   }, [delivery, partNumber, resolvedMatchedPart]);
 
-  // When matched part changes or user selects candidate, auto-fill description if blank
   const handleSelectCandidate = (candidate: DeliveryPart) => {
     setPartNumber(candidate.partNumber);
     if (!description.trim() || description === 'Unlisted Part') {
@@ -181,54 +176,90 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
     }
   };
 
-  // Determine badge styling and label
   const methodBadge = useMemo(() => {
     switch (scan.scanMethod) {
       case 'qr_code':
-        return { label: '2D QR Code', icon: QrCode, color: 'text-cyan-400 bg-cyan-950/70 border-cyan-500/40' };
+        return {
+          label: '2D QR Code',
+          icon: QrCode,
+          color:
+            'text-[var(--pt-primary-light,#C084FC)] bg-[var(--pt-bg,#080B12)] border-[var(--pt-primary,#A020F0)]/50',
+        };
       case 'ocr_label':
-        return { label: 'Pallet Label OCR', icon: FileText, color: 'text-amber-400 bg-amber-950/70 border-amber-500/40' };
+        return {
+          label: 'Pallet Label OCR',
+          icon: FileText,
+          color: 'text-[#F59E0B] bg-amber-950/70 border-[#F59E0B]/40',
+        };
       case 'external_hid':
-        return { label: 'Hardware Scanner', icon: Barcode, color: 'text-emerald-400 bg-emerald-950/70 border-emerald-500/40' };
+        return {
+          label: 'Hardware Scanner',
+          icon: Barcode,
+          color: 'text-[#00D979] bg-emerald-950/70 border-[#00D979]/40',
+        };
       case 'manual':
-        return { label: 'Manual Entry', icon: Keyboard, color: 'text-zinc-300 bg-zinc-800 border-zinc-700' };
+        return {
+          label: 'Manual Entry',
+          icon: Keyboard,
+          color: 'text-zinc-200 bg-zinc-800 border-zinc-700',
+        };
       default:
-        return { label: '1D Barcode', icon: Barcode, color: 'text-blue-400 bg-blue-950/70 border-blue-500/40' };
+        return {
+          label: '1D Barcode',
+          icon: Barcode,
+          color: 'text-[#078BFF] bg-sky-950/70 border-[#078BFF]/40',
+        };
     }
   }, [scan.scanMethod]);
 
   const MethodIcon = methodBadge.icon;
 
-  // Verification state badge
+  // Verification status & remaining quantity computation
   const verificationStatus = useMemo(() => {
     if (!resolvedMatchedPart) {
       return {
-        type: 'unlisted',
-        title: 'Unlisted Item',
-        message: `Code "${scan.rawCode || partNumber}" is not on docket #${scan.docketNumber}`,
-        badgeClass: 'bg-amber-500/15 border-amber-500/40 text-amber-300',
+        type: 'unlisted' as const,
+        title: 'DOCKET MISMATCH — UNLISTED PART',
+        message: `Part "${scan.rawCode || partNumber}" is not listed on Docket #${scan.docketNumber}. Will be flagged for review.`,
+        badgeClass: 'bg-[#F59E0B]/15 border-[#F59E0B]/50 text-[#F59E0B]',
+        requiredQty: parsedQty,
+        remainingQty: 0,
       };
     }
 
-    const { state, requiredQty, receivedQty } = getPartVerificationState(resolvedMatchedPart);
+    const { requiredQty } = getPartVerificationState(resolvedMatchedPart);
     const itemNoBadge = resolvedMatchedPart.itemNumber
       ? resolvedMatchedPart.itemNumber.replace(/^ITM-0*/i, '')
       : String(resolvedMatchedPart.docketLineIndex || 1);
+    const remainingAfterScan = Math.max(0, requiredQty - parsedQty);
 
     if (parsedQty === requiredQty) {
       return {
-        type: 'exact_match',
-        title: `Matched Docket Item #${itemNoBadge}`,
-        message: `Full quantity verified (${parsedQty} of ${requiredQty} required)`,
-        badgeClass: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300',
+        type: 'exact_match' as const,
+        title: `VERIFIED — DOCKET ITEM #${itemNoBadge}`,
+        message: `Full quantity verified (${parsedQty} of ${requiredQty} required • 0 remaining)`,
+        badgeClass: 'bg-[#00D979]/15 border-[#00D979]/50 text-[#00D979]',
+        requiredQty,
+        remainingQty: 0,
+      };
+    } else if (parsedQty > requiredQty) {
+      const overage = parsedQty - requiredQty;
+      return {
+        type: 'overage' as const,
+        title: `OVERAGE FLAG — DOCKET ITEM #${itemNoBadge}`,
+        message: `Overage detected: +${overage} over required quantity (${parsedQty} entered vs ${requiredQty} required)`,
+        badgeClass: 'bg-[#EF4444]/15 border-[#EF4444]/50 text-[#EF4444]',
+        requiredQty,
+        remainingQty: 0,
       };
     } else {
-      const diff = parsedQty - requiredQty;
       return {
-        type: 'quantity_mismatch',
-        title: `Matched Docket Item #${itemNoBadge}`,
-        message: `Quantity mismatch: ${parsedQty} entered vs ${requiredQty} required (${diff > 0 ? `+${diff}` : diff})`,
-        badgeClass: 'bg-orange-500/15 border-orange-500/40 text-orange-300',
+        type: 'partial_match' as const,
+        title: `PARTIAL RECEIPT — DOCKET ITEM #${itemNoBadge}`,
+        message: `${parsedQty} of ${requiredQty} received • ${remainingAfterScan} remaining`,
+        badgeClass: 'bg-[#F59E0B]/15 border-[#F59E0B]/50 text-[#F59E0B]',
+        requiredQty,
+        remainingQty: remainingAfterScan,
       };
     }
   }, [resolvedMatchedPart, parsedQty, scan.docketNumber, scan.rawCode, partNumber]);
@@ -239,27 +270,28 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 backdrop-blur-md p-3 sm:p-4 pb-6 sm:pb-4 animate-in fade-in duration-200"
       onClick={(e) => {
-        // Prevent background clicks from closing unintentionally without user choosing Cancel
         e.stopPropagation();
       }}
     >
       <div
-        className="w-full max-w-lg bg-[#0B0F17] text-white rounded-2xl border border-cyan-500/30 shadow-[0_0_50px_rgba(0,168,255,0.3)] flex flex-col max-h-[90dvh] sm:max-h-[88dvh] overflow-hidden animate-in zoom-in-95 duration-200 my-auto"
+        className="w-full max-w-lg bg-[var(--pt-card,#15182A)] text-white rounded-2xl border border-[var(--pt-primary,#A020F0)]/50 shadow-[0_0_50px_var(--pt-glow,rgba(160,32,240,0.35))] flex flex-col max-h-[90dvh] sm:max-h-[88dvh] overflow-hidden animate-in zoom-in-95 duration-200 my-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Top Header Bar: Scan Method + Docket Association + Discard Button */}
-        <div className="px-4 py-3 bg-[#0F1624] border-b border-zinc-800/80 flex items-center justify-between gap-2 shrink-0">
+        <div className="px-4 py-3 bg-[var(--pt-bg-secondary,#101321)] border-b border-[var(--pt-border,#29243D)] flex items-center justify-between gap-2 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
             <span
-              className={`px-2 py-0.5 rounded-[4px] border text-[11px] font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 shrink-0 ${methodBadge.color}`}
+              className={`px-2 py-0.5 rounded-md border text-[11px] font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 shrink-0 ${methodBadge.color}`}
             >
               <MethodIcon className="w-3 h-3 shrink-0" />
               <span>{methodBadge.label}</span>
             </span>
-            <div className="text-xs text-zinc-400 font-mono truncate">
+            <div className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] font-mono truncate">
               <span>Docket #{scan.docketNumber}</span>
               {scan.customerOrSupplier && (
-                <span className="text-zinc-500 ml-1.5 font-sans">• {scan.customerOrSupplier}</span>
+                <span className="text-[var(--pt-text-muted,#737B94)] ml-1.5 font-sans">
+                  • {scan.customerOrSupplier}
+                </span>
               )}
             </div>
           </div>
@@ -267,7 +299,7 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
           <button
             type="button"
             onClick={onDiscard}
-            className="w-8 h-8 rounded-full bg-zinc-800/70 hover:bg-zinc-700 text-zinc-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer shrink-0"
+            className="w-8 h-8 rounded-full bg-[var(--pt-bg,#080B12)] hover:bg-white/10 text-zinc-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer shrink-0 border border-[var(--pt-border,#29243D)]"
             title="Discard this scan"
             aria-label="Discard scan"
           >
@@ -279,20 +311,20 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
         <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4">
           {/* Validation Status Card */}
           <div
-            className={`p-3 rounded-xl border flex items-start gap-2.5 transition-colors ${verificationStatus.badgeClass}`}
+            className={`p-3.5 rounded-xl border flex items-start gap-2.5 transition-colors ${verificationStatus.badgeClass}`}
           >
             {verificationStatus.type === 'exact_match' ? (
-              <ShieldCheck className="w-5 h-5 shrink-0 text-emerald-400 mt-0.5" />
-            ) : verificationStatus.type === 'quantity_mismatch' ? (
-              <AlertTriangle className="w-5 h-5 shrink-0 text-orange-400 mt-0.5" />
+              <ShieldCheck className="w-5 h-5 shrink-0 text-[#00D979] mt-0.5" />
+            ) : verificationStatus.type === 'overage' ? (
+              <AlertTriangle className="w-5 h-5 shrink-0 text-[#EF4444] mt-0.5" />
             ) : (
-              <AlertCircle className="w-5 h-5 shrink-0 text-amber-400 mt-0.5" />
+              <AlertCircle className="w-5 h-5 shrink-0 text-[#F59E0B] mt-0.5" />
             )}
             <div className="min-w-0 flex-1">
-              <div className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5">
+              <div className="font-mono font-extrabold text-xs uppercase tracking-wide flex items-center gap-1.5">
                 <span>{verificationStatus.title}</span>
               </div>
-              <p className="text-[11px] opacity-90 mt-0.5 leading-snug">
+              <p className="text-[11px] font-mono opacity-95 mt-0.5 leading-snug">
                 {verificationStatus.message}
               </p>
             </div>
@@ -300,8 +332,8 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
 
           {/* Unconfident Field Warning if applicable */}
           {scan.unconfidentFields && scan.unconfidentFields.length > 0 && (
-            <div className="px-3 py-2 rounded-lg bg-amber-950/40 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
-              <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <div className="px-3 py-2 rounded-lg bg-[#F59E0B]/15 border border-[#F59E0B]/40 text-amber-200 text-xs flex items-center gap-2">
+              <Sparkles className="w-3.5 h-3.5 text-[#F59E0B] shrink-0" />
               <span>
                 Please check {scan.unconfidentFields.join(' and ')} — verification recommended.
               </span>
@@ -310,47 +342,45 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
 
           {/* Validation Error Message */}
           {validationError && (
-            <div className="px-3 py-2 rounded-lg bg-red-950/60 border border-red-500/40 text-red-200 text-xs flex items-center gap-2 animate-shake">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+            <div className="px-3 py-2 rounded-lg bg-[#EF4444]/20 border border-[#EF4444]/50 text-red-200 text-xs flex items-center gap-2 animate-shake">
+              <AlertCircle className="w-4 h-4 text-[#EF4444] shrink-0" />
               <span>{validationError}</span>
             </div>
           )}
 
-          {/* Primary Form Card: Part Number, Description, Quantity */}
-          <div className="bg-[#111722] border border-zinc-800 rounded-xl p-4 space-y-4 shadow-sm">
+          {/* Primary Form Card: Part Number, Description, Quantity, Remaining */}
+          <div className="bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] rounded-xl p-4 space-y-4 shadow-sm">
             {/* Field 1: Part Number */}
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label className="text-[11px] font-mono uppercase tracking-wider text-zinc-400 font-semibold">
+                <label className="text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] font-semibold">
                   Part Number
                 </label>
                 {resolvedMatchedPart ? (
-                  <span className="text-[10px] font-mono text-emerald-400 font-medium">
-                    ✓ Verified on Docket
+                  <span className="text-[10px] font-mono text-[#00D979] font-bold">
+                    ✓ Matched on Docket
                   </span>
                 ) : (
-                  <span className="text-[10px] font-mono text-amber-400 font-medium">
-                    New / Unlisted Part
+                  <span className="text-[10px] font-mono text-[#F59E0B] font-bold">
+                    ! Unlisted / Mismatch
                   </span>
                 )}
               </div>
-              <div className="relative">
-                <input
-                  type="text"
-                  value={partNumber}
-                  onChange={(e) => {
-                    setPartNumber(e.target.value.toUpperCase());
-                    setValidationError(null);
-                  }}
-                  placeholder="e.g. PART-10293"
-                  className="w-full h-11 px-3.5 rounded-lg bg-[#070A0F] border border-zinc-700/80 focus:border-cyan-400 text-white font-mono font-bold text-base tracking-wide uppercase outline-none shadow-inner transition-colors"
-                />
-              </div>
+              <input
+                type="text"
+                value={partNumber}
+                onChange={(e) => {
+                  setPartNumber(e.target.value.toUpperCase());
+                  setValidationError(null);
+                }}
+                placeholder="e.g. PART-10293"
+                className="w-full h-11 px-3.5 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] focus:border-[var(--pt-primary,#A020F0)] text-white font-mono font-bold text-base tracking-wide uppercase outline-none shadow-inner transition-colors"
+              />
 
               {/* Candidate suggestions if unlisted */}
               {candidateParts.length > 0 && (
-                <div className="mt-2 p-2 rounded-lg bg-black/40 border border-zinc-800">
-                  <span className="text-[10px] font-mono text-zinc-400 uppercase tracking-wider block mb-1.5">
+                <div className="mt-2 p-2 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)]">
+                  <span className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] uppercase tracking-wider block mb-1.5">
                     Suggested docket matches:
                   </span>
                   <div className="flex flex-wrap gap-1.5">
@@ -359,10 +389,14 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                         key={c.id}
                         type="button"
                         onClick={() => handleSelectCandidate(c)}
-                        className="h-6 px-2 rounded bg-zinc-800/90 hover:bg-cyan-950/60 border border-zinc-700 hover:border-cyan-500/50 text-zinc-200 text-[10px] font-mono flex items-center gap-1 cursor-pointer transition-colors"
+                        className="h-6 px-2 rounded bg-[var(--pt-card,#15182A)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-white text-[10px] font-mono flex items-center gap-1 cursor-pointer transition-colors"
                       >
-                        <span className="font-bold text-cyan-300">{c.partNumber}</span>
-                        <span className="text-zinc-500">(Qty {c.quantity})</span>
+                        <span className="font-bold text-[var(--pt-primary-light,#C084FC)]">
+                          {c.partNumber}
+                        </span>
+                        <span className="text-[var(--pt-text-muted,#737B94)]">
+                          (Qty {c.quantity})
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -372,7 +406,7 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
 
             {/* Field 2: Description */}
             <div>
-              <label className="text-[11px] font-mono uppercase tracking-wider text-zinc-400 font-semibold block mb-1.5">
+              <label className="text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] font-semibold block mb-1.5">
                 Description / Material Spec
               </label>
               <input
@@ -383,21 +417,35 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                   setValidationError(null);
                 }}
                 placeholder="Description or material spec"
-                className="w-full h-10 px-3.5 rounded-lg bg-[#070A0F] border border-zinc-700/80 focus:border-cyan-400 text-zinc-200 text-xs outline-none shadow-inner transition-colors"
+                className="w-full h-10 px-3.5 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] focus:border-[var(--pt-primary,#A020F0)] text-white text-xs outline-none shadow-inner transition-colors"
               />
             </div>
 
-            {/* Field 3: Prominent Quantity Selector */}
+            {/* Field 3: Prominent Quantity Selector + Required vs Remaining Summary */}
             <div className="pt-1">
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-[11px] font-mono uppercase tracking-wider text-cyan-400 font-bold">
-                  Received Quantity
+              <div className="flex items-center justify-between mb-2 font-mono text-[11px]">
+                <label className="uppercase tracking-wider text-[var(--pt-primary-light,#C084FC)] font-bold">
+                  Quantity Received
                 </label>
                 {resolvedMatchedPart && (
-                  <span className="text-[11px] font-mono text-zinc-400">
-                    Required on docket:{' '}
-                    <strong className="text-white">{resolvedMatchedPart.quantity}</strong>
-                  </span>
+                  <div className="flex items-center gap-2 text-[var(--pt-text-secondary,#A3A8BD)]">
+                    <span>
+                      Required: <strong className="text-white">{verificationStatus.requiredQty}</strong>
+                    </span>
+                    <span>•</span>
+                    <span>
+                      Remaining:{' '}
+                      <strong
+                        className={
+                          verificationStatus.remainingQty === 0
+                            ? 'text-[#00D979]'
+                            : 'text-[#F59E0B]'
+                        }
+                      >
+                        {verificationStatus.remainingQty}
+                      </strong>
+                    </span>
+                  </div>
                 )}
               </div>
 
@@ -407,7 +455,7 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                   type="button"
                   onClick={() => handleStepQuantity(-1)}
                   disabled={parsedQty <= 1}
-                  className="w-14 h-14 rounded-xl bg-zinc-800/90 hover:bg-zinc-700 disabled:opacity-30 border border-zinc-700 text-white flex items-center justify-center text-xl font-bold cursor-pointer transition-all active:scale-95 shrink-0 select-none shadow-sm"
+                  className="w-14 h-14 rounded-xl bg-[var(--pt-card,#15182A)] hover:bg-white/10 disabled:opacity-30 border border-[var(--pt-border,#29243D)] text-white flex items-center justify-center text-xl font-bold cursor-pointer transition-all active:scale-95 shrink-0 select-none"
                   aria-label="Decrease quantity"
                 >
                   <Minus className="w-6 h-6 stroke-[2.5]" />
@@ -424,9 +472,9 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                       setQuantityInput(e.target.value);
                       setValidationError(null);
                     }}
-                    className="w-full h-14 rounded-xl bg-[#070A0F] border-2 border-cyan-500/40 focus:border-cyan-400 text-center font-mono font-black text-2xl text-cyan-300 outline-none shadow-inner tabular-nums transition-colors"
+                    className="w-full h-14 rounded-xl bg-[var(--pt-bg,#080B12)] border-2 border-[var(--pt-primary,#A020F0)]/60 focus:border-[var(--pt-primary-light,#C084FC)] text-center font-mono font-black text-2xl text-white outline-none shadow-inner tabular-nums transition-colors"
                   />
-                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 font-mono text-[10px] uppercase pointer-events-none">
+                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--pt-text-muted,#737B94)] font-mono text-[10px] uppercase pointer-events-none">
                     PCS
                   </span>
                 </div>
@@ -434,14 +482,14 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                 <button
                   type="button"
                   onClick={() => handleStepQuantity(1)}
-                  className="w-14 h-14 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-black flex items-center justify-center text-xl font-bold cursor-pointer transition-all active:scale-95 shrink-0 select-none shadow-[0_0_15px_rgba(6,182,212,0.4)]"
+                  className="w-14 h-14 rounded-xl pt-btn-primary text-white flex items-center justify-center text-xl font-bold cursor-pointer transition-all active:scale-95 shrink-0 select-none"
                   aria-label="Increase quantity"
                 >
                   <Plus className="w-6 h-6 stroke-[3]" />
                 </button>
               </div>
 
-              {/* Quick quantity presets for fast shopfloor tapping */}
+              {/* Quick quantity presets */}
               <div className="flex items-center gap-1.5 mt-2.5 justify-center flex-wrap">
                 {[1, 2, 5, 10, 20, 50].map((preset) => (
                   <button
@@ -453,8 +501,8 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                     }}
                     className={`h-7 px-2.5 rounded-md font-mono text-[11px] font-bold cursor-pointer transition-all ${
                       parsedQty === preset
-                        ? 'bg-cyan-400 text-black shadow-xs'
-                        : 'bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300'
+                        ? 'pt-btn-primary text-white'
+                        : 'bg-[var(--pt-card,#15182A)] hover:bg-white/10 text-[var(--pt-text-secondary,#A3A8BD)] border border-[var(--pt-border,#29243D)]'
                     }`}
                   >
                     {preset}
@@ -469,7 +517,7 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
                         setQuantityInput(String(resolvedMatchedPart.quantity));
                         setValidationError(null);
                       }}
-                      className="h-7 px-2.5 rounded-md bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/40 text-emerald-300 font-mono text-[11px] font-bold cursor-pointer transition-all"
+                      className="h-7 px-2.5 rounded-md bg-[#00D979]/20 hover:bg-[#00D979]/30 border border-[#00D979]/50 text-[#00D979] font-mono text-[11px] font-bold cursor-pointer transition-all"
                     >
                       Full ({resolvedMatchedPart.quantity})
                     </button>
@@ -478,50 +526,45 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
             </div>
           </div>
 
-          {/* Toggleable Advanced Details: Pallet assignment, notes, raw code */}
-          <div className="border border-zinc-800/80 rounded-xl overflow-hidden bg-[#0D121B]">
+          {/* Toggleable Advanced Details */}
+          <div className="border border-[var(--pt-border,#29243D)] rounded-xl overflow-hidden bg-[var(--pt-bg-secondary,#101321)]">
             <button
               type="button"
               onClick={() => setIsEditingDetails((prev) => !prev)}
-              className="w-full px-3.5 py-2.5 flex items-center justify-between text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
+              className="w-full px-3.5 py-2.5 flex items-center justify-between text-xs text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white transition-colors cursor-pointer"
             >
               <div className="flex items-center gap-1.5 font-medium">
-                <Edit3 className="w-3.5 h-3.5 text-cyan-400" />
+                <Edit3 className="w-3.5 h-3.5 text-[var(--pt-primary-light,#C084FC)]" />
                 <span>{isEditingDetails ? 'Hide additional details' : 'Edit details & notes'}</span>
               </div>
               {isEditingDetails ? (
-                <ChevronUp className="w-4 h-4 text-zinc-400" />
+                <ChevronUp className="w-4 h-4" />
               ) : (
-                <ChevronDown className="w-4 h-4 text-zinc-400" />
+                <ChevronDown className="w-4 h-4" />
               )}
             </button>
 
             {isEditingDetails && (
-              <div className="p-3.5 pt-1 space-y-3 border-t border-zinc-800/60 text-xs">
+              <div className="p-3.5 pt-1 space-y-3 border-t border-[var(--pt-border,#29243D)] text-xs">
                 <div>
-                  <label className="text-[10px] font-mono uppercase text-zinc-400 block mb-1">
+                  <label className="text-[10px] font-mono uppercase text-[var(--pt-text-secondary,#A3A8BD)] block mb-1">
                     Scan Notes / Pallet Notes
                   </label>
                   <input
                     type="text"
                     value={notes}
                     onChange={(e) => setNotes(e.target.value)}
-                    placeholder="e.g. Pallet #2, slight scratch on corner, etc."
-                    className="w-full h-9 px-3 rounded-lg bg-[#070A0F] border border-zinc-700 text-zinc-200 text-xs outline-none focus:border-cyan-400"
+                    placeholder="e.g. Pallet #2, verified intact"
+                    className="w-full h-9 px-3 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-white text-xs outline-none focus:border-[var(--pt-primary,#A020F0)]"
                   />
                 </div>
 
                 {scan.rawCode && (
-                  <div className="p-2 rounded bg-black/40 border border-zinc-800 font-mono text-[10px] text-zinc-400 break-all">
-                    <span className="text-zinc-500 block">Raw Decoded String:</span>
+                  <div className="p-2 rounded bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] font-mono text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] break-all">
+                    <span className="text-[var(--pt-text-muted,#737B94)] block">
+                      Raw Decoded String:
+                    </span>
                     <span>{scan.rawCode}</span>
-                  </div>
-                )}
-
-                {scan.rawOcrText && (
-                  <div className="p-2 rounded bg-black/40 border border-zinc-800 font-mono text-[10px] text-zinc-400 max-h-24 overflow-y-auto">
-                    <span className="text-zinc-500 block">Full OCR Text Output:</span>
-                    <pre className="whitespace-pre-wrap">{scan.rawOcrText}</pre>
                   </div>
                 )}
               </div>
@@ -529,36 +572,33 @@ export const ScanConfirmationModal: React.FC<ScanConfirmationModalProps> = ({
           </div>
         </div>
 
-        {/* Bottom Actions Bar (Mobile Sticky & Touch-Optimised) */}
-        <div className="p-4 bg-[#0D131F] border-t border-zinc-800/80 flex flex-col gap-2 shrink-0">
-          {/* Primary Action Button: CONFIRM & SCAN NEXT (Continuous Scanning Workflow) */}
+        {/* Bottom Actions Bar */}
+        <div className="p-4 bg-[var(--pt-bg-secondary,#101321)] border-t border-[var(--pt-border,#29243D)] flex flex-col gap-2 shrink-0">
           <button
             type="button"
             onClick={handleSaveAndScanNextClick}
-            className="w-full h-12 rounded-xl bg-gradient-to-r from-cyan-500 via-cyan-400 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-black font-bold text-sm tracking-wide flex items-center justify-center gap-2 cursor-pointer shadow-[0_0_20px_rgba(6,182,212,0.4)] active:scale-[0.98] transition-all"
+            className="w-full h-12 rounded-xl bg-[#00D979] hover:bg-[#00c46d] text-black font-mono font-extrabold text-sm tracking-wide flex items-center justify-center gap-2 cursor-pointer shadow-[0_0_20px_rgba(0,217,121,0.4)] active:scale-[0.98] transition-all"
           >
             <Check className="w-5 h-5 stroke-[3]" />
             <span>CONFIRM &amp; SCAN NEXT</span>
             <ArrowRight className="w-4 h-4 ml-1 stroke-[2.5]" />
           </button>
 
-          {/* Confirm Button */}
           <button
             type="button"
             onClick={handleConfirmAndSaveClick}
-            className="w-full h-11 px-4 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-100 hover:text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer border border-zinc-700 transition-colors shadow-sm"
+            className="w-full h-11 px-4 rounded-xl pt-btn-primary text-white font-mono font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
           >
-            <Check className="w-4 h-4 text-emerald-400 stroke-[2.5]" />
+            <Check className="w-4 h-4 stroke-[2.5]" />
             <span>CONFIRM</span>
           </button>
 
-          {/* Cancel Button Underneath Confirm */}
           <button
             type="button"
             onClick={onDiscard}
-            className="w-full h-11 px-4 rounded-xl bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 hover:border-zinc-600 text-zinc-300 hover:text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
+            className="w-full h-11 px-4 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-white/5 border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white font-mono font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
           >
-            <X className="w-4 h-4 text-zinc-400" />
+            <X className="w-4 h-4" />
             <span>CANCEL</span>
           </button>
         </div>

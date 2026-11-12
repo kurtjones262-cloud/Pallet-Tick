@@ -183,7 +183,7 @@ export function logOcrEvent(
     }
   }
   const timestamp = new Date().toISOString();
-  const payload = JSON.stringify({ timestamp, component: 'PalletTrack-OCR', event, ...sanitizedMeta });
+  const payload = JSON.stringify({ timestamp, component: 'PartTrack-OCR', event, ...sanitizedMeta });
   if (level === 'error') {
     console.error(payload);
   } else if (level === 'warn') {

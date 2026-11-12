@@ -135,7 +135,8 @@ export async function handlePalletTrackApiRequest(
         const prov = await service.getProvisionStatus();
         return jsonResponse({
           status: 'ok',
-          app: 'PalletTrack',
+          app: 'PartTrack',
+          tagline: 'Track every part. Every pallet. Every order.',
           database: 'Cloudflare D1 (centralised)',
           dbConnected: Boolean(ping),
           hasSuperAdmin: prov.hasSuperAdmin,
@@ -148,7 +149,7 @@ export async function handlePalletTrackApiRequest(
         return jsonResponse(
           {
             status: 'degraded',
-            app: 'PalletTrack',
+            app: 'PartTrack',
             database: 'Cloudflare D1 (error)',
             dbConnected: false,
             error: err?.message,
@@ -293,7 +294,7 @@ export async function handlePalletTrackApiRequest(
       const prov = await service.getProvisionStatus();
       if (!prov.hasAdmin) {
         return errorResponse(
-          'Initial Super Admin setup required before using PalletTrack.',
+          'Initial Super Admin setup required before using PartTrack.',
           428,
           'SETUP_REQUIRED'
         );
@@ -910,7 +911,7 @@ export async function handlePalletTrackApiRequest(
 
     return null;
   } catch (err: any) {
-    console.error('PalletTrack API Error:', err);
+    console.error('PartTrack API Error:', err);
     return errorResponse(err?.message || 'Internal database server error', 500, 'INTERNAL_ERROR');
   }
 }

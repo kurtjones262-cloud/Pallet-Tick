@@ -12,8 +12,8 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'autoUpdate',
         includeAssets: [
-          'pallettrack-icon.png',
-          'pallettrack-horizontal-logo.png',
+          'parttrack-icon.png',
+          'parttrack-horizontal-logo.png',
           'favicon.ico',
           'favicon-32x32.png',
           'favicon-16x16.png',
@@ -25,10 +25,10 @@ export default defineConfig(() => {
         ],
         manifest: {
           id: '/',
-          name: 'PalletTick - Parts Receiving & Verification',
-          short_name: 'PalletTick',
+          name: 'PartTrack - Track every part. Every pallet. Every order.',
+          short_name: 'PartTrack',
           description:
-            'Offline-first delivery docket scanner, on-device OCR, and continuous QR & barcode parts verification.',
+            'PartTrack — Track every part. Every pallet. Every order. Industrial parts receiving, delivery docket AI vision extraction, continuous QR & barcode scanner, and real-time multi-user pallet verification.',
           theme_color: '#0B111A',
           background_color: '#070A0F',
           display: 'standalone',
@@ -55,15 +55,21 @@ export default defineConfig(() => {
               purpose: 'maskable',
             },
             {
-              src: '/pallettrack-icon.png',
-              sizes: '1254x1254',
+              src: '/parttrack-icon.png',
+              sizes: '512x512',
               type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/icon.svg',
+              sizes: 'any',
+              type: 'image/svg+xml',
               purpose: 'any',
             },
           ],
         },
         workbox: {
-          cacheId: 'pallettick-pwa-v3',
+          cacheId: 'parttrack-pwa-v4',
           cleanupOutdatedCaches: true,
           clientsClaim: true,
           skipWaiting: true,

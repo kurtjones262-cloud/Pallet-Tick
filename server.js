@@ -1,5 +1,7 @@
 // server.ts
 import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
 import dotenv from "dotenv";
 import path2 from "path";
 import { fileURLToPath } from "url";
@@ -34,7 +36,7 @@ function logOcrEvent(level, event, meta = {}) {
     }
   }
   const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-  const payload = JSON.stringify({ timestamp, component: "PalletTrack-OCR", event, ...sanitizedMeta });
+  const payload = JSON.stringify({ timestamp, component: "PartTrack-OCR", event, ...sanitizedMeta });
   if (level === "error") {
     console.error(payload);
   } else if (level === "warn") {
@@ -910,32 +912,42 @@ var NodeSqliteD1Adapter = class {
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec("PRAGMA journal_mode = WAL;");
-    if (schemaSql) {
-      this.db.exec(schemaSql);
-    }
     const safeAddCol = (table, colDef) => {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
       } catch {
       }
     };
-    safeAddCol("users", "employee_code TEXT");
-    safeAddCol("users", "pin_salt TEXT");
-    safeAddCol("users", "last_login_at TEXT");
-    safeAddCol("users", "failed_login_attempts INTEGER NOT NULL DEFAULT 0");
-    safeAddCol("users", "locked_until TEXT");
-    safeAddCol("users", "created_by TEXT");
-    safeAddCol("scan_events", "employee_name TEXT");
-    safeAddCol("scan_events", "employee_role TEXT");
-    safeAddCol("scan_events", "event_action TEXT DEFAULT 'part_scan'");
-    safeAddCol("delivery_parts", "revision TEXT");
-    safeAddCol("delivery_parts", "manually_edited INTEGER NOT NULL DEFAULT 0");
-    safeAddCol("delivery_parts", "original_ocr_values TEXT");
-    safeAddCol("delivery_parts", "last_edited_by TEXT");
-    safeAddCol("delivery_parts", "last_edited_at TEXT");
+    const runColumnMigrations = () => {
+      safeAddCol("users", "employee_code TEXT");
+      safeAddCol("users", "pin_salt TEXT");
+      safeAddCol("users", "last_login_at TEXT");
+      safeAddCol("users", "failed_login_attempts INTEGER NOT NULL DEFAULT 0");
+      safeAddCol("users", "locked_until TEXT");
+      safeAddCol("users", "created_by TEXT");
+      safeAddCol("scan_events", "employee_name TEXT");
+      safeAddCol("scan_events", "employee_role TEXT");
+      safeAddCol("scan_events", "event_action TEXT DEFAULT 'part_scan'");
+      safeAddCol("scan_events", "idempotency_key TEXT");
+      safeAddCol("scan_events", "sequence_number INTEGER");
+      safeAddCol("deliveries", "version INTEGER NOT NULL DEFAULT 1");
+      safeAddCol("delivery_parts", "revision TEXT");
+      safeAddCol("delivery_parts", "manually_edited INTEGER NOT NULL DEFAULT 0");
+      safeAddCol("delivery_parts", "original_ocr_values TEXT");
+      safeAddCol("delivery_parts", "last_edited_by TEXT");
+      safeAddCol("delivery_parts", "last_edited_at TEXT");
+      safeAddCol("delivery_parts", "version INTEGER NOT NULL DEFAULT 1");
+      safeAddCol("delivery_parts", "last_scanned_by_id TEXT");
+      safeAddCol("delivery_parts", "last_scanned_by_name TEXT");
+    };
+    runColumnMigrations();
+    if (schemaSql) {
+      this.db.exec(schemaSql);
+    }
+    runColumnMigrations();
     try {
       const tblInfo = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
-      if (tblInfo?.sql && tblInfo.sql.includes("CHECK") && !tblInfo.sql.includes("super_admin")) {
+      if (tblInfo?.sql && tblInfo.sql.includes("CHECK") && (!tblInfo.sql.includes("super_admin") || !tblInfo.sql.includes("supervisor"))) {
         this.db.exec("PRAGMA foreign_keys = OFF;");
         this.db.exec(`
           CREATE TABLE users_new (
@@ -984,6 +996,41 @@ var NodeSqliteD1Adapter = class {
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
         CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id);
+      `);
+    } catch {
+    }
+    const phase5AlterStatements = [
+      "ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1;",
+      "ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1;",
+      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT;",
+      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT;",
+      "ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT;",
+      "ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER;"
+    ];
+    for (const stmt of phase5AlterStatements) {
+      try {
+        this.db.exec(stmt);
+      } catch {
+      }
+    }
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS realtime_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          delivery_id TEXT,
+          part_id TEXT,
+          user_id TEXT,
+          employee_name TEXT,
+          employee_role TEXT,
+          delivery_version INTEGER,
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC);
+        CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC);
       `);
     } catch {
     }
@@ -1146,6 +1193,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
       scannedAt: row.scanned_at || void 0,
       scannedVia: row.scanned_via || void 0,
       scannedCode: row.scanned_code || void 0,
+      lastScannedById: row.last_scanned_by_id || void 0,
+      lastScannedByName: row.last_scanned_by_name || void 0,
       notes: row.notes || void 0,
       flaggedForReview: Boolean(row.flagged_for_review),
       ocrConfidence: row.ocr_confidence || void 0,
@@ -1153,6 +1202,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       lastEditedBy: row.last_edited_by || void 0,
       lastEditedAt: row.last_edited_at || void 0,
       originalOcrValues: parsedOriginalOcr,
+      version: Number(row.version || 1),
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
@@ -1196,6 +1246,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       palletCount: row.pallet_count,
       supplierProfile: row.supplier_profile || "laser_central",
       notes: row.notes || void 0,
+      version: Number(row.version || 1),
       createdBy: row.created_by || void 0,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -1411,7 +1462,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
     await this.db.prepare(
       `UPDATE deliveries
          SET docket_number = ?, supplier = ?, purchase_order_number = ?, delivery_date = ?,
-             delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?, updated_at = ?
+             delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?,
+             version = COALESCE(version, 1) + 1, updated_at = ?
          WHERE id = ?`
     ).bind(
       docketNumber,
@@ -1570,7 +1622,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
             scan_result, employee_name, employee_role, event_action
           ) VALUES (?, ?, ?, ?, ?, ?, 'manual', 'part_added', ?, 0, ?, ?, ?, 'part_added')`
       ).bind(scanId, deliveryId, partId, actorId, now, partNumber, reqQty, auditMessage, actorName, actorRole),
-      this.db.prepare("UPDATE deliveries SET delivery_status = 'receiving', updated_at = ? WHERE id = ?").bind(now, deliveryId)
+      this.db.prepare("UPDATE deliveries SET delivery_status = 'receiving', version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?").bind(now, deliveryId)
     ];
     await this.db.batch(stmts);
     const createdPartRow = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
@@ -1709,7 +1761,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
                END,
                material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
                notes = ?, manually_edited = 1, original_ocr_values = ?,
-               last_edited_by = ?, last_edited_at = ?, updated_at = ?
+               last_edited_by = ?, last_edited_at = ?, updated_at = ?,
+               version = COALESCE(version, 1) + 1
            WHERE delivery_id = ? AND id = ?`
       ).bind(
         newPartNumber,
@@ -1758,7 +1811,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
              ) THEN 'receiving'
              ELSE delivery_status
            END,
-           updated_at = ?
+           updated_at = ?,
+           version = COALESCE(version, 1) + 1
            WHERE id = ?`
       ).bind(deliveryId, now, deliveryId)
     ];
@@ -1808,7 +1862,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
             scan_result, employee_name, employee_role, event_action
           ) VALUES (?, ?, NULL, ?, ?, ?, 'manual', 'part_deleted', 0, ?, ?, ?, ?, 'part_deleted')`
       ).bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole),
-      this.db.prepare("UPDATE deliveries SET updated_at = ? WHERE id = ?").bind(now, deliveryId)
+      this.db.prepare("UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?").bind(now, deliveryId)
     ];
     await this.db.batch(stmts);
     const updatedDelivery = await this.getDeliveryById(deliveryId);
@@ -2058,6 +2112,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
                ) THEN 'receiving'
                ELSE delivery_status
              END,
+             version = COALESCE(version, 1) + 1,
              updated_at = ?
              WHERE id = ?`
         ).bind(deliveryId, now, deliveryId)
@@ -2070,10 +2125,54 @@ var PalletTrackDbService = class _PalletTrackDbService {
       delivery: updatedDelivery
     };
   }
+  static {
+    this.partReceiveLocks = /* @__PURE__ */ new Map();
+  }
   /**
-   * Update received quantity for a specific part with atomic scan logging and strict duplicate protection
+   * Update received quantity for a specific part with atomic scan logging,
+   * idempotency key deduplication, per-part concurrency serialization, and
+   * strict SQL-level race-condition protection.
    */
   async updatePartReceivedQuantity(deliveryId, partId, input) {
+    const lockKey = `${deliveryId}:${partId}`;
+    const prevLock = _PalletTrackDbService.partReceiveLocks.get(lockKey) || Promise.resolve();
+    let releaseLock;
+    const currentLock = new Promise((resolve) => {
+      releaseLock = resolve;
+    });
+    _PalletTrackDbService.partReceiveLocks.set(
+      lockKey,
+      prevLock.then(() => currentLock).catch(() => currentLock)
+    );
+    await prevLock.catch(() => {
+    });
+    try {
+      return await this.executeUpdatePartReceivedQuantityAtomic(deliveryId, partId, input);
+    } finally {
+      releaseLock();
+      if (_PalletTrackDbService.partReceiveLocks.get(lockKey) === currentLock) {
+        _PalletTrackDbService.partReceiveLocks.delete(lockKey);
+      }
+    }
+  }
+  async executeUpdatePartReceivedQuantityAtomic(deliveryId, partId, input) {
+    await this.ensureSchemaReady();
+    const cleanIdempotencyKey = typeof input.idempotencyKey === "string" && input.idempotencyKey.trim() ? input.idempotencyKey.trim().slice(0, 128) : null;
+    if (cleanIdempotencyKey) {
+      const existingScan = await this.db.prepare("SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1").bind(cleanIdempotencyKey).first();
+      if (existingScan) {
+        const currentPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+        const currentDelivery = await this.db.prepare("SELECT version FROM deliveries WHERE id = ?").bind(deliveryId).first();
+        return {
+          duplicate: false,
+          idempotentReplay: true,
+          status: "updated",
+          deliveryVersion: Number(currentDelivery?.version || 1),
+          part: currentPart ? this.mapPartRow(currentPart) : null,
+          scanEvent: this.mapScanRow(existingScan)
+        };
+      }
+    }
     const part = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
     if (!part) {
       throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
@@ -2084,14 +2183,49 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const reqQty = Math.max(0, part.required_quantity);
-    const recQty = Math.round(enteredQty);
-    const targetStatus = input.status || (recQty > 0 ? "received" : "outstanding");
+    const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
+    const currentVersion = Number(part.version || 1);
+    const isIncrementMode = input.mode === "increment";
     const isScanAttempt = input.scannedVia !== "manual";
-    if (isScanAttempt && part.status === "received" && targetStatus === "received" && part.received_quantity > 0) {
+    const recQty = isIncrementMode ? currentRecQty + Math.round(enteredQty) : Math.round(enteredQty);
+    const targetStatus = input.status || (recQty > 0 ? "received" : "outstanding");
+    const isAlreadyFulfilled = part.status === "received" && currentRecQty >= reqQty && reqQty > 0;
+    const isRedundantSameScan = isScanAttempt && part.status === "received" && targetStatus === "received" && currentRecQty > 0 && (!isIncrementMode && recQty <= currentRecQty);
+    if (isScanAttempt && targetStatus === "received" && (isAlreadyFulfilled || isRedundantSameScan)) {
+      const alreadyScannedBy = part.last_scanned_by_name || "Another worker";
+      const alreadyScannedAt = part.scanned_at || part.updated_at;
+      const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const dupMsg = `Duplicate scan \u2013 part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
+      try {
+        await this.db.prepare(
+          `INSERT INTO scan_events (
+              id, delivery_id, part_id, user_id, timestamp, code,
+              scan_type, scan_status, quantity_added, received_quantity_after,
+              scan_result, employee_name, employee_role, event_action
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
+        ).bind(
+          dupScanId,
+          deliveryId,
+          partId,
+          input.userId || null,
+          now,
+          input.scannedCode || part.part_number,
+          input.scannedVia || "qr",
+          currentRecQty,
+          dupMsg,
+          input.employeeName || null,
+          input.employeeRole || null
+        ).run();
+      } catch {
+      }
       return {
         duplicate: true,
         status: "duplicate",
-        message: "This part has already been scanned into this delivery.",
+        message: "Duplicate scan \u2013 this part has already been received by another worker",
+        error: "Duplicate scan \u2013 this part has already been received by another worker",
+        detailMessage: dupMsg,
+        alreadyScannedBy,
+        alreadyScannedAt,
         part: this.mapPartRow(part)
       };
     }
@@ -2100,35 +2234,58 @@ var PalletTrackDbService = class _PalletTrackDbService {
     const scannedVia = targetStatus === "received" ? input.scannedVia || "manual" : null;
     const scannedCode = targetStatus === "received" ? input.scannedCode || part.scanned_code || (scannedVia === "qr" ? part.part_number : part.item_number) : null;
     const scannedAt = targetStatus === "received" ? now : null;
+    const lastScannedById = targetStatus === "received" ? input.userId || part.last_scanned_by_id || null : null;
+    const lastScannedByName = targetStatus === "received" ? input.employeeName || part.last_scanned_by_name || "Worker" : null;
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const addedQty = Math.max(0, recQty - part.received_quantity);
+    const addedQty = Math.max(0, recQty - currentRecQty);
     const scanStatus = targetStatus === "received" ? isQtyMatch ? "match_success" : "quantity_mismatch" : "undo_performed";
     const scanResultMsg = targetStatus === "received" ? isQtyMatch ? `Verified ${part.part_number} (No. ${part.item_number}) - Qty ${recQty}/${reqQty} matched` : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required` : `Unticked ${part.part_number} (${part.item_number})`;
-    const stmts = [
-      this.db.prepare(
-        `UPDATE delivery_parts
-           SET received_quantity = ?, verification_status = ?, status = ?,
-               scanned_via = ?, scanned_code = ?, scanned_at = ?, notes = COALESCE(?, notes),
-               updated_at = ?
-           WHERE delivery_id = ? AND id = ?`
-      ).bind(
-        recQty,
-        verificationStatus,
-        targetStatus,
-        scannedVia,
-        scannedCode,
-        scannedAt,
-        input.notes || null,
-        now,
-        deliveryId,
-        partId
-      ),
+    const updateRes = await this.db.prepare(
+      `UPDATE delivery_parts
+         SET received_quantity = ?, verification_status = ?, status = ?,
+             scanned_via = ?, scanned_code = ?, scanned_at = ?,
+             last_scanned_by_id = ?, last_scanned_by_name = ?,
+             notes = COALESCE(?, notes),
+             version = COALESCE(version, 1) + 1,
+             updated_at = ?
+         WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
+    ).bind(
+      recQty,
+      verificationStatus,
+      targetStatus,
+      scannedVia,
+      scannedCode,
+      scannedAt,
+      lastScannedById,
+      lastScannedByName,
+      input.notes || null,
+      now,
+      deliveryId,
+      partId,
+      currentVersion
+    ).run();
+    const rowsChanged = Number(updateRes.meta?.changes ?? 1);
+    if (rowsChanged === 0) {
+      const latestPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+      if (latestPart && latestPart.status === "received") {
+        return {
+          duplicate: true,
+          status: "duplicate",
+          message: "Duplicate scan \u2013 this part has already been received by another worker",
+          error: "Duplicate scan \u2013 this part has already been received by another worker",
+          alreadyScannedBy: latestPart.last_scanned_by_name || "Another worker",
+          alreadyScannedAt: latestPart.scanned_at || latestPart.updated_at,
+          part: this.mapPartRow(latestPart)
+        };
+      }
+    }
+    await this.db.batch([
       this.db.prepare(
         `INSERT INTO scan_events (
             id, delivery_id, part_id, user_id, timestamp, code,
             scan_type, scan_status, quantity_added, received_quantity_after,
-            scan_result, raw_ocr_text, employee_name, employee_role, event_action
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         scanId,
         deliveryId,
@@ -2144,15 +2301,34 @@ var PalletTrackDbService = class _PalletTrackDbService {
         input.rawOcrText || null,
         input.employeeName || null,
         input.employeeRole || null,
-        input.eventAction || (recQty > 0 ? "part_scan" : "part_untick")
+        input.eventAction || (recQty > 0 ? "part_scan" : "part_untick"),
+        cleanIdempotencyKey
       ),
-      this.db.prepare("UPDATE deliveries SET updated_at = ? WHERE id = ?").bind(now, deliveryId)
-    ];
-    await this.db.batch(stmts);
+      this.db.prepare(
+        "UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?"
+      ).bind(now, deliveryId)
+    ]);
     const updatedPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
+    const updatedDeliveryRow = await this.db.prepare("SELECT version, delivery_status FROM deliveries WHERE id = ?").bind(deliveryId).first();
+    const statsRow = await this.db.prepare(
+      `SELECT
+           COUNT(*) as total_count,
+           SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
+         FROM delivery_parts
+         WHERE delivery_id = ?`
+    ).bind(deliveryId).first();
+    const totalCount = Number(statsRow?.total_count || 0);
+    const receivedCount = Number(statsRow?.received_count || 0);
+    const outstandingCount = Math.max(0, totalCount - receivedCount);
     return {
       duplicate: false,
       status: "updated",
+      deliveryVersion: Number(updatedDeliveryRow?.version || 1),
+      deliveryStats: {
+        totalCount,
+        receivedCount,
+        outstandingCount
+      },
       part: updatedPart ? this.mapPartRow(updatedPart) : null,
       scanEvent: {
         id: scanId,
@@ -2168,7 +2344,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         status: scanStatus,
         quantityAdded: addedQty,
         receivedQuantity: recQty,
-        message: scanResultMsg
+        message: scanResultMsg,
+        idempotencyKey: cleanIdempotencyKey || void 0
       }
     };
   }
@@ -2287,7 +2464,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
     try {
       await this.db.prepare("SELECT id, employee_code, role, active FROM users LIMIT 1").first();
       await this.db.prepare("SELECT id FROM sessions LIMIT 1").first();
-      await this.db.prepare("SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at FROM delivery_parts LIMIT 1").first();
+      await this.db.prepare("SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1").first();
+      await this.db.prepare("SELECT id, version FROM deliveries LIMIT 1").first();
+      await this.db.prepare("SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1").first();
+      await this.db.prepare("SELECT seq, id FROM realtime_events LIMIT 1").first();
       _PalletTrackDbService.verifiedDbs.add(this.db);
       return;
     } catch {
@@ -2328,6 +2508,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
         pallet_count INTEGER NOT NULL DEFAULT 1,
         supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
         notes TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -2352,6 +2533,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         scanned_at TEXT,
         scanned_via TEXT,
         scanned_code TEXT,
+        last_scanned_by_id TEXT,
+        last_scanned_by_name TEXT,
         notes TEXT,
         flagged_for_review INTEGER NOT NULL DEFAULT 0,
         ocr_confidence TEXT,
@@ -2359,6 +2542,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
         original_ocr_values TEXT,
         last_edited_by TEXT,
         last_edited_at TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
@@ -2378,6 +2562,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         received_quantity_after INTEGER,
         scan_result TEXT,
         raw_ocr_text TEXT,
+        idempotency_key TEXT,
+        sequence_number INTEGER,
         created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
       )`,
       `CREATE TABLE IF NOT EXISTS m1_synchronisations (
@@ -2390,6 +2576,19 @@ var PalletTrackDbService = class _PalletTrackDbService {
         error_info TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS realtime_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        delivery_id TEXT,
+        part_id TEXT,
+        user_id TEXT,
+        employee_name TEXT,
+        employee_role TEXT,
+        delivery_version INTEGER,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
       )`
     ];
     for (const sql of createStatements) {
@@ -2409,11 +2608,17 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "ALTER TABLE scan_events ADD COLUMN employee_name TEXT",
       "ALTER TABLE scan_events ADD COLUMN employee_role TEXT",
       "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
+      "ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT",
+      "ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER",
+      "ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE delivery_parts ADD COLUMN revision TEXT",
       "ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT",
       "ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT"
+      "ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT",
+      "ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT",
+      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT"
     ];
     for (const sql of alterCols) {
       try {
@@ -2437,7 +2642,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "CREATE INDEX IF NOT EXISTS idx_scans_part ON scan_events(part_id)",
       "CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id)",
       "CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scan_events(timestamp DESC)",
-      "CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)"
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)",
+      "CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC)",
+      "CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)"
     ];
     for (const sql of indexStatements) {
       try {
@@ -2949,6 +3157,583 @@ var PalletTrackDbService = class _PalletTrackDbService {
   }
 };
 
+// src/server/realtime/realtimeHub.ts
+var WS_OPEN = 1;
+var HEARTBEAT_INTERVAL_MS = 15e3;
+var STALE_CONNECTION_TIMEOUT_MS = 45e3;
+var PalletTrackRealtimeBroker = class {
+  constructor() {
+    this.clients = /* @__PURE__ */ new Map();
+    this.latestSeq = 0;
+    this.heartbeatTimer = null;
+    this.startHeartbeat();
+  }
+  setDurableObjectForwarder(fn) {
+    this.durableObjectForwarder = fn;
+  }
+  startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      this.pruneStaleConnectionsAndPing();
+    }, HEARTBEAT_INTERVAL_MS);
+    if (typeof this.heartbeatTimer?.unref === "function") {
+      this.heartbeatTimer.unref();
+    }
+  }
+  pruneStaleConnectionsAndPing() {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    let changed = false;
+    const affectedDeliveries = /* @__PURE__ */ new Set();
+    for (const [connId, client] of this.clients.entries()) {
+      if (client.socket.readyState !== WS_OPEN || nowMs - client.lastPongMs > STALE_CONNECTION_TIMEOUT_MS) {
+        affectedDeliveries.add(client.activeDeliveryId);
+        try {
+          client.socket.close(4e3, "Heartbeat timeout");
+        } catch {
+        }
+        this.clients.delete(connId);
+        changed = true;
+        continue;
+      }
+      try {
+        client.socket.send(
+          JSON.stringify({
+            type: "ping",
+            timestamp: nowIso,
+            latestSeq: this.latestSeq
+          })
+        );
+      } catch {
+        affectedDeliveries.add(client.activeDeliveryId);
+        this.clients.delete(connId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      for (const delId of affectedDeliveries) {
+        this.broadcastPresenceUpdate(delId);
+      }
+      this.broadcastPresenceUpdate(null);
+    }
+  }
+  /**
+   * Register a newly authenticated WebSocket connection
+   */
+  registerClient(socket, user, sessionToken, initialDeliveryId, lastSeq, db) {
+    const connectionId = `ws_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const client = {
+      connectionId,
+      socket,
+      user,
+      sessionToken,
+      activeDeliveryId: initialDeliveryId || null,
+      status: initialDeliveryId ? "viewing" : "dashboard",
+      connectedAt: nowIso,
+      lastActivityAt: nowIso,
+      lastPongMs: Date.now()
+    };
+    this.clients.set(connectionId, client);
+    this.safeSend(socket, {
+      type: "connected",
+      connectionId,
+      user: {
+        id: user.id,
+        employeeName: user.employeeName,
+        employeeCode: user.employeeCode,
+        role: user.role
+      },
+      latestSeq: this.latestSeq,
+      currentSequenceNumber: this.latestSeq,
+      presence: this.getPresenceSummary(initialDeliveryId || null),
+      timestamp: nowIso
+    });
+    if (db && typeof lastSeq === "number" && lastSeq > 0) {
+      this.getEventsSince(db, lastSeq, initialDeliveryId || void 0).then((missedEvents) => {
+        if (missedEvents.length > 0) {
+          this.safeSend(socket, {
+            type: "sync_catchup",
+            sinceSeq: lastSeq,
+            latestSeq: this.latestSeq,
+            events: missedEvents,
+            timestamp: (/* @__PURE__ */ new Date()).toISOString()
+          });
+        }
+      }).catch(() => {
+      });
+    }
+    this.broadcastPresenceUpdate(initialDeliveryId || null);
+    if (initialDeliveryId) {
+      this.broadcastPresenceUpdate(null);
+    }
+    return connectionId;
+  }
+  /**
+   * Remove a disconnected client and broadcast updated worker presence
+   */
+  unregisterClient(connectionId) {
+    const existing = this.clients.get(connectionId);
+    if (!existing) return;
+    const prevDeliveryId = existing.activeDeliveryId;
+    this.clients.delete(connectionId);
+    this.broadcastPresenceUpdate(prevDeliveryId);
+    if (prevDeliveryId !== null) {
+      this.broadcastPresenceUpdate(null);
+    }
+  }
+  /**
+   * Immediately disconnect all active WebSockets for a deactivated or logged-out user
+   */
+  disconnectUser(userId, reason = "Session ended or account deactivated") {
+    const affectedDeliveries = /* @__PURE__ */ new Set();
+    for (const [connId, client] of this.clients.entries()) {
+      if (client.user.id === userId) {
+        affectedDeliveries.add(client.activeDeliveryId);
+        this.safeSend(client.socket, {
+          type: "auth_revoked",
+          reason,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        try {
+          client.socket.close(4003, reason);
+        } catch {
+        }
+        this.clients.delete(connId);
+      }
+    }
+    for (const delId of affectedDeliveries) {
+      this.broadcastPresenceUpdate(delId);
+    }
+    if (affectedDeliveries.size > 0) {
+      this.broadcastPresenceUpdate(null);
+    }
+  }
+  /**
+   * Disconnect a specific session token on logout
+   */
+  disconnectSessionToken(sessionToken) {
+    if (!sessionToken) return;
+    const affectedDeliveries = /* @__PURE__ */ new Set();
+    for (const [connId, client] of this.clients.entries()) {
+      if (client.sessionToken === sessionToken) {
+        affectedDeliveries.add(client.activeDeliveryId);
+        try {
+          client.socket.close(4001, "Logged out");
+        } catch {
+        }
+        this.clients.delete(connId);
+      }
+    }
+    for (const delId of affectedDeliveries) {
+      this.broadcastPresenceUpdate(delId);
+    }
+    if (affectedDeliveries.size > 0) {
+      this.broadcastPresenceUpdate(null);
+    }
+  }
+  /**
+   * Handle incoming WebSocket message from a connected client
+   */
+  async handleClientMessage(connectionId, rawMessage, db) {
+    const client = this.clients.get(connectionId);
+    if (!client) return;
+    client.lastPongMs = Date.now();
+    client.lastActivityAt = (/* @__PURE__ */ new Date()).toISOString();
+    let msg;
+    try {
+      msg = JSON.parse(rawMessage);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg.type !== "string") return;
+    switch (msg.type) {
+      case "ping": {
+        this.safeSend(client.socket, {
+          type: "pong",
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          latestSeq: this.latestSeq
+        });
+        break;
+      }
+      case "pong": {
+        break;
+      }
+      case "join_delivery": {
+        const prevDeliveryId = client.activeDeliveryId;
+        const nextDeliveryId = typeof msg.deliveryId === "string" && msg.deliveryId.trim() ? msg.deliveryId.trim() : null;
+        const nextStatus = msg.status === "scanning" ? "scanning" : nextDeliveryId ? "viewing" : "dashboard";
+        client.activeDeliveryId = nextDeliveryId;
+        client.status = nextStatus;
+        if (prevDeliveryId !== nextDeliveryId) {
+          if (prevDeliveryId) this.broadcastPresenceUpdate(prevDeliveryId);
+          if (nextDeliveryId) this.broadcastPresenceUpdate(nextDeliveryId);
+        } else if (nextDeliveryId) {
+          this.broadcastPresenceUpdate(nextDeliveryId);
+        }
+        this.broadcastPresenceUpdate(null);
+        break;
+      }
+      case "leave_delivery": {
+        const prevDeliveryId = client.activeDeliveryId;
+        client.activeDeliveryId = null;
+        client.status = "dashboard";
+        if (prevDeliveryId) {
+          this.broadcastPresenceUpdate(prevDeliveryId);
+        }
+        this.broadcastPresenceUpdate(null);
+        break;
+      }
+      case "worker_status": {
+        const nextStatus = msg.status === "scanning" ? "scanning" : client.activeDeliveryId ? "viewing" : "dashboard";
+        const statusChanged = client.status !== nextStatus;
+        client.status = nextStatus;
+        if (typeof msg.lastScanSummary === "string") {
+          client.lastScanSummary = msg.lastScanSummary.slice(0, 160);
+        }
+        if (statusChanged || msg.lastScanSummary) {
+          if (client.activeDeliveryId) {
+            this.broadcastPresenceUpdate(client.activeDeliveryId);
+          }
+          this.broadcastPresenceUpdate(null);
+        }
+        break;
+      }
+      case "scanning_activity": {
+        if (!client.activeDeliveryId) break;
+        client.status = "scanning";
+        if (typeof msg.summary === "string") {
+          client.lastScanSummary = msg.summary.slice(0, 160);
+        }
+        const activityEvent = {
+          id: `rt_act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          type: "worker:scanning_activity",
+          sequenceNumber: this.latestSeq,
+          deliveryId: client.activeDeliveryId,
+          partId: typeof msg.partId === "string" ? msg.partId : void 0,
+          userId: client.user.id,
+          employeeName: client.user.employeeName,
+          employeeRole: client.user.role,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          payload: {
+            action: msg.action || "scanning",
+            partNumber: msg.partNumber,
+            itemNumber: msg.itemNumber,
+            summary: msg.summary || `${client.user.employeeName} is scanning`
+          }
+        };
+        this.broadcastToDeliveryRoom(client.activeDeliveryId, {
+          type: "event",
+          event: activityEvent
+        });
+        this.broadcastPresenceUpdate(client.activeDeliveryId);
+        break;
+      }
+      case "sync_request": {
+        if (!db) break;
+        const sinceSeq = Math.max(0, Number(msg.sinceSeq) || 0);
+        const deliveryId = typeof msg.deliveryId === "string" && msg.deliveryId.trim() ? msg.deliveryId.trim() : void 0;
+        const missedEvents = await this.getEventsSince(db, sinceSeq, deliveryId);
+        this.safeSend(client.socket, {
+          type: "sync_response",
+          sinceSeq,
+          latestSeq: this.latestSeq,
+          events: missedEvents,
+          presence: this.getPresenceSummary(client.activeDeliveryId),
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        break;
+      }
+    }
+  }
+  /**
+   * Build live worker presence summary for a specific delivery room and globally
+   */
+  getPresenceSummary(deliveryId = null) {
+    const allDevices = [];
+    for (const client of this.clients.values()) {
+      if (client.socket.readyState !== WS_OPEN) continue;
+      allDevices.push({
+        connectionId: client.connectionId,
+        userId: client.user.id,
+        employeeName: client.user.employeeName,
+        employeeCode: client.user.employeeCode,
+        role: client.user.role,
+        activeDeliveryId: client.activeDeliveryId,
+        status: client.status,
+        connectedAt: client.connectedAt,
+        lastActivityAt: client.lastActivityAt,
+        lastScanSummary: client.lastScanSummary
+      });
+    }
+    const dedupByUser = (list) => {
+      const byUser = /* @__PURE__ */ new Map();
+      const rank = { scanning: 3, viewing: 2, dashboard: 1 };
+      for (const item of list) {
+        const prev = byUser.get(item.userId);
+        if (!prev || rank[item.status] > rank[prev.status] || item.lastActivityAt > prev.lastActivityAt) {
+          byUser.set(item.userId, item);
+        }
+      }
+      return Array.from(byUser.values());
+    };
+    const allUniqueWorkers = dedupByUser(allDevices);
+    const roomDevices = deliveryId ? allDevices.filter((d) => d.activeDeliveryId === deliveryId) : allDevices;
+    const roomUniqueWorkers = dedupByUser(roomDevices);
+    return {
+      deliveryId,
+      connectedWorkersCount: allUniqueWorkers.length,
+      deliveryWorkersCount: roomUniqueWorkers.length,
+      connectedDevicesCount: roomDevices.length,
+      workers: roomUniqueWorkers,
+      deliveryWorkers: roomUniqueWorkers,
+      allConnectedWorkers: allUniqueWorkers,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * Broadcast presence update to clients in a delivery room (or globally if deliveryId is null)
+   */
+  broadcastPresenceUpdate(deliveryId = null) {
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    for (const client of this.clients.values()) {
+      if (client.socket.readyState !== WS_OPEN) continue;
+      if (deliveryId !== null && client.activeDeliveryId !== deliveryId) {
+        continue;
+      }
+      const summary = this.getPresenceSummary(client.activeDeliveryId);
+      const event = {
+        id: `rt_pres_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        type: "presence:updated",
+        sequenceNumber: this.latestSeq,
+        deliveryId: client.activeDeliveryId || void 0,
+        timestamp: nowIso,
+        payload: summary
+      };
+      this.safeSend(client.socket, {
+        type: "event",
+        event
+      });
+    }
+  }
+  /**
+   * Persist an authoritative state-change event to D1 `realtime_events`, assign a monotonic
+   * sequenceNumber, update the scanning worker's live activity summary, and broadcast to
+   * all connected clients immediately.
+   */
+  async publishEvent(db, input) {
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const eventId = `rt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const payloadJson = JSON.stringify(input.payload || {});
+    let seq = this.latestSeq + 1;
+    try {
+      const insertRes = await db.prepare(
+        `INSERT INTO realtime_events (
+            id, event_type, delivery_id, part_id, user_id, employee_name, employee_role,
+            delivery_version, payload, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        eventId,
+        input.type,
+        input.deliveryId || null,
+        input.partId || null,
+        input.userId || null,
+        input.employeeName || null,
+        input.employeeRole || null,
+        input.deliveryVersion ?? null,
+        payloadJson,
+        nowIso
+      ).run();
+      const lastRowId = Number(insertRes.meta?.last_row_id);
+      if (Number.isFinite(lastRowId) && lastRowId > 0) {
+        seq = lastRowId;
+      } else {
+        const row = await db.prepare("SELECT seq FROM realtime_events WHERE id = ?").bind(eventId).first();
+        if (row?.seq) {
+          seq = Number(row.seq);
+        }
+      }
+      if (seq > this.latestSeq) {
+        this.latestSeq = seq;
+      }
+      if (seq % 200 === 0 && seq > 2e3) {
+        db.prepare("DELETE FROM realtime_events WHERE seq < ?").bind(seq - 2e3).run().catch(() => {
+        });
+      }
+    } catch (err) {
+      console.warn("Realtime event persistence fallback notice:", err);
+      this.latestSeq = seq;
+    }
+    if (input.userId && input.deliveryId) {
+      let summaryText;
+      if (input.type === "part:scanned" || input.type === "quantity:updated") {
+        const partNo = input.payload?.part?.partNumber || input.payload?.partNumber || "";
+        const recQty = input.payload?.part?.receivedQuantity ?? input.payload?.receivedQuantity;
+        const reqQty = input.payload?.part?.quantity ?? input.payload?.requiredQuantity;
+        summaryText = `Scanned ${partNo} (${recQty}/${reqQty})`;
+      } else if (input.type === "part:duplicate_rejected") {
+        const partNo = input.payload?.part?.partNumber || input.payload?.partNumber || "";
+        summaryText = `Duplicate scan blocked on ${partNo}`;
+      } else if (input.type === "part:added" || input.type === "part:edited") {
+        const partNo = input.payload?.part?.partNumber || "";
+        summaryText = `Edited ${partNo}`;
+      }
+      if (summaryText) {
+        for (const client of this.clients.values()) {
+          if (client.user.id === input.userId) {
+            client.lastScanSummary = summaryText;
+            client.lastActivityAt = nowIso;
+          }
+        }
+      }
+    }
+    const event = {
+      id: eventId,
+      type: input.type,
+      sequenceNumber: seq,
+      deliveryId: input.deliveryId,
+      partId: input.partId,
+      userId: input.userId,
+      employeeName: input.employeeName,
+      employeeRole: input.employeeRole,
+      deliveryVersion: input.deliveryVersion,
+      timestamp: nowIso,
+      payload: input.payload || {}
+    };
+    this.broadcastEvent(event);
+    if (this.durableObjectForwarder) {
+      this.durableObjectForwarder(event).catch(() => {
+      });
+    }
+    return event;
+  }
+  /**
+   * Broadcast a RealtimeEvent to all connected authenticated WebSocket clients.
+   * Room isolation rule:
+   * - `part:duplicate_rejected` and `worker:scanning_activity` are only sent to clients
+   *   actively viewing/scanning the target `deliveryId` (or the triggering user).
+   * - Authoritative delivery/part state transitions (`delivery:*`, `part:*`, `quantity:updated`)
+   *   include `deliveryId` and `deliveryVersion` and are sent to all authenticated clients so both
+   *   open checklists for that delivery AND dashboard progress bars update instantaneously, while
+   *   clients viewing a different delivery safely ignore foreign part mutations in their active view.
+   */
+  broadcastEvent(event) {
+    if (event.sequenceNumber > this.latestSeq) {
+      this.latestSeq = event.sequenceNumber;
+    }
+    const packet = JSON.stringify({
+      type: "event",
+      event
+    });
+    const isRoomScopedOnly = event.type === "worker:scanning_activity" || event.type === "part:duplicate_rejected";
+    for (const [connId, client] of this.clients.entries()) {
+      if (client.socket.readyState !== WS_OPEN) {
+        this.clients.delete(connId);
+        continue;
+      }
+      if (isRoomScopedOnly && event.deliveryId) {
+        if (client.activeDeliveryId !== event.deliveryId && client.user.id !== event.userId) {
+          continue;
+        }
+      }
+      try {
+        client.socket.send(packet);
+      } catch {
+        this.clients.delete(connId);
+      }
+    }
+  }
+  broadcastToDeliveryRoom(deliveryId, message) {
+    const packet = JSON.stringify(message);
+    for (const [connId, client] of this.clients.entries()) {
+      if (client.socket.readyState !== WS_OPEN) {
+        this.clients.delete(connId);
+        continue;
+      }
+      if (client.activeDeliveryId === deliveryId) {
+        try {
+          client.socket.send(packet);
+        } catch {
+          this.clients.delete(connId);
+        }
+      }
+    }
+  }
+  safeSend(socket, payload) {
+    if (socket.readyState !== WS_OPEN) return;
+    try {
+      socket.send(JSON.stringify(payload));
+    } catch {
+    }
+  }
+  /**
+   * Query missed events since `sinceSeq` from D1 `realtime_events`
+   */
+  async getEventsSince(db, sinceSeq, deliveryId) {
+    try {
+      let rowsRes;
+      if (deliveryId) {
+        rowsRes = await db.prepare(
+          `SELECT * FROM realtime_events
+             WHERE seq > ? AND (delivery_id = ? OR delivery_id IS NULL OR event_type LIKE 'delivery:%')
+             ORDER BY seq ASC
+             LIMIT 300`
+        ).bind(sinceSeq, deliveryId).all();
+      } else {
+        rowsRes = await db.prepare(
+          `SELECT * FROM realtime_events
+             WHERE seq > ?
+             ORDER BY seq ASC
+             LIMIT 300`
+        ).bind(sinceSeq).all();
+      }
+      const events = [];
+      for (const row of rowsRes.results || []) {
+        let parsedPayload = {};
+        try {
+          parsedPayload = JSON.parse(row.payload);
+        } catch {
+          parsedPayload = {};
+        }
+        if (row.seq > this.latestSeq) {
+          this.latestSeq = row.seq;
+        }
+        events.push({
+          id: row.id,
+          type: row.event_type,
+          sequenceNumber: Number(row.seq),
+          deliveryId: row.delivery_id || void 0,
+          partId: row.part_id || void 0,
+          userId: row.user_id || void 0,
+          employeeName: row.employee_name || void 0,
+          employeeRole: row.employee_role || void 0,
+          deliveryVersion: row.delivery_version !== null && row.delivery_version !== void 0 ? Number(row.delivery_version) : void 0,
+          timestamp: row.created_at,
+          payload: parsedPayload
+        });
+      }
+      return events;
+    } catch {
+      return [];
+    }
+  }
+  /**
+   * Get the latest sequence number from memory or D1
+   */
+  async getLatestSequenceNumber(db) {
+    try {
+      const row = await db.prepare("SELECT MAX(seq) as max_seq FROM realtime_events").first();
+      const dbMax = Number(row?.max_seq || 0);
+      if (dbMax > this.latestSeq) {
+        this.latestSeq = dbMax;
+      }
+    } catch {
+    }
+    return this.latestSeq;
+  }
+};
+var realtimeBroker = new PalletTrackRealtimeBroker();
+
 // src/server/api/palletTrackApiRouter.ts
 var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -2982,7 +3767,15 @@ function errorResponse(message, status = 400, code, extraHeaders = {}) {
     }
   );
 }
-function extractToken(request) {
+function extractSessionTokenFromRequest(request) {
+  try {
+    const url = new URL(request.url);
+    const queryToken = url.searchParams.get("token");
+    if (queryToken && queryToken.trim()) {
+      return queryToken.trim();
+    }
+  } catch {
+  }
   const authHeader = request.headers.get("authorization") || request.headers.get("Authorization");
   if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
     return authHeader.slice(7).trim();
@@ -2995,6 +3788,9 @@ function extractToken(request) {
     }
   }
   return null;
+}
+function extractToken(request) {
+  return extractSessionTokenFromRequest(request);
 }
 function buildSetCookieHeader(token, maxAge = 28800) {
   return `pallettrack_session=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax`;
@@ -3033,7 +3829,8 @@ async function handlePalletTrackApiRequest(request, db, env) {
         const prov = await service.getProvisionStatus();
         return jsonResponse({
           status: "ok",
-          app: "PalletTrack",
+          app: "PartTrack",
+          tagline: "Track every part. Every pallet. Every order.",
           database: "Cloudflare D1 (centralised)",
           dbConnected: Boolean(ping),
           hasSuperAdmin: prov.hasSuperAdmin,
@@ -3046,7 +3843,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
         return jsonResponse(
           {
             status: "degraded",
-            app: "PalletTrack",
+            app: "PartTrack",
             database: "Cloudflare D1 (error)",
             dbConnected: false,
             error: err?.message,
@@ -3131,6 +3928,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
     if (path3 === "/api/auth/logout" && method === "POST") {
       const token = extractToken(request);
       if (token) {
+        realtimeBroker.disconnectSessionToken(token);
         await service.revokeSession(token);
       }
       return jsonResponse(
@@ -3162,7 +3960,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
       const prov = await service.getProvisionStatus();
       if (!prov.hasAdmin) {
         return errorResponse(
-          "Initial Super Admin setup required before using PalletTrack.",
+          "Initial Super Admin setup required before using PartTrack.",
           428,
           "SETUP_REQUIRED"
         );
@@ -3227,6 +4025,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
           }
           try {
             const res = await service.resetUserPin(targetUserId, pinValue, currentUser);
+            realtimeBroker.disconnectUser(targetUserId, "PIN reset by administrator");
             return jsonResponse(res);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
@@ -3241,6 +4040,9 @@ async function handlePalletTrackApiRequest(request, db, env) {
           const body = await request.json().catch(() => ({}));
           try {
             const updated = await service.updateUser(targetUserId, body, currentUser);
+            if (body.active === false || !updated.active) {
+              realtimeBroker.disconnectUser(targetUserId, "Account deactivated by administrator");
+            }
             return jsonResponse(updated);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
@@ -3254,6 +4056,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
         if ((sub === "" || sub === "/") && method === "DELETE") {
           try {
             const deleted = await service.deleteUser(targetUserId, currentUser);
+            realtimeBroker.disconnectUser(targetUserId, "Account deleted by administrator");
             return jsonResponse(deleted);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
@@ -3265,6 +4068,58 @@ async function handlePalletTrackApiRequest(request, db, env) {
           }
         }
       }
+    }
+    if (path3 === "/api/realtime/events" && method === "GET") {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const sinceSeq = Math.max(0, Number(url.searchParams.get("sinceSeq")) || 0);
+      const deliveryId = url.searchParams.get("deliveryId") || void 0;
+      const events = await realtimeBroker.getEventsSince(db, sinceSeq, deliveryId);
+      const latestSeq = await realtimeBroker.getLatestSequenceNumber(db);
+      const presence = realtimeBroker.getPresenceSummary(deliveryId || null);
+      return jsonResponse({
+        events,
+        latestSeq,
+        presence,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    if (path3 === "/api/realtime/presence" && method === "GET") {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const deliveryId = url.searchParams.get("deliveryId") || null;
+      const presence = realtimeBroker.getPresenceSummary(deliveryId);
+      const latestSeq = await realtimeBroker.getLatestSequenceNumber(db);
+      return jsonResponse({
+        presence,
+        latestSeq,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    if (path3 === "/api/deliveries/processing" && method === "POST") {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+      if (isEmployeeRole(currentUser.role)) {
+        return errorResponse("Forbidden: Employees cannot upload new deliveries.", 403, "FORBIDDEN");
+      }
+      const body = await request.json().catch(() => ({}));
+      const rtEvent = await realtimeBroker.publishEvent(db, {
+        type: "delivery:processing",
+        userId: currentUser.id,
+        employeeName: currentUser.employeeName,
+        employeeRole: currentUser.role,
+        payload: {
+          status: body.status || "processing",
+          fileName: body.fileName || "Delivery Docket",
+          fileCount: Number(body.fileCount) || 1,
+          employeeName: currentUser.employeeName
+        }
+      });
+      return jsonResponse({
+        success: true,
+        sequenceNumber: rtEvent.sequenceNumber
+      });
     }
     if (path3 === "/api/deliveries/migrate" && method === "POST") {
       const authResult = await authenticateSession();
@@ -3307,6 +4162,21 @@ async function handlePalletTrackApiRequest(request, db, env) {
         }
         body.createdBy = currentUser.id;
         const created = await service.createDelivery(body);
+        if (created) {
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: "delivery:created",
+            deliveryId: created.id,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            deliveryVersion: created.version || 1,
+            payload: {
+              delivery: created,
+              createdByName: currentUser.employeeName
+            }
+          });
+          return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+        }
         return jsonResponse(created, 201);
       }
     }
@@ -3334,7 +4204,27 @@ async function handlePalletTrackApiRequest(request, db, env) {
             );
           }
           const body = await request.json().catch(() => ({}));
+          const prevDelivery = await service.getDeliveryById(deliveryId);
           const updated = await service.updateDelivery(deliveryId, body);
+          if (updated) {
+            const prevStatus = prevDelivery?.status || prevDelivery?.deliveryStatus;
+            const nextStatus = updated.status || updated.deliveryStatus;
+            const eventType = prevDelivery && prevStatus !== "completed" && nextStatus === "completed" ? "delivery:completed" : prevDelivery && prevStatus === "completed" && nextStatus === "receiving" ? "delivery:reopened" : "delivery:updated";
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: eventType,
+              deliveryId: updated.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: updated.version || 1,
+              payload: {
+                delivery: updated,
+                status: nextStatus,
+                updatedByName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber });
+          }
           return jsonResponse(updated);
         }
       }
@@ -3354,7 +4244,21 @@ async function handlePalletTrackApiRequest(request, db, env) {
               employeeName: currentUser.employeeName,
               role: currentUser.role
             });
-            return jsonResponse(added, 201);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "part:added",
+              deliveryId,
+              partId: added.part?.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: added.delivery?.version || 1,
+              payload: {
+                part: added.part,
+                delivery: added.delivery,
+                actorName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...added, sequenceNumber: rtEvent.sequenceNumber }, 201);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
             return errorResponse(
@@ -3376,7 +4280,19 @@ async function handlePalletTrackApiRequest(request, db, env) {
               employeeName: currentUser.employeeName,
               role: currentUser.role
             });
-            return jsonResponse(saved, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "parts:batch_saved",
+              deliveryId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: saved.delivery?.version || 1,
+              payload: {
+                delivery: saved.delivery,
+                actorName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...saved, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
             return errorResponse(
@@ -3399,6 +4315,8 @@ async function handlePalletTrackApiRequest(request, db, env) {
         }
         const receivePayload = {
           ...body,
+          scannedVia: body.scannedVia || body.scanType || "qr",
+          scannedCode: body.scannedCode || body.code,
           userId: currentUser.id,
           employeeName: currentUser.employeeName,
           employeeRole: currentUser.role,
@@ -3406,7 +4324,46 @@ async function handlePalletTrackApiRequest(request, db, env) {
         };
         const result = await service.updatePartReceivedQuantity(deliveryId, partId, receivePayload);
         if (result.duplicate) {
+          await realtimeBroker.publishEvent(db, {
+            type: "part:duplicate_rejected",
+            deliveryId,
+            partId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: {
+              part: result.part,
+              alreadyScannedBy: result.alreadyScannedBy,
+              alreadyScannedAt: result.alreadyScannedAt,
+              attemptedBy: currentUser.employeeName,
+              message: result.message
+            }
+          });
           return jsonResponse(result, 409);
+        }
+        if (!result.idempotentReplay) {
+          const isUndo = result.part?.status === "outstanding" || Number(result.part?.receivedQuantity) === 0;
+          const isPartialQtyUpdate = !isUndo && result.part?.verificationStatus === "quantity_mismatch" && Number(result.part?.receivedQuantity) < Number(result.part?.quantity);
+          const eventType = isUndo ? "part:scan_reversed" : body.scannedVia === "manual" || isPartialQtyUpdate ? "quantity:updated" : "part:scanned";
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: eventType,
+            deliveryId,
+            partId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            deliveryVersion: result.deliveryVersion || 1,
+            payload: {
+              part: result.part,
+              scanEvent: result.scanEvent,
+              scannedByName: currentUser.employeeName,
+              receivedQuantity: result.part?.receivedQuantity,
+              requiredQuantity: result.part?.quantity,
+              deliveryStats: result.deliveryStats,
+              deliveryVersion: result.deliveryVersion || 1
+            }
+          });
+          return jsonResponse({ ...result, sequenceNumber: rtEvent.sequenceNumber }, 200);
         }
         return jsonResponse(result, 200);
       }
@@ -3421,7 +4378,21 @@ async function handlePalletTrackApiRequest(request, db, env) {
               employeeName: currentUser.employeeName,
               role: currentUser.role
             });
-            return jsonResponse(updated, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "part:edited",
+              deliveryId,
+              partId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: updated.delivery?.version || 1,
+              payload: {
+                part: updated.part,
+                delivery: updated.delivery,
+                actorName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
             return errorResponse(
@@ -3438,7 +4409,21 @@ async function handlePalletTrackApiRequest(request, db, env) {
               employeeName: currentUser.employeeName,
               role: currentUser.role
             });
-            return jsonResponse(deleted, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "part:deleted",
+              deliveryId,
+              partId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: deleted.delivery?.version || 1,
+              payload: {
+                deletedPartId: deleted.deletedPartId,
+                delivery: deleted.delivery,
+                actorName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...deleted, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err) {
             const isForbidden = String(err?.message || "").startsWith("Forbidden:");
             return errorResponse(
@@ -3480,7 +4465,7 @@ async function handlePalletTrackApiRequest(request, db, env) {
     }
     return null;
   } catch (err) {
-    console.error("PalletTrack API Error:", err);
+    console.error("PartTrack API Error:", err);
     return errorResponse(err?.message || "Internal database server error", 500, "INTERNAL_ERROR");
   }
 }
@@ -3512,7 +4497,7 @@ app.use(express.static(path2.resolve(__dirname, "public")));
 app.use("/tesseract", express.static(path2.resolve(__dirname, "node_modules/tesseract.js/dist")));
 var localDb = getLocalDevDatabase();
 app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path === "/api/health") {
+  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path.startsWith("/api/realtime") || req.path === "/api/health") {
     try {
       const url = `${req.protocol}://${req.get("host") || "localhost:3000"}${req.originalUrl}`;
       const headers = new Headers();
@@ -3568,6 +4553,9 @@ app.get("/api/export-project-zip", async (_req, res) => {
     const ignoredNames = /* @__PURE__ */ new Set([
       "node_modules",
       "dist",
+      "build",
+      "server.js",
+      ".data",
       ".git",
       ".tempmediaStorage",
       ".aistudio",
@@ -3580,7 +4568,7 @@ app.get("/api/export-project-zip", async (_req, res) => {
       compressionOptions: { level: 6 }
     });
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="pallettick-app-source.zip"');
+    res.setHeader("Content-Disposition", 'attachment; filename="parttrack-app-source.zip"');
     res.send(zipBuffer);
   } catch (err) {
     console.error("Error generating project zip:", err);
@@ -3682,8 +4670,82 @@ async function startServer() {
       res.sendFile(path2.resolve(__dirname, "dist", "index.html"));
     });
   }
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`PalletTick server running on http://localhost:${PORT}`);
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+  const dbService = new PalletTrackDbService(localDb);
+  httpServer.on("upgrade", (req, socket, head) => {
+    try {
+      const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost:3000"}`);
+      if (reqUrl.pathname !== "/api/realtime/ws") {
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, async (ws) => {
+        try {
+          const headers = new Headers();
+          for (const [k, v] of Object.entries(req.headers)) {
+            if (typeof v === "string") headers.set(k, v);
+            else if (Array.isArray(v)) v.forEach((val) => headers.append(k, val));
+          }
+          const webReq = new Request(reqUrl.toString(), { headers });
+          const token = extractSessionTokenFromRequest(webReq);
+          if (!token) {
+            ws.send(
+              JSON.stringify({
+                type: "auth_error",
+                code: "UNAUTHORIZED",
+                error: "Authentication required for real-time synchronisation."
+              })
+            );
+            ws.close(4001, "Unauthorized: Missing session token");
+            return;
+          }
+          const user = await dbService.validateSession(token);
+          if (!user || !user.active) {
+            ws.send(
+              JSON.stringify({
+                type: "auth_error",
+                code: "SESSION_INVALID",
+                error: "Invalid, expired, or deactivated session."
+              })
+            );
+            ws.close(4001, "Unauthorized: Invalid or expired session");
+            return;
+          }
+          const initialDeliveryId = reqUrl.searchParams.get("deliveryId") || null;
+          const lastSeq = Number(reqUrl.searchParams.get("lastSeq")) || 0;
+          const connectionId = realtimeBroker.registerClient(
+            ws,
+            user,
+            token,
+            initialDeliveryId,
+            lastSeq,
+            localDb
+          );
+          ws.on("message", (data) => {
+            const text = typeof data === "string" ? data : data.toString("utf-8");
+            realtimeBroker.handleClientMessage(connectionId, text, localDb).catch(() => {
+            });
+          });
+          ws.on("close", () => {
+            realtimeBroker.unregisterClient(connectionId);
+          });
+          ws.on("error", () => {
+            realtimeBroker.unregisterClient(connectionId);
+          });
+        } catch {
+          try {
+            ws.close(4e3, "Internal connection error");
+          } catch {
+          }
+        }
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`PartTrack server running on http://localhost:${PORT}`);
   });
 }
 startServer();

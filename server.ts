@@ -154,7 +154,7 @@ app.get('/api/export-project-zip', async (_req: ExpressRequest, res: ExpressResp
     });
 
     res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="pallettick-app-source.zip"');
+    res.setHeader('Content-Disposition', 'attachment; filename="parttrack-app-source.zip"');
     res.send(zipBuffer);
   } catch (err: any) {
     console.error('Error generating project zip:', err);
@@ -397,7 +397,7 @@ async function startServer() {
   });
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`PalletTick server running on http://localhost:${PORT}`);
+    console.log(`PartTrack server running on http://localhost:${PORT}`);
   });
 }
 

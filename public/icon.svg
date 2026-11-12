@@ -1,3 +1,63 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <image href="/icon-512.png" width="512" height="512" preserveAspectRatio="xMidYMid slice" />
+  <defs>
+    <linearGradient id="ptBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#140B24" />
+      <stop offset="50%" stop-color="#080B12" />
+      <stop offset="100%" stop-color="#05060A" />
+    </linearGradient>
+    <linearGradient id="ptPurpleTop" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E879F9" />
+      <stop offset="45%" stop-color="#C084FC" />
+      <stop offset="100%" stop-color="#A020F0" />
+    </linearGradient>
+    <linearGradient id="ptPurpleMid" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C084FC" />
+      <stop offset="100%" stop-color="#9333EA" />
+    </linearGradient>
+    <linearGradient id="ptPurpleBot" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A855F7" />
+      <stop offset="100%" stop-color="#6B21A8" />
+    </linearGradient>
+    <filter id="ptNeonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Rounded Square Dark Graphite & Neon Purple Frame -->
+  <rect x="14" y="14" width="484" height="484" rx="108" fill="url(#ptBgGrad)" stroke="url(#ptPurpleTop)" stroke-width="10" />
+
+  <!-- Subtle Diagonal Industrial Light Streaks -->
+  <line x1="36" y1="160" x2="180" y2="16" stroke="#C084FC" stroke-width="3" opacity="0.45" />
+  <line x1="340" y1="490" x2="490" y2="340" stroke="#A020F0" stroke-width="3" opacity="0.45" />
+
+  <!-- 3-Layer Geometric Stacked Diamond / Chevron Mark -->
+  <g filter="url(#ptNeonGlow)">
+    <!-- Layer 1 (Top Diamond Ring) -->
+    <path
+      d="M256 76 L376 144 L256 212 L136 144 Z M256 108 L184 144 L256 180 L328 144 Z"
+      fill="url(#ptPurpleTop)"
+      fill-rule="evenodd"
+    />
+    <!-- Layer 2 (Middle Chevron) -->
+    <path
+      d="M136 184 L256 252 L376 184 L376 216 L256 284 L136 216 Z"
+      fill="url(#ptPurpleMid)"
+    />
+    <!-- Layer 3 (Bottom Chevron) -->
+    <path
+      d="M136 238 L256 306 L376 238 L376 270 L256 338 L136 270 Z"
+      fill="url(#ptPurpleBot)"
+    />
+  </g>
+
+  <!-- PartTrack Wordmark -->
+  <g font-family="Plus Jakarta Sans, Arial, sans-serif" font-weight="800" font-style="italic" font-size="72" text-anchor="middle">
+    <text x="256" y="422">
+      <tspan fill="#FFFFFF">Part</tspan><tspan fill="url(#ptPurpleTop)">Track</tspan>
+    </text>
+  </g>
+
+  <!-- Horizontal Laser Beam Accent -->
+  <ellipse cx="256" cy="448" rx="150" ry="2.5" fill="url(#ptPurpleTop)" opacity="0.85" />
 </svg>

@@ -83,7 +83,7 @@ export const ConnectionRequiredModal: React.FC<ConnectionRequiredModalProps> = (
                 Online connection required for receiving
               </p>
               <p>
-                PalletTrack operates on a centralized database to coordinate warehouse operations.
+                PartTrack operates on a centralized database to coordinate warehouse operations.
                 Scans cannot be recorded while disconnected to prevent conflicting or lost data.
               </p>
             </div>

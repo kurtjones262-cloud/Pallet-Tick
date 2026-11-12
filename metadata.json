@@ -1,6 +1,6 @@
 {
   "name": "PartTrack - Mobile Parts Receiving & Verification",
-  "description": "Workshop parts receiving, delivery docket AI vision extraction, and continuous QR & barcode scanner for laser-cut steel parts verification.",
+  "description": "PartTrack — Track every part. Every pallet. Every order. Workshop parts receiving, delivery docket AI vision extraction, continuous QR & barcode scanner, and real-time multi-user pallet verification.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

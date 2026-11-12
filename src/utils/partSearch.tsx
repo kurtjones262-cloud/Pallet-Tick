@@ -214,6 +214,46 @@ export function searchAllDeliveriesParts(
 }
 
 /**
+ * Checks whether a delivery (docket number, supplier, order number, carrier, notes, or any of its parts)
+ * matches a smart search query.
+ */
+export function deliveryMatchesSmartQuery(delivery: Delivery, query: string): boolean {
+  const clean = query.trim().toLowerCase();
+  if (!clean) return true;
+
+  const tokens = parseSearchTokens(clean);
+  if (tokens.length === 0) return true;
+
+  const headerHaystack = [
+    delivery.docketNumber,
+    delivery.supplier,
+    delivery.orderNumber,
+    delivery.carrier,
+    delivery.notes,
+    delivery.deliveryDate,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  // Check if all tokens match the delivery header directly
+  const allMatchHeader = tokens.every((token) => headerHaystack.includes(token));
+  if (allMatchHeader) return true;
+
+  // Check if any part in the delivery matches the query
+  for (const part of delivery.parts || []) {
+    const res = matchPartWithQuery(part, clean, {
+      docketNumber: delivery.docketNumber,
+      supplier: delivery.supplier,
+      carrier: delivery.carrier,
+    });
+    if (res.isMatch) return true;
+  }
+
+  return false;
+}
+
+/**
  * Escapes characters for safe regular expression building
  */
 function escapeRegExp(string: string): string {

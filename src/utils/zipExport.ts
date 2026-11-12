@@ -8,6 +8,7 @@ import {
 } from './pdfExport';
 import { getDocketImagesForDelivery } from './indexedDb';
 import { getStoredDeliveries } from './storage';
+import { BRANDING } from '../config/branding';
 
 /**
  * Converts a base64 Data URL to a binary Uint8Array for zip packaging.
@@ -60,7 +61,7 @@ export async function exportDeliveryZip(
   try {
     const pdfDoc = createDeliveryPdfDoc(delivery);
     const pdfArrayBuffer = pdfDoc.output('arraybuffer');
-    zip.file(`PalletTick_Report_${sanitizedDocket}.pdf`, pdfArrayBuffer);
+    zip.file(`${BRANDING.exportFilePrefix}_Report_${sanitizedDocket}.pdf`, pdfArrayBuffer);
   } catch (err) {
     console.error('Failed to bundle PDF in zip:', err);
   }
@@ -82,8 +83,9 @@ export async function exportDeliveryZip(
   const receivedCount = delivery.parts.filter((p) => p.status === 'received').length;
   const totalCount = delivery.parts.length;
   const manifest = {
-    app: 'PalletTick',
-    version: '1.0',
+    app: BRANDING.appName,
+    tagline: BRANDING.tagline,
+    version: '2.5',
     exportTimestamp: new Date().toISOString(),
     delivery: {
       id: delivery.id,
@@ -144,7 +146,7 @@ export async function exportDeliveryZip(
     compressionOptions: { level: 6 },
   });
 
-  const zipFilename = `PalletTick_Docket_${sanitizedDocket}_${dateStr}.zip`;
+  const zipFilename = `${BRANDING.exportFilePrefix}_Docket_${sanitizedDocket}_${dateStr}.zip`;
   triggerDownload(zipBlob, zipFilename);
   onProgress?.('Download complete!');
 }
@@ -242,6 +244,6 @@ export async function exportAllDeliveriesBackupZip(
     compressionOptions: { level: 6 },
   });
 
-  triggerDownload(zipBlob, `PalletTick_Master_Backup_${dateStr}.zip`);
+  triggerDownload(zipBlob, `${BRANDING.exportFilePrefix}_Master_Backup_${dateStr}.zip`);
   onProgress?.('Master backup downloaded successfully!');
 }

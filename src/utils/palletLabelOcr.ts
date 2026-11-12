@@ -643,23 +643,31 @@ function rotateCanvas(canvas: HTMLCanvasElement, degrees: number): HTMLCanvasEle
 }
 
 /**
- * Applies a clean 1st-to-99th percentile luminance normalization with gentle edge micro-contrast
- * so live camera video frames remain free of grain/speckle artifacts while keeping printed text crisp.
+ * Applies a sparse-text-safe luminance normalization (0.25th-to-96th percentile with black/white point guards),
+ * a 3x3 unsharp mask filter for crisp character strokes on small/faded printed labels, and a 16px white quiet-zone border.
+ * Kept strictly isolated to OCR label recognition so barcode/QR fast-paths incur zero preprocessing overhead.
  */
-function enhanceLabelContrastSmoothly(
+export function enhanceLabelContrastSmoothly(
   canvas: HTMLCanvasElement,
   gentleMode: boolean = false
 ): HTMLCanvasElement {
-  const w = canvas.width;
-  const h = canvas.height;
+  const srcW = canvas.width;
+  const srcH = canvas.height;
+  const pad = 16;
+  const w = srcW + pad * 2;
+  const h = srcH + pad * 2;
+
   const out = document.createElement('canvas');
   out.width = w;
   out.height = h;
   const ctx = out.getContext('2d', { willReadFrequently: true });
   if (!ctx) return canvas;
 
-  // Add a clean white quiet-zone border around the image (Tesseract LSTM performs significantly better with a quiet border)
-  ctx.drawImage(canvas, 0, 0);
+  // Fill clean white quiet-zone border around the image (Tesseract LSTM performs significantly better with a quiet border)
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(canvas, pad, pad);
+
   const imageData = ctx.getImageData(0, 0, w, h);
   const data = imageData.data;
   const numPixels = w * h;
@@ -674,8 +682,9 @@ function enhanceLabelContrastSmoothly(
     hist[v]++;
   }
 
-  const lowTarget = Math.floor(numPixels * (gentleMode ? 0.01 : 0.02));
-  const highTarget = Math.floor(numPixels * (gentleMode ? 0.99 : 0.97));
+  // Use 0.25th percentile for dark ink so labels with sparse printed text (<1.5% ink coverage) never clip dark strokes
+  const lowTarget = Math.max(1, Math.floor(numPixels * (gentleMode ? 0.0015 : 0.0025)));
+  const highTarget = Math.floor(numPixels * (gentleMode ? 0.98 : 0.95));
   let cum = 0;
   let pLow = 0;
   let pHigh = 255;
@@ -686,15 +695,45 @@ function enhanceLabelContrastSmoothly(
     if (cum <= highTarget) pHigh = v;
   }
 
-  const range = Math.max(40, pHigh - pLow);
+  // Guard black & white points so a mostly-white label never stretches grey paper grain into black ink
+  pLow = Math.min(pLow, 145);
+  pHigh = Math.max(pHigh, pLow + 55, 175);
+  const range = Math.max(55, pHigh - pLow);
 
+  const normLum = new Uint8Array(numPixels);
   for (let i = 0; i < numPixels; i++) {
     const norm = Math.min(1, Math.max(0, (lum[i] - pLow) / range));
-    const val = Math.round(norm * 255);
-    const idx = i * 4;
-    data[idx] = val;
-    data[idx + 1] = val;
-    data[idx + 2] = val;
+    normLum[i] = Math.round(norm * 255);
+  }
+
+  // Apply 3x3 unsharp mask to sharpen character edges, hyphens, and small digits
+  const sharpenAmount = gentleMode ? 0.35 : 0.65;
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = row + x;
+      const center = normLum[i];
+      // 3x3 box blur approximation around center pixel
+      const blur =
+        (normLum[i - w - 1] +
+          normLum[i - w] +
+          normLum[i - w + 1] +
+          normLum[i - 1] +
+          center +
+          normLum[i + 1] +
+          normLum[i + w - 1] +
+          normLum[i + w] +
+          normLum[i + w + 1]) /
+        9;
+      const sharpened = Math.min(
+        255,
+        Math.max(0, Math.round(center + (center - blur) * sharpenAmount))
+      );
+      const idx = i * 4;
+      data[idx] = sharpened;
+      data[idx + 1] = sharpened;
+      data[idx + 2] = sharpened;
+    }
   }
 
   ctx.putImageData(imageData, 0, 0);

@@ -48,6 +48,15 @@ import {
   computeFrameSignatureDifference,
 } from '../utils/palletLabelOcr';
 import {
+  CAMERA_PROFILES,
+  ScanMode,
+  rankRearVideoDevices,
+  applyCameraProfileToTrack,
+  triggerCameraRefocusPulse,
+  createVerifiedNativeBarcodeDetector,
+  decodeStillImageOrVideoFrameBarcodes,
+} from '../utils/cameraManager';
+import {
   ScanConfirmationModal,
   ActiveScanData,
   ConfirmedScanPayload,
@@ -96,17 +105,27 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     return '';
   });
   const [actualCameraInfo, setActualCameraInfo] = useState<{
+    cameraProfile?: string;
     width: number;
     height: number;
     frameRate?: number;
     focusMode?: string;
     supportedFocusModes?: string[];
+    exposureMode?: string;
+    whiteBalanceMode?: string;
     deviceLabel?: string;
     decodeMethod?: string;
+    scanFrequencyHz?: number;
+    scanIntervalMs?: number;
     avgDecodeTimeMs?: number;
     lastDecodeTimeMs?: number;
+    lastRecognitionTimeMs?: number | null;
+    lastRecognitionTimestamp?: string | null;
     attemptsBeforeLastSuccess?: number;
     currentAttemptCount?: number;
+    multipleDecodersActive?: boolean;
+    concurrentDecodersCount?: number;
+    streamStatus?: string;
   } | null>(null);
   const [showDiagnosticsHud, setShowDiagnosticsHud] = useState<boolean>(false);
 
@@ -331,7 +350,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, []);
 
   /**
-   * Universal device video inputs enumeration
+   * Universal device video inputs enumeration (ranked with primary rear wide sensor first)
    */
   const enumerateAllVideoInputs = useCallback(async (): Promise<
     Array<{ id: string; label: string }>
@@ -345,7 +364,11 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     }
     try {
       const allDevices = await navigator.mediaDevices.enumerateDevices();
-      const videoInputs = allDevices.filter((d) => d.kind === 'videoinput');
+      const rankedRearFirst = rankRearVideoDevices(allDevices);
+      const videoInputs =
+        rankedRearFirst.length > 0
+          ? rankedRearFirst
+          : allDevices.filter((d) => d.kind === 'videoinput');
       const list = videoInputs.map((d, idx) => ({
         id: d.deviceId,
         label: d.label || `Camera ${idx + 1}`,
@@ -361,8 +384,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [appendDiagnosticLog]);
 
   /**
-   * Apply hardware camera capabilities (continuous autofocus, zoom, torch, exposure)
-   * without restarting or disrupting the video stream.
+   * Apply mode-specific camera profile (resolution, frameRate, continuous autofocus, continuous exposure,
+   * continuous white balance, zoom, torch) in-place without restarting or disrupting the video stream.
    */
   const configureTrackFocusAndCapabilities = useCallback(
     async (targetZoom: number = 1) => {
@@ -375,155 +398,92 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           focusMaintenanceIntervalRef.current = null;
         }
 
-        const capabilities: any = track.getCapabilities ? track.getCapabilities() : {};
-        const supportedFocusModes: string[] = Array.isArray(capabilities.focusMode)
-          ? capabilities.focusMode
-          : [];
+        const currentMode: ScanMode =
+          (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+        const profile = CAMERA_PROFILES[currentMode] || CAMERA_PROFILES.laser_central;
 
-        // 1. Check Torch capability
-        if (capabilities.torch && isMountedRef.current) {
-          setHasTorch(true);
-        } else if (isMountedRef.current) {
-          setHasTorch(false);
-        }
-
-        // 2. Check Hardware Zoom capability
-        if (capabilities.zoom && typeof capabilities.zoom === 'object') {
-          const minZ = capabilities.zoom.min || 1;
-          const maxZ = capabilities.zoom.max || 4;
-          if (isMountedRef.current) {
-            setSupportsHardwareZoom(true);
-            setMinHardwareZoom(minZ);
-            setMaxHardwareZoom(Math.min(maxZ, 6));
-          }
-        } else if (isMountedRef.current) {
-          setSupportsHardwareZoom(false);
-        }
-
-        // 3. Apply continuous autofocus where supported (or best available focus fallback)
-        let appliedContinuousFocus = false;
-        if (supportedFocusModes.includes('continuous') || supportedFocusModes.length === 0) {
-          try {
-            await track.applyConstraints({
-              advanced: [{ focusMode: 'continuous' } as any],
-            });
-            appliedContinuousFocus = true;
-          } catch {
-            try {
-              await track.applyConstraints({ focusMode: 'continuous' } as any);
-              appliedContinuousFocus = true;
-            } catch {}
-          }
-        }
-
-        // Fallback if continuous autofocus is not supported by the camera driver
-        if (!appliedContinuousFocus && supportedFocusModes.length > 0) {
-          const fallbackMode = supportedFocusModes.includes('single-shot')
-            ? 'single-shot'
-            : supportedFocusModes.includes('auto')
-            ? 'auto'
-            : null;
-          if (fallbackMode) {
-            await track
-              .applyConstraints({
-                advanced: [{ focusMode: fallbackMode } as any],
-              })
-              .catch(() => {});
-
-            // Gently trigger single-shot refocus periodically without resetting the stream
-            focusMaintenanceIntervalRef.current = setInterval(() => {
-              if (
-                !isMountedRef.current ||
-                activeScanConfirmationRef.current !== null ||
-                activeDuplicateWarningRef.current !== null
-              ) {
-                return;
-              }
-              const currentTrack = getActiveVideoTrack();
-              if (!currentTrack) return;
-              currentTrack
-                .applyConstraints({
-                  advanced: [{ focusMode: fallbackMode } as any],
-                })
-                .catch(() => {});
-            }, 2200);
-          }
-        }
-
-        // 4. Apply continuous exposure & white balance if supported
-        if (
-          Array.isArray(capabilities.exposureMode) &&
-          capabilities.exposureMode.includes('continuous')
-        ) {
-          await track
-            .applyConstraints({
-              advanced: [{ exposureMode: 'continuous' } as any],
-            })
-            .catch(() => {});
-        }
-        if (
-          Array.isArray(capabilities.whiteBalanceMode) &&
-          capabilities.whiteBalanceMode.includes('continuous')
-        ) {
-          await track
-            .applyConstraints({
-              advanced: [{ whiteBalanceMode: 'continuous' } as any],
-            })
-            .catch(() => {});
-        }
-        if (capabilities.zoom && targetZoom > 1) {
-          const minZ = capabilities.zoom.min || 1;
-          const maxZ = capabilities.zoom.max || 4;
-          const clampedZ = Math.max(minZ, Math.min(maxZ, targetZoom));
-          await track
-            .applyConstraints({
-              advanced: [{ zoom: clampedZ } as any],
-            })
-            .catch(() => {});
-        }
-
-        // 5. Inspect updated settings after applying constraints
-        const updatedSettings: any = track.getSettings ? track.getSettings() : {};
-        const container = document.getElementById('camera-scanner-view');
-        const video = container?.querySelector('video') as HTMLVideoElement | null;
-        const actualW = updatedSettings.width || video?.videoWidth || 0;
-        const actualH = updatedSettings.height || video?.videoHeight || 0;
-        const fps = updatedSettings.frameRate ? Math.round(updatedSettings.frameRate) : undefined;
-        const activeFocusMode =
-          updatedSettings.focusMode ||
-          (appliedContinuousFocus && supportedFocusModes.includes('continuous')
-            ? 'continuous'
-            : supportedFocusModes.length > 0
-            ? supportedFocusModes[0]
-            : 'auto (driver managed)');
+        const applied = await applyCameraProfileToTrack(
+          track,
+          currentMode,
+          targetZoom > 1 ? targetZoom : undefined
+        );
 
         if (isMountedRef.current) {
-          const diagPayload = {
-            width: actualW,
-            height: actualH,
-            frameRate: fps,
-            focusMode: activeFocusMode,
-            supportedFocusModes:
-              supportedFocusModes.length > 0 ? supportedFocusModes : ['driver-default'],
-            deviceLabel: track.label || 'Rear Camera',
-            decodeMethod: activeDecodeMethodRef.current,
-            avgDecodeTimeMs:
-              decodeTimeSamplesRef.current.length > 0
-                ? Math.round(
-                    (decodeTimeSamplesRef.current.reduce((a, b) => a + b, 0) /
-                      decodeTimeSamplesRef.current.length) *
-                      10
-                  ) / 10
-                : 0,
-            lastDecodeTimeMs:
-              decodeTimeSamplesRef.current[decodeTimeSamplesRef.current.length - 1] || 0,
-            attemptsBeforeLastSuccess: attemptsBeforeLastSuccessRef.current,
-            currentAttemptCount: decodeAttemptCountRef.current,
-          };
-          setActualCameraInfo(diagPayload);
-          if (typeof window !== 'undefined') {
-            (window as any).__PALLETTRACK_SCANNER_DIAGNOSTICS__ = diagPayload;
+          setHasTorch(applied.torchSupported);
+          setSupportsHardwareZoom(applied.zoomSupported);
+          if (applied.zoomSupported) {
+            setMinHardwareZoom(applied.zoomMin);
+            setMaxHardwareZoom(applied.zoomMax);
           }
+        }
+
+        // If the camera driver only supports single-shot focus (no continuous PDAF), pulse gently every 2.2s
+        if (
+          !applied.supportedFocusModes.includes('continuous') &&
+          applied.supportedFocusModes.includes('single-shot')
+        ) {
+          focusMaintenanceIntervalRef.current = setInterval(() => {
+            if (
+              !isMountedRef.current ||
+              activeScanConfirmationRef.current !== null ||
+              activeDuplicateWarningRef.current !== null
+            ) {
+              return;
+            }
+            const currentTrack = getActiveVideoTrack();
+            if (!currentTrack) return;
+            triggerCameraRefocusPulse(currentTrack).catch(() => {});
+          }, 2200);
+        }
+
+        // Inspect actual video element dimensions if track settings omitted width/height
+        const container = document.getElementById('camera-scanner-view');
+        const video = container?.querySelector('video') as HTMLVideoElement | null;
+        const [parsedW, parsedH] = applied.resolution.split('x').map((n) => parseInt(n, 10) || 0);
+        const actualW = video?.videoWidth || parsedW || profile.idealWidth;
+        const actualH = video?.videoHeight || parsedH || profile.idealHeight;
+
+        if (isMountedRef.current) {
+          setActualCameraInfo((prev) => {
+            const diagPayload = {
+              cameraProfile: applied.cameraProfile,
+              width: actualW,
+              height: actualH,
+              frameRate: applied.frameRate,
+              focusMode: applied.activeFocusMode,
+              supportedFocusModes:
+                applied.supportedFocusModes.length > 0
+                  ? applied.supportedFocusModes
+                  : ['continuous (driver-default)'],
+              exposureMode: applied.activeExposureMode,
+              whiteBalanceMode: applied.activeWhiteBalanceMode,
+              deviceLabel: applied.cameraDeviceLabel,
+              decodeMethod: activeDecodeMethodRef.current,
+              scanFrequencyHz: profile.scanFrequencyHz,
+              scanIntervalMs: profile.scanIntervalMs,
+              avgDecodeTimeMs:
+                decodeTimeSamplesRef.current.length > 0
+                  ? Math.round(
+                      (decodeTimeSamplesRef.current.reduce((a, b) => a + b, 0) /
+                        decodeTimeSamplesRef.current.length) *
+                        10
+                    ) / 10
+                  : 0,
+              lastDecodeTimeMs:
+                decodeTimeSamplesRef.current[decodeTimeSamplesRef.current.length - 1] || 0,
+              lastRecognitionTimeMs: prev?.lastRecognitionTimeMs ?? null,
+              lastRecognitionTimestamp: prev?.lastRecognitionTimestamp ?? null,
+              attemptsBeforeLastSuccess: attemptsBeforeLastSuccessRef.current,
+              currentAttemptCount: decodeAttemptCountRef.current,
+              multipleDecodersActive: false,
+              concurrentDecodersCount: 1,
+              streamStatus: 'active',
+            };
+            if (typeof window !== 'undefined') {
+              (window as any).__PALLETTRACK_SCANNER_DIAGNOSTICS__ = diagPayload;
+            }
+            return diagPayload;
+          });
         }
       } catch (e: any) {
         appendDiagnosticLog('error', `Track capability check note: ${e?.message || String(e)}`);
@@ -591,7 +551,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [appendDiagnosticLog, getActiveVideoTrack, torchOn]);
 
   /**
-   * Tap to focus on camera preview
+   * Tap to focus on camera preview (triggers refocus pulse + pointsOfInterest while keeping continuous AF)
    */
   const handleTapToFocus = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -625,6 +585,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             })
             .catch(() => {});
         }
+        triggerCameraRefocusPulse(track).catch(() => {});
       } catch {}
     },
     [getActiveVideoTrack]
@@ -963,6 +924,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const avgMs =
         Math.round((samples.reduce((acc, v) => acc + v, 0) / samples.length) * 10) / 10;
 
+      const currentMode: ScanMode =
+        (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+      const profile = CAMERA_PROFILES[currentMode] || CAMERA_PROFILES.laser_central;
+
       if (recognized) {
         attemptsBeforeLastSuccessRef.current = decodeAttemptCountRef.current;
         decodeAttemptCountRef.current = 0;
@@ -972,17 +937,29 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       if (recognized || decodeAttemptCountRef.current % 6 === 0) {
         setActualCameraInfo((prev) => {
           const next = {
-            width: prev?.width || 0,
-            height: prev?.height || 0,
-            frameRate: prev?.frameRate,
+            cameraProfile: prev?.cameraProfile || profile.profileLabel,
+            width: prev?.width || profile.idealWidth,
+            height: prev?.height || profile.idealHeight,
+            frameRate: prev?.frameRate || profile.idealFrameRate,
             focusMode: prev?.focusMode || 'continuous',
             supportedFocusModes: prev?.supportedFocusModes || ['continuous'],
+            exposureMode: prev?.exposureMode || 'continuous',
+            whiteBalanceMode: prev?.whiteBalanceMode || 'continuous',
             deviceLabel: prev?.deviceLabel || 'Rear Camera',
             decodeMethod: methodLabel,
+            scanFrequencyHz: profile.scanFrequencyHz,
+            scanIntervalMs: profile.scanIntervalMs,
             avgDecodeTimeMs: avgMs,
             lastDecodeTimeMs: roundedMs,
+            lastRecognitionTimeMs: recognized ? roundedMs : (prev?.lastRecognitionTimeMs ?? null),
+            lastRecognitionTimestamp: recognized
+              ? new Date().toLocaleTimeString()
+              : (prev?.lastRecognitionTimestamp ?? null),
             attemptsBeforeLastSuccess: attemptsBeforeLastSuccessRef.current,
             currentAttemptCount: decodeAttemptCountRef.current,
+            multipleDecodersActive: false,
+            concurrentDecodersCount: 1,
+            streamStatus: 'active',
           };
           if (typeof window !== 'undefined') {
             (window as any).__PALLETTRACK_SCANNER_DIAGNOSTICS__ = next;
@@ -996,12 +973,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   /**
    * Single-flight, mode-isolated Native Barcode & QR scanning loop on video frames.
-   * - In GCI mode ('gci'): isolates strictly to ['qr_code'] at 45ms intervals with single-flight lock,
+   * - In GCI mode ('gci'): isolates strictly to ['qr_code'] at 45ms intervals (22.2 Hz) with single-flight lock,
    *   and suspends Html5Qrcode's redundant ZXing canvas loop so only one decoder processes each frame.
-   * - In Laser Central mode ('laser_central'): scans 1D barcodes + QR codes with single-flight lock.
-   * - In OCR Label mode ('ocr_label'): scans 1D barcodes only (ignores QR codes).
+   * - In Laser Central mode ('laser_central'): verifies native 1D format support (code_128, code_39) via
+   *   createVerifiedNativeBarcodeDetector and scans at 60ms intervals (16.7 Hz) with single-flight lock,
+   *   or automatically enables ZXing fallback if 1D formats are unsupported natively.
+   * - In OCR Label mode ('ocr_label'): scans 1D barcodes at 85ms intervals (11.8 Hz) while ignoring QR codes.
    */
-  const startNativeBarcodeLoop = useCallback(() => {
+  const startNativeBarcodeLoop = useCallback(async () => {
     if (nativeDetectorIntervalRef.current) {
       clearInterval(nativeDetectorIntervalRef.current);
       nativeDetectorIntervalRef.current = null;
@@ -1009,64 +988,36 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     isNativeDetectingRef.current = false;
     decodeAttemptCountRef.current = 0;
 
-    const currentRuleId = activeSupplierRuleRef.current?.id || 'laser_central';
+    const currentRuleId: ScanMode =
+      (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+    const profile = CAMERA_PROFILES[currentRuleId] || CAMERA_PROFILES.laser_central;
 
-    if (
-      typeof window === 'undefined' ||
-      !('BarcodeDetector' in window) ||
-      typeof (window as any).BarcodeDetector !== 'function'
-    ) {
-      // Native BarcodeDetector unavailable: ensure Html5Qrcode ZXing fallback is active
-      const fallbackLabel =
-        currentRuleId === 'gci'
-          ? 'ZXing Fallback (GCI QR Mode)'
-          : 'ZXing Fallback (Html5Qrcode)';
-      activeDecodeMethodRef.current = fallbackLabel;
+    const { detector, engineName } = await createVerifiedNativeBarcodeDetector(currentRuleId);
+
+    if (!detector) {
+      // Native BarcodeDetector unavailable or missing required 1D formats: ensure Html5Qrcode ZXing fallback is active
+      activeDecodeMethodRef.current = engineName;
       if (scannerRef.current) {
         (scannerRef.current as any).shouldScan = true;
       }
       setActualCameraInfo((prev) =>
-        prev ? { ...prev, decodeMethod: fallbackLabel } : prev
+        prev
+          ? {
+              ...prev,
+              cameraProfile: profile.profileLabel,
+              decodeMethod: engineName,
+              scanFrequencyHz: profile.scanFrequencyHz,
+              scanIntervalMs: profile.scanIntervalMs,
+              multipleDecodersActive: false,
+              concurrentDecodersCount: 1,
+            }
+          : prev
       );
       return;
     }
 
     try {
-      const formats =
-        currentRuleId === 'gci'
-          ? ['qr_code']
-          : currentRuleId === 'ocr_label'
-          ? [
-              'code_128',
-              'code_39',
-              'ean_13',
-              'ean_8',
-              'data_matrix',
-              'itf',
-              'upc_a',
-              'upc_e',
-              'codabar',
-            ]
-          : [
-              'qr_code',
-              'code_128',
-              'code_39',
-              'ean_13',
-              'ean_8',
-              'data_matrix',
-              'itf',
-              'upc_a',
-              'upc_e',
-              'codabar',
-            ];
-
-      const detector = new (window as any).BarcodeDetector({ formats });
-      const methodLabel =
-        currentRuleId === 'gci'
-          ? 'Native BarcodeDetector (QR Fast-Path)'
-          : currentRuleId === 'ocr_label'
-          ? 'Native BarcodeDetector (1D + Live OCR)'
-          : 'Native BarcodeDetector (1D + QR)';
+      const methodLabel = engineName;
       activeDecodeMethodRef.current = methodLabel;
 
       // Prevent Html5Qrcode's internal ZXing canvas decoder from running in parallel on the same frame
@@ -1078,11 +1029,20 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       }
 
       setActualCameraInfo((prev) =>
-        prev ? { ...prev, decodeMethod: methodLabel } : prev
+        prev
+          ? {
+              ...prev,
+              cameraProfile: profile.profileLabel,
+              decodeMethod: methodLabel,
+              scanFrequencyHz: profile.scanFrequencyHz,
+              scanIntervalMs: profile.scanIntervalMs,
+              multipleDecodersActive: false,
+              concurrentDecodersCount: 1,
+            }
+          : prev
       );
 
-      // Fast 45ms cadence for GCI QR codes (~22fps), 80ms for multi-format 1D+QR
-      const intervalMs = currentRuleId === 'gci' ? 45 : 80;
+      const intervalMs = profile.scanIntervalMs;
 
       nativeDetectorIntervalRef.current = setInterval(async () => {
         // Strict single-flight guard: never start decoding a frame if the previous frame is still decoding
@@ -1141,7 +1101,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
       }, intervalMs);
     } catch {
-      // Fallback to Html5Qrcode ZXing decoder if BarcodeDetector constructor fails
+      // Fallback to Html5Qrcode ZXing decoder if BarcodeDetector fails
       activeDecodeMethodRef.current = 'ZXing Fallback (Html5Qrcode)';
       if (scannerRef.current) {
         (scannerRef.current as any).shouldScan = true;
@@ -1162,6 +1122,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     if (activeSupplierRuleRef.current?.id !== 'ocr_label') {
       return;
     }
+
+    const ocrCadenceMs = CAMERA_PROFILES.ocr_label.ocrIntervalMs || 1350;
 
     liveOcrIntervalRef.current = setInterval(async () => {
       if (
@@ -1193,6 +1155,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
       lastOcrFrameSignatureRef.current = sigInfo.signature;
       isLiveOcrBusyRef.current = true;
+      const t0 = performance.now();
 
       try {
         const result = await recognizePalletLabelOffline(
@@ -1200,6 +1163,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           deliveryRef.current?.parts || [],
           { x: 0.05, y: 0.16, width: 0.9, height: 0.68 }
         );
+        const ocrElapsedMs = performance.now() - t0;
 
         if (
           !isMountedRef.current ||
@@ -1210,6 +1174,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
 
         if (result.partNumber) {
+          recordDecodeDiagnostics(ocrElapsedMs, true, 'BarcodeDetector (1D) + Offline OCR');
           // STRICT DUPLICATE SCAN PREVENTION CHECK
           const duplicateCheck = detectDuplicateScan(
             deliveryRef.current,
@@ -1268,10 +1233,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       } finally {
         isLiveOcrBusyRef.current = false;
       }
-    }, 1800);
-  }, [appendDiagnosticLog, appSettings, isProcessingOcrLabel, triggerDuplicateWarning]);
+    }, ocrCadenceMs);
+  }, [
+    appendDiagnosticLog,
+    appSettings,
+    isProcessingOcrLabel,
+    recordDecodeDiagnostics,
+    triggerDuplicateWarning,
+  ]);
 
-  // Reconfigure active decoder loops in-place when switching between GCI, Laser Central, and OCR Label modes
+  // Reconfigure active decoder loops & resolution profile in-place when switching between GCI, Laser Central, and OCR Label modes
   const reconfigureActiveMode = useCallback(() => {
     configureTrackFocusAndCapabilities(zoomLevelRef.current);
     startNativeBarcodeLoop();
@@ -1280,7 +1251,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   reconfigureActiveModeRef.current = reconfigureActiveMode;
 
   /**
-   * Initializes the continuous video camera scanner
+   * Initializes the continuous video camera scanner using shared camera profiles & smart rear-lens ranking
    */
   const startScanner = useCallback(
     async (targetCameraId?: string) => {
@@ -1319,7 +1290,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           scannerRef.current = null;
         }
 
-        // 2. Discover available devices & prioritize rear/environment cameras when no explicit camera is saved
+        // 2. Discover available devices (already ranked with primary wide rear camera first via rankRearVideoDevices)
         const devices = await enumerateAllVideoInputs();
         const savedCamId =
           typeof window !== 'undefined'
@@ -1331,21 +1302,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         if (requestedId && (devices.length === 0 || devices.some((d) => d.id === requestedId))) {
           orderedCameraIds.push(requestedId);
         }
-        if (devices.length > 0) {
-          // Sort rear/back/environment cameras ahead of front cameras
-          const sortedDevices = [...devices].sort((a, b) => {
-            const aBack = /back|rear|environment|0/i.test(a.label) ? 0 : 1;
-            const bBack = /back|rear|environment|0/i.test(b.label) ? 0 : 1;
-            return aBack - bBack;
-          });
-          sortedDevices.forEach((d) => {
-            if (!orderedCameraIds.includes(d.id)) {
-              orderedCameraIds.push(d.id);
-            }
-          });
-        }
+        devices.forEach((d) => {
+          if (!orderedCameraIds.includes(d.id)) {
+            orderedCameraIds.push(d.id);
+          }
+        });
 
-        const currentRuleId = activeSupplierRuleRef.current?.id || 'laser_central';
+        const currentRuleId: ScanMode =
+          (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+        const profile = CAMERA_PROFILES[currentRuleId] || CAMERA_PROFILES.laser_central;
+
         const formatsToSupport =
           currentRuleId === 'gci'
             ? [Html5QrcodeSupportedFormats.QR_CODE]
@@ -1421,8 +1387,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         let started = false;
         let lastErrorMsg = '';
 
-        // Prefer environment-facing camera with 1280x720 HD resolution & continuous autofocus first when no specific camera ID was forced
-        if (!requestedId) {
+        // Prefer ranked primary rear camera or environment-facing constraint with profile's optimal resolution & continuous autofocus
+        if (!requestedId && orderedCameraIds.length === 0) {
           try {
             await scanner.start(
               { facingMode: 'environment' },
@@ -1430,10 +1396,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 ...baseScanConfig,
                 videoConstraints: {
                   facingMode: { ideal: 'environment' },
-                  width: { ideal: 1280 },
-                  height: { ideal: 720 },
-                  frameRate: { ideal: 30 },
-                  advanced: [{ focusMode: 'continuous' } as any],
+                  width: { ideal: profile.idealWidth },
+                  height: { ideal: profile.idealHeight },
+                  frameRate: { ideal: profile.idealFrameRate },
+                  advanced: [
+                    { focusMode: 'continuous' },
+                    { exposureMode: 'continuous' },
+                    { whiteBalanceMode: 'continuous' },
+                  ] as any,
                 } as any,
               },
               onZxingSuccess,
@@ -1441,7 +1411,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             );
             started = true;
           } catch {
-            // Fall through to deviceId loop or standard facingMode: 'environment'
+            // Fall through to ranked deviceId loop or standard facingMode: 'environment'
           }
         }
 
@@ -1454,10 +1424,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                   ...baseScanConfig,
                   videoConstraints: {
                     deviceId: { exact: camId },
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
-                    frameRate: { ideal: 30 },
-                    advanced: [{ focusMode: 'continuous' } as any],
+                    width: { ideal: profile.idealWidth },
+                    height: { ideal: profile.idealHeight },
+                    frameRate: { ideal: profile.idealFrameRate },
+                    advanced: [
+                      { focusMode: 'continuous' },
+                      { exposureMode: 'continuous' },
+                      { whiteBalanceMode: 'continuous' },
+                    ] as any,
                   } as any,
                 },
                 onZxingSuccess,
@@ -1527,7 +1501,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
 
         await configureTrackFocusAndCapabilities();
-        startNativeBarcodeLoop();
+        await startNativeBarcodeLoop();
         startLiveOcrDetectionLoop();
       } catch (err: any) {
         if (isMountedRef.current) {
@@ -1618,7 +1592,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   };
 
   /**
-   * Manual Snapshot / Shutter capture for instant OCR & Barcode processing
+   * Manual Snapshot / Shutter capture for instant Barcode/QR Fast-Path + Offline OCR Label processing
    */
   const handleShutterCapture = async () => {
     if (
@@ -1640,15 +1614,34 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     }
 
     setIsProcessingOcrLabel(true);
-    setOcrLabelStatusMessage('Reading label text & barcodes...');
+    setOcrLabelStatusMessage('Scanning frame for barcodes & label text...');
     triggerVisualFlash('green');
 
     try {
-      // 1. First run high-speed OCR on video frame
+      const currentMode: ScanMode =
+        (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+
+      // 1. FAST-PATH: Check native BarcodeDetector on the captured video frame (<25ms)
+      if (currentMode !== 'ocr_label') {
+        const barcodeCheck = await decodeStillImageOrVideoFrameBarcodes(video, currentMode);
+        if (barcodeCheck.rawValues.length > 0) {
+          recordDecodeDiagnostics(barcodeCheck.elapsedMs, true, barcodeCheck.engineUsed);
+          handleScannedCode(barcodeCheck.rawValues[0], 'photo_snap');
+          return;
+        }
+      }
+
+      // 2. Run high-detail unsharp-masked OCR on the video frame
+      const t0 = performance.now();
       const ocrResult = await recognizePalletLabelOffline(
         video,
         deliveryRef.current?.parts || [],
         { x: 0.05, y: 0.15, width: 0.9, height: 0.7 }
+      );
+      recordDecodeDiagnostics(
+        performance.now() - t0,
+        Boolean(ocrResult.partNumber),
+        'Shutter Offline OCR (Unsharp)'
       );
 
       const evalMatch = evaluatePalletLabelMatch(
@@ -1803,20 +1796,39 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   };
 
   /**
-   * Handle photo upload from gallery or file picker
+   * Handle photo upload from gallery or file picker (runs Barcode/QR fast-path first, then Offline OCR)
    */
   const handleFilePicked = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const file = files[0];
     setIsProcessingOcrLabel(true);
-    setOcrLabelStatusMessage('Processing image...');
+    setOcrLabelStatusMessage('Scanning photo for barcodes & label text...');
 
     try {
-      // Run OCR on picked file
+      const currentMode: ScanMode =
+        (activeSupplierRuleRef.current?.id as ScanMode) || 'laser_central';
+
+      // 1. FAST-PATH: Check native BarcodeDetector on the uploaded image file (<25ms)
+      if (currentMode !== 'ocr_label') {
+        const barcodeCheck = await decodeStillImageOrVideoFrameBarcodes(file, currentMode);
+        if (barcodeCheck.rawValues.length > 0) {
+          recordDecodeDiagnostics(barcodeCheck.elapsedMs, true, barcodeCheck.engineUsed);
+          handleScannedCode(barcodeCheck.rawValues[0], 'photo_snap');
+          return;
+        }
+      }
+
+      // 2. Run high-detail unsharp-masked OCR on picked file
+      const t0 = performance.now();
       const ocrResult = await recognizePalletLabelOffline(
         file,
         deliveryRef.current?.parts || [],
         { x: 0, y: 0, width: 1, height: 1 }
+      );
+      recordDecodeDiagnostics(
+        performance.now() - t0,
+        Boolean(ocrResult.partNumber),
+        'File Offline OCR (Unsharp)'
       );
 
       const evalMatch = evaluatePalletLabelMatch(
@@ -2071,67 +2083,127 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <div className="px-2.5 py-1 rounded-full bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 font-mono text-[10px] font-bold flex items-center gap-1.5 shadow-[0_0_10px_rgba(6,182,212,0.25)]">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span>
-                {activeSupplierRule.id === 'gci' ? 'GCI QR FAST' : 'LIVE SCAN'}
+                {activeSupplierRule.id === 'gci'
+                  ? 'GCI QR FAST'
+                  : activeSupplierRule.id === 'ocr_label'
+                  ? 'OCR LABEL HD'
+                  : 'LASER 1D HD'}
               </span>
             </div>
           </div>
         </div>
 
         {/* ============================================================ */}
-        {/* LIVE CAMERA & QR DECODER DIAGNOSTICS OVERLAY                 */}
+        {/* LIVE CAMERA & SCANNER DIAGNOSTICS OVERLAY (ALL MODES)         */}
         {/* ============================================================ */}
         {showDiagnosticsHud && (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="absolute top-13 right-3 z-30 w-72 p-3 rounded-xl bg-black/90 backdrop-blur-md border border-cyan-500/40 text-[10px] font-mono text-zinc-200 shadow-2xl space-y-1"
+            className="absolute top-13 right-3 z-30 w-80 p-3 rounded-xl bg-black/92 backdrop-blur-md border border-cyan-500/40 text-[10px] font-mono text-zinc-200 shadow-2xl space-y-1"
           >
             <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1 text-cyan-400 font-bold uppercase">
-              <span>Scanner Diagnostics</span>
+              <span>Camera & Scanner Diag</span>
               <span>{activeSupplierRule.name}</span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Camera:</span>
-              <span className="text-white truncate max-w-[160px]">
+              <span className="text-zinc-400">1. Profile:</span>
+              <span className="text-cyan-300 font-bold truncate max-w-[180px]">
+                {actualCameraInfo?.cameraProfile ||
+                  CAMERA_PROFILES[(activeSupplierRule.id as ScanMode) || 'laser_central']
+                    ?.profileLabel}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">2. Camera Device:</span>
+              <span className="text-white truncate max-w-[180px]">
                 {actualCameraInfo?.deviceLabel || 'Environment Rear'}
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Resolution / FPS:</span>
+              <span className="text-zinc-400">3. Resolution / FPS:</span>
               <span className="text-white">
                 {actualCameraInfo?.width || 0}×{actualCameraInfo?.height || 0}
                 {actualCameraInfo?.frameRate ? ` @ ${actualCameraInfo.frameRate}fps` : ''}
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Supported Focus:</span>
-              <span className="text-white truncate max-w-[160px]">
+              <span className="text-zinc-400">4. Supported Focus:</span>
+              <span className="text-white truncate max-w-[180px]">
                 {actualCameraInfo?.supportedFocusModes?.join(', ') || 'continuous'}
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Active Focus Mode:</span>
+              <span className="text-zinc-400">5. Active Focus Mode:</span>
               <span className="text-emerald-400 font-bold">
                 {actualCameraInfo?.focusMode || 'continuous'}
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Decode Engine:</span>
-              <span className="text-cyan-300 truncate max-w-[165px]">
+              <span className="text-zinc-400">6. Exposure / WB:</span>
+              <span className="text-white">
+                {actualCameraInfo?.exposureMode || 'continuous'} /{' '}
+                {actualCameraInfo?.whiteBalanceMode || 'continuous'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">7. Active Decoder:</span>
+              <span className="text-cyan-300 truncate max-w-[180px]">
                 {actualCameraInfo?.decodeMethod || activeDecodeMethodRef.current}
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Avg Decode Time:</span>
+              <span className="text-zinc-400">8. Scan Frequency:</span>
+              <span className="text-white">
+                {actualCameraInfo?.scanFrequencyHz ?? 22.2} Hz (
+                {actualCameraInfo?.scanIntervalMs ?? 45} ms)
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">9. Avg Decode Time:</span>
               <span className="text-white">
                 {actualCameraInfo?.avgDecodeTimeMs ?? 0} ms (last:{' '}
                 {actualCameraInfo?.lastDecodeTimeMs ?? 0} ms)
               </span>
             </div>
             <div className="flex justify-between gap-2">
-              <span className="text-zinc-400">Attempts to Match:</span>
+              <span className="text-zinc-400">10. Last Match Time:</span>
+              <span className="text-emerald-300">
+                {actualCameraInfo?.lastRecognitionTimeMs != null
+                  ? `${actualCameraInfo.lastRecognitionTimeMs} ms (${
+                      actualCameraInfo.lastRecognitionTimestamp || 'just now'
+                    })`
+                  : 'Awaiting scan'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">11. Attempts to Match:</span>
               <span className="text-amber-300 font-bold">
                 {actualCameraInfo?.attemptsBeforeLastSuccess || 0} (live:{' '}
                 {actualCameraInfo?.currentAttemptCount || 0})
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">12. Multi-Decoders:</span>
+              <span
+                className={
+                  actualCameraInfo?.multipleDecodersActive
+                    ? 'text-red-400 font-bold'
+                    : 'text-emerald-400 font-bold'
+                }
+              >
+                {actualCameraInfo?.multipleDecodersActive
+                  ? `YES (${actualCameraInfo?.concurrentDecodersCount})`
+                  : 'NO (Single-Flight = 1)'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-zinc-400">13. Stream Status:</span>
+              <span className="text-emerald-400 font-bold uppercase">
+                {isScanning
+                  ? actualCameraInfo?.streamStatus || 'ACTIVE'
+                  : isStarting
+                  ? 'INITIALIZING'
+                  : 'IDLE'}
               </span>
             </div>
           </div>

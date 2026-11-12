@@ -168,37 +168,39 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
     }
   };
 
-  // Connection status resolution (ONLINE • SYNCED | CONNECTING | OFFLINE | SYNC ERROR)
+  // Connection status resolution:
+  // Distinctly separates API connectivity from WebSocket connectivity.
+  // Never falsely marks HTTP fallback as realtime connectivity.
   const syncStatusInfo = useMemo(() => {
     if (!isOnline || !backendHealth.connected) {
       return {
-        label: 'OFFLINE',
-        badgeClass: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/40',
-        dotClass: 'bg-[#F59E0B]',
-        icon: WifiOff,
-      };
-    }
-    if (rtState.status === 'connecting' || rtState.status === 'reconnecting') {
-      return {
-        label: 'CONNECTING',
-        badgeClass: 'bg-[#078BFF]/15 text-[#078BFF] border-[#078BFF]/40',
-        dotClass: 'bg-[#078BFF] animate-ping',
-        icon: RefreshCw,
-      };
-    }
-    if (rtState.status === 'disconnected' && backendHealth.error) {
-      return {
-        label: 'SYNC ERROR',
+        label: 'API OFFLINE',
         badgeClass: 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/40',
         dotClass: 'bg-[#EF4444]',
         icon: WifiOff,
       };
     }
+    if (rtState.status === 'connected') {
+      return {
+        label: 'REALTIME ONLINE',
+        badgeClass: 'bg-[#00D979]/15 text-[#00D979] border-[#00D979]/40',
+        dotClass: 'bg-[#00D979] shadow-[0_0_8px_#00D979]',
+        icon: Wifi,
+      };
+    }
+    if (rtState.status === 'connecting' || rtState.status === 'reconnecting') {
+      return {
+        label: 'API ONLINE • RT CONNECTING',
+        badgeClass: 'bg-[#078BFF]/15 text-[#078BFF] border-[#078BFF]/40',
+        dotClass: 'bg-[#078BFF] animate-ping',
+        icon: RefreshCw,
+      };
+    }
     return {
-      label: 'ONLINE • SYNCED',
-      badgeClass: 'bg-[#00D979]/15 text-[#00D979] border-[#00D979]/40',
-      dotClass: 'bg-[#00D979] shadow-[0_0_8px_#00D979]',
-      icon: Wifi,
+      label: 'API ONLINE • RT OFFLINE',
+      badgeClass: 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/40',
+      dotClass: 'bg-[#F59E0B]',
+      icon: WifiOff,
     };
   }, [isOnline, backendHealth, rtState.status]);
 

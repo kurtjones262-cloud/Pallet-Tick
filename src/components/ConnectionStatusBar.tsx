@@ -210,10 +210,37 @@ export const ConnectionStatusBar: React.FC = () => {
   const activelyScanningWorkers = otherDeliveryWorkers.filter(
     (w: WorkerPresence) => w.status === 'scanning'
   );
-  const totalOnlineCount = Math.max(1, presence?.connectedWorkersCount || 1);
+  const totalOnlineCount =
+    typeof presence?.connectedWorkersCount === 'number'
+      ? presence.connectedWorkersCount
+      : rtState.status === 'connected'
+      ? 1
+      : 0;
+
+  // PRIORITY 3: Distinctly separate API connectivity from WebSocket connectivity
+  const isApiOnline = Boolean(health.connected);
+  const isRealtimeConnected = rtState.status === 'connected';
   const isRealtimeConnecting =
     rtState.status === 'reconnecting' || rtState.status === 'connecting';
-  const hasSyncWarning = rtState.status === 'disconnected' && Boolean(rtState.lastError);
+  const hasSyncWarning =
+    (rtState.status === 'disconnected' && Boolean(rtState.lastError)) ||
+    (!isApiOnline && Boolean(health.error));
+
+  const statusLabel = !isApiOnline
+    ? 'API OFFLINE'
+    : isRealtimeConnected
+    ? 'REALTIME ONLINE'
+    : isRealtimeConnecting
+    ? 'API ONLINE • REALTIME CONNECTING'
+    : 'API ONLINE • REALTIME OFFLINE';
+
+  const dotClass = !isApiOnline
+    ? 'bg-[#EF4444]'
+    : isRealtimeConnected
+    ? 'bg-[#00D979] shadow-[0_0_8px_#00D979]'
+    : isRealtimeConnecting
+    ? 'bg-[#F59E0B] animate-ping'
+    : 'bg-[#F59E0B]';
 
   return (
     <div className="bg-[var(--pt-bg-secondary,#101321)] text-white border-b border-[var(--pt-border,#29243D)] px-3 sm:px-6 py-1.5 text-[11px] flex items-center justify-between gap-2 z-20 shrink-0">
@@ -221,23 +248,11 @@ export const ConnectionStatusBar: React.FC = () => {
         <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
           {/* Live Sync Status Indicator */}
           <div className="flex items-center gap-1.5 font-mono">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                hasSyncWarning
-                  ? 'bg-[#EF4444]'
-                  : isRealtimeConnecting
-                  ? 'bg-[#F59E0B] animate-ping'
-                  : 'bg-[#00D979] shadow-[0_0_8px_#00D979]'
-              }`}
-            />
+            <span className={`w-2 h-2 rounded-full ${dotClass}`} />
             <span className="text-[10px] uppercase tracking-wider font-bold text-white">
-              {hasSyncWarning
-                ? 'SYNC ERROR'
-                : isRealtimeConnecting
-                ? 'CONNECTING'
-                : 'ONLINE • SYNCED'}
+              {statusLabel}
             </span>
-            {hasSyncWarning && (
+            {(!isRealtimeConnected || hasSyncWarning) && (
               <button
                 type="button"
                 onClick={handleRetry}

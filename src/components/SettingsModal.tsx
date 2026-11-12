@@ -558,7 +558,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     : 'bg-[#F59E0B]/15 border border-[#F59E0B]/40 text-[#F59E0B]'
                 }`}
               >
-                {rtState.status === 'connected' ? 'ONLINE • SYNCED' : rtState.status.toUpperCase()}
+                {rtState.status === 'connected' ? 'REALTIME ONLINE' : `REALTIME ${rtState.status.toUpperCase()}`}
               </span>
             </div>
 
@@ -569,7 +569,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <div className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
                   Offline Queue: {rtState.pendingOfflineScansCount} pending scans · Connected Workers:{' '}
-                  {Math.max(1, rtState.presence?.connectedWorkersCount || 1)}
+                  {typeof rtState.presence?.connectedWorkersCount === 'number'
+                    ? rtState.presence.connectedWorkersCount
+                    : rtState.status === 'connected'
+                    ? 1
+                    : 0}
                 </div>
               </div>
               <button

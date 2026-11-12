@@ -83,10 +83,36 @@ export class PalletTrackRealtimeClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private fallbackPollTimer: ReturnType<typeof setInterval> | null = null;
+  private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private manuallyStopped = false;
   private isFlushingOfflineQueue = false;
   private lastSyncedAt: string | undefined = getLastSyncedAt();
   private lastError: string | undefined = undefined;
+
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+  }
+
+  private cleanupSocket(socket: WebSocket | null) {
+    if (!socket) return;
+    try {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close(1000, 'Client socket cleanup');
+      }
+    } catch {
+      // Ignore
+    }
+  }
 
   private presenceSummary: DeliveryPresenceSummary = {
     deliveryId: null,
@@ -207,6 +233,7 @@ export class PalletTrackRealtimeClient {
 
   public stop() {
     this.manuallyStopped = true;
+    this.clearConnectTimeout();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -217,14 +244,7 @@ export class PalletTrackRealtimeClient {
       this.fallbackPollTimer = null;
     }
     if (this.ws) {
-      try {
-        this.ws.onclose = null;
-        this.ws.onerror = null;
-        this.ws.onmessage = null;
-        this.ws.close(1000, 'Client stopped');
-      } catch {
-        // Ignore
-      }
+      this.cleanupSocket(this.ws);
       this.ws = null;
     }
     this.setConnectionState('disconnected');
@@ -516,6 +536,22 @@ export class PalletTrackRealtimeClient {
       return;
     }
 
+    // PRIORITY 1: Prevent multiple simultaneous WebSocket connections.
+    // If an existing socket is healthy or in the middle of a handshake, never replace it.
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    // Clean up any stale or closing socket reference before creating a new one
+    if (this.ws) {
+      this.cleanupSocket(this.ws);
+      this.ws = null;
+    }
+
     this.setConnectionState(
       this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting'
     );
@@ -525,8 +561,32 @@ export class PalletTrackRealtimeClient {
       const socket = new WebSocket(wsUrl);
       this.ws = socket;
 
+      // PRIORITY 1: Connection handshake timeout (8s)
+      this.clearConnectTimeout();
+      this.connectTimeoutTimer = setTimeout(() => {
+        if (this.ws === socket && socket.readyState === WebSocket.CONNECTING) {
+          this.lastError = 'WebSocket connection timed out (no server response within 8s)';
+          this.cleanupSocket(socket);
+          this.ws = null;
+          if (!this.manuallyStopped) {
+            this.setConnectionState(
+              typeof navigator !== 'undefined' && navigator.onLine === false
+                ? 'offline'
+                : 'reconnecting'
+            );
+            this.scheduleReconnect();
+          }
+        }
+      }, 8000);
+
       socket.onopen = () => {
-        if (this.ws !== socket) return;
+        this.clearConnectTimeout();
+        // Prevent orphaned socket event handlers from changing the active connection state
+        if (this.ws !== socket) {
+          this.cleanupSocket(socket);
+          return;
+        }
+
         const wasReconnect = this.reconnectAttempts > 0 || this.lastSequenceNumber > 0;
         this.reconnectAttempts = 0;
         this.lastError = undefined;
@@ -556,17 +616,32 @@ export class PalletTrackRealtimeClient {
       };
 
       socket.onclose = (evt) => {
-        if (this.ws !== socket) return;
+        this.clearConnectTimeout();
+        if (this.ws !== socket) {
+          // Stale socket close event - ignore
+          return;
+        }
         this.ws = null;
         this.stopPingLoop();
 
-        if (evt.code === 4001 || evt.code === 4003) {
-          this.lastError = evt.reason || 'Session expired or revoked';
+        const closeCode = evt.code;
+        const closeReason = evt.reason || '';
+
+        if (closeCode === 4001 || closeCode === 4003) {
+          this.lastError = closeReason || 'Session expired or revoked';
           this.setConnectionState('disconnected');
           this.authRevokedListeners.forEach((cb) =>
             cb(evt.reason || 'Session expired or revoked')
           );
           return;
+        }
+
+        if (closeCode === 1006) {
+          this.lastError = 'WebSocket closed abnormally (code 1006: edge network drop or handshake rejection)';
+        } else if (closeCode > 1000 && closeCode !== 1001) {
+          this.lastError = `WebSocket closed (code ${closeCode}${closeReason ? `: ${closeReason}` : ''})`;
+        } else {
+          this.lastError = undefined;
         }
 
         if (!this.manuallyStopped) {
@@ -580,9 +655,10 @@ export class PalletTrackRealtimeClient {
       };
 
       socket.onerror = () => {
-        // onclose will handle reconnection
+        // onclose will handle reconnection and error recording
       };
     } catch (err: any) {
+      this.clearConnectTimeout();
       this.lastError = err?.message || 'WebSocket connection error';
       this.scheduleReconnect();
     }
@@ -603,6 +679,7 @@ export class PalletTrackRealtimeClient {
     switch (data.type) {
       case 'connected': {
         this.lastError = undefined;
+        this.setConnectionState('connected');
         markBackendSynced(data.timestamp || nowIso);
         if (typeof data.latestSeq === 'number' && this.lastSequenceNumber === 0) {
           this.lastSequenceNumber = data.latestSeq;
@@ -773,6 +850,11 @@ export class PalletTrackRealtimeClient {
       this.reconnectTimer = null;
     }
     this.reconnectAttempts = 0;
+    this.clearConnectTimeout();
+    if (this.ws) {
+      this.cleanupSocket(this.ws);
+      this.ws = null;
+    }
     this.connectWebSocket();
   }
 

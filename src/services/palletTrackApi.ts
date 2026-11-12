@@ -26,6 +26,10 @@ export function getAuthToken(): string | null {
   return inMemoryToken;
 }
 
+export function getStoredSessionToken(): string | null {
+  return inMemoryToken;
+}
+
 export function setAuthToken(token: string | null) {
   inMemoryToken = token;
   try {
@@ -451,45 +455,70 @@ export async function apiReceivePart(
   partId: string,
   payload: {
     receivedQuantity: number;
+    mode?: 'set' | 'increment';
+    idempotencyKey?: string;
     scannedVia?: 'qr' | 'barcode' | 'ocr_label' | 'manual';
     scannedCode?: string;
     status?: 'received' | 'outstanding';
     notes?: string;
     rawOcrText?: string;
+    eventAction?: string;
   }
 ): Promise<{
   duplicate: boolean;
+  idempotentReplay?: boolean;
   status: string;
   message?: string;
+  detailMessage?: string;
+  alreadyScannedBy?: string;
+  alreadyScannedAt?: string;
+  deliveryVersion?: number;
+  sequenceNumber?: number;
   part?: DeliveryPart;
   scanEvent?: ScanEvent;
 }> {
-  const health = await checkBackendConnection();
-  if (!health.connected) {
-    throw new Error(
-      'ONLINE CONNECTION REQUIRED: Cannot record receiving scan while disconnected from the central database. Scan rejected.'
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    const offlineErr: any = new Error(
+      'ONLINE CONNECTION REQUIRED: Device is currently offline. Scan queued for server verification upon reconnect.'
     );
+    offlineErr.isOffline = true;
+    throw offlineErr;
   }
 
   const url = resolveApiUrl(
     `/api/deliveries/${encodeURIComponent(deliveryId)}/parts/${encodeURIComponent(partId)}/receive`
   );
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: getAuthHeaders({
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    }),
-    body: JSON.stringify(payload),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: getAuthHeaders({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      }),
+      body: JSON.stringify(payload),
+    });
+  } catch (netErr: any) {
+    const offlineErr: any = new Error(
+      netErr?.message ||
+        'Network unreachable while committing scan to central database.'
+    );
+    offlineErr.isOffline = true;
+    throw offlineErr;
+  }
 
   if (res.status === 409) {
     const data = await res.json().catch(() => ({}));
     return {
       duplicate: true,
       status: 'duplicate',
-      message: data.message || 'This part has already been scanned into this delivery.',
+      message:
+        data.message ||
+        'Duplicate scan – this part has already been received by another worker',
+      detailMessage: data.detailMessage,
+      alreadyScannedBy: data.alreadyScannedBy || 'Another worker',
+      alreadyScannedAt: data.alreadyScannedAt,
       part: data.part,
     };
   }
@@ -694,4 +723,78 @@ export async function apiDeleteDeliveryPart(
   }
   return body;
 }
+
+// ==========================================
+// REAL-TIME SYNCHRONISATION & PRESENCE API
+// ==========================================
+
+export async function apiNotifyDocketProcessing(payload: {
+  fileName?: string;
+  fileCount?: number;
+  supplier?: string;
+  status?: 'processing' | 'failed';
+}): Promise<{ success?: boolean; sequenceNumber?: number } | null> {
+  try {
+    const url = resolveApiUrl('/api/deliveries/processing');
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: getAuthHeaders({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      }),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    return await res.json().catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+export async function apiFetchRealtimeEvents(
+  sinceSeq: number,
+  deliveryId?: string | null
+): Promise<{
+  events: any[];
+  latestSeq: number;
+  presence: any;
+  timestamp: string;
+}> {
+  const params = new URLSearchParams({
+    sinceSeq: String(Math.max(0, Number(sinceSeq) || 0)),
+  });
+  if (deliveryId) {
+    params.set('deliveryId', deliveryId);
+  }
+  const url = resolveApiUrl(`/api/realtime/events?${params.toString()}`);
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to fetch real-time events (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+export async function apiFetchRealtimePresence(deliveryId?: string | null) {
+  const params = new URLSearchParams();
+  if (deliveryId) {
+    params.set('deliveryId', deliveryId);
+  }
+  const url = resolveApiUrl(
+    `/api/realtime/presence${params.toString() ? `?${params.toString()}` : ''}`
+  );
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.error || `Failed to fetch worker presence (HTTP ${res.status})`);
+  }
+  return body;
+}
+
 

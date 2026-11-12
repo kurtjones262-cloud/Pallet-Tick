@@ -98,6 +98,8 @@ export interface UpdateDeliveryInput {
 
 export interface ReceivePartInput {
   receivedQuantity: number;
+  mode?: 'set' | 'increment';
+  idempotencyKey?: string;
   scannedVia?: 'qr' | 'barcode' | 'ocr_label' | 'manual';
   scannedCode?: string;
   status?: 'received' | 'outstanding';
@@ -169,6 +171,8 @@ export class PalletTrackDbService {
       scannedAt: row.scanned_at || undefined,
       scannedVia: (row.scanned_via as any) || undefined,
       scannedCode: row.scanned_code || undefined,
+      lastScannedById: row.last_scanned_by_id || undefined,
+      lastScannedByName: row.last_scanned_by_name || undefined,
       notes: row.notes || undefined,
       flaggedForReview: Boolean(row.flagged_for_review),
       ocrConfidence: (row.ocr_confidence as any) || undefined,
@@ -176,6 +180,7 @@ export class PalletTrackDbService {
       lastEditedBy: row.last_edited_by || undefined,
       lastEditedAt: row.last_edited_at || undefined,
       originalOcrValues: parsedOriginalOcr,
+      version: Number(row.version || 1),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -225,6 +230,7 @@ export class PalletTrackDbService {
       palletCount: row.pallet_count,
       supplierProfile: (row.supplier_profile as any) || 'laser_central',
       notes: row.notes || undefined,
+      version: Number(row.version || 1),
       createdBy: row.created_by || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -506,7 +512,8 @@ export class PalletTrackDbService {
       .prepare(
         `UPDATE deliveries
          SET docket_number = ?, supplier = ?, purchase_order_number = ?, delivery_date = ?,
-             delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?, updated_at = ?
+             delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?,
+             version = COALESCE(version, 1) + 1, updated_at = ?
          WHERE id = ?`
       )
       .bind(
@@ -754,7 +761,7 @@ export class PalletTrackDbService {
         )
         .bind(scanId, deliveryId, partId, actorId, now, partNumber, reqQty, auditMessage, actorName, actorRole),
       this.db
-        .prepare("UPDATE deliveries SET delivery_status = 'receiving', updated_at = ? WHERE id = ?")
+        .prepare("UPDATE deliveries SET delivery_status = 'receiving', version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?")
         .bind(now, deliveryId),
     ];
 
@@ -1017,7 +1024,8 @@ export class PalletTrackDbService {
                END,
                material = ?, thickness = ?, dimensions = ?, weight = ?, pallet_number = ?,
                notes = ?, manually_edited = 1, original_ocr_values = ?,
-               last_edited_by = ?, last_edited_at = ?, updated_at = ?
+               last_edited_by = ?, last_edited_at = ?, updated_at = ?,
+               version = COALESCE(version, 1) + 1
            WHERE delivery_id = ? AND id = ?`
         )
         .bind(
@@ -1070,7 +1078,8 @@ export class PalletTrackDbService {
              ) THEN 'receiving'
              ELSE delivery_status
            END,
-           updated_at = ?
+           updated_at = ?,
+           version = COALESCE(version, 1) + 1
            WHERE id = ?`
         )
         .bind(deliveryId, now, deliveryId),
@@ -1156,7 +1165,7 @@ export class PalletTrackDbService {
         )
         .bind(scanId, deliveryId, actorId, now, existing.part_number, recQty, auditMessage, actorName, actorRole),
       this.db
-        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .prepare('UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?')
         .bind(now, deliveryId),
     ];
 
@@ -1501,6 +1510,7 @@ export class PalletTrackDbService {
                ) THEN 'receiving'
                ELSE delivery_status
              END,
+             version = COALESCE(version, 1) + 1,
              updated_at = ?
              WHERE id = ?`
           )
@@ -1516,14 +1526,83 @@ export class PalletTrackDbService {
     };
   }
 
+  private static partReceiveLocks = new Map<string, Promise<any>>();
+
   /**
-   * Update received quantity for a specific part with atomic scan logging and strict duplicate protection
+   * Update received quantity for a specific part with atomic scan logging,
+   * idempotency key deduplication, per-part concurrency serialization, and
+   * strict SQL-level race-condition protection.
    */
   async updatePartReceivedQuantity(
     deliveryId: string,
     partId: string,
     input: ReceivePartInput
   ) {
+    const lockKey = `${deliveryId}:${partId}`;
+    const prevLock = PalletTrackDbService.partReceiveLocks.get(lockKey) || Promise.resolve();
+
+    let releaseLock!: () => void;
+    const currentLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    PalletTrackDbService.partReceiveLocks.set(
+      lockKey,
+      prevLock.then(() => currentLock).catch(() => currentLock)
+    );
+
+    await prevLock.catch(() => {});
+
+    try {
+      return await this.executeUpdatePartReceivedQuantityAtomic(deliveryId, partId, input);
+    } finally {
+      releaseLock();
+      if (PalletTrackDbService.partReceiveLocks.get(lockKey) === currentLock) {
+        PalletTrackDbService.partReceiveLocks.delete(lockKey);
+      }
+    }
+  }
+
+  private async executeUpdatePartReceivedQuantityAtomic(
+    deliveryId: string,
+    partId: string,
+    input: ReceivePartInput
+  ) {
+    await this.ensureSchemaReady();
+
+    const cleanIdempotencyKey =
+      typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()
+        ? input.idempotencyKey.trim().slice(0, 128)
+        : null;
+
+    // 1. Idempotency check: If this exact scan request was already processed (e.g. network retry or offline queue replay),
+    // return the previously committed state without double-counting or raising a false duplicate conflict.
+    if (cleanIdempotencyKey) {
+      const existingScan = await this.db
+        .prepare('SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1')
+        .bind(cleanIdempotencyKey)
+        .first<ScanEventRow>();
+
+      if (existingScan) {
+        const currentPart = await this.db
+          .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+          .bind(deliveryId, partId)
+          .first<DeliveryPartRow>();
+        const currentDelivery = await this.db
+          .prepare('SELECT version FROM deliveries WHERE id = ?')
+          .bind(deliveryId)
+          .first<{ version: number }>();
+
+        return {
+          duplicate: false,
+          idempotentReplay: true,
+          status: 'updated',
+          deliveryVersion: Number(currentDelivery?.version || 1),
+          part: currentPart ? this.mapPartRow(currentPart) : null,
+          scanEvent: this.mapScanRow(existingScan),
+        };
+      }
+    }
+
     const part = await this.db
       .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
       .bind(deliveryId, partId)
@@ -1541,21 +1620,72 @@ export class PalletTrackDbService {
 
     const now = new Date().toISOString();
     const reqQty = Math.max(0, part.required_quantity);
-    const recQty = Math.round(enteredQty);
+    const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
+    const currentVersion = Number(part.version || 1);
+    const isIncrementMode = input.mode === 'increment';
+    const isScanAttempt = input.scannedVia !== 'manual';
 
-    // Check if status is explicitly being set or unticked
+    const recQty = isIncrementMode
+      ? currentRecQty + Math.round(enteredQty)
+      : Math.round(enteredQty);
+
     const targetStatus =
       input.status || (recQty > 0 ? 'received' : 'outstanding');
 
-    // DUPLICATE PROTECTION:
-    // If the part is ALREADY received and client sends another scan claiming received quantity,
-    // prevent duplicate scan from inflating or re-recording unless this is an explicit update or undo.
-    const isScanAttempt = input.scannedVia !== 'manual';
-    if (isScanAttempt && part.status === 'received' && targetStatus === 'received' && part.received_quantity > 0) {
+    // DUPLICATE & CONCURRENT RACE PROTECTION:
+    // A scan attempt is rejected as a duplicate if:
+    // 1. The part is already marked 'received' AND its required quantity is already fulfilled (currentRecQty >= reqQty), OR
+    // 2. It is a standard non-increment scan attempt on a part that has already been scanned (currentRecQty > 0) and is not increasing partial quantity toward reqQty.
+    const isAlreadyFulfilled =
+      part.status === 'received' && currentRecQty >= reqQty && reqQty > 0;
+    const isRedundantSameScan =
+      isScanAttempt &&
+      part.status === 'received' &&
+      targetStatus === 'received' &&
+      currentRecQty > 0 &&
+      (!isIncrementMode && recQty <= currentRecQty);
+
+    if (isScanAttempt && targetStatus === 'received' && (isAlreadyFulfilled || isRedundantSameScan)) {
+      const alreadyScannedBy = part.last_scanned_by_name || 'Another worker';
+      const alreadyScannedAt = part.scanned_at || part.updated_at;
+      const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const dupMsg = `Duplicate scan – part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
+
+      try {
+        await this.db
+          .prepare(
+            `INSERT INTO scan_events (
+              id, delivery_id, part_id, user_id, timestamp, code,
+              scan_type, scan_status, quantity_added, received_quantity_after,
+              scan_result, employee_name, employee_role, event_action
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
+          )
+          .bind(
+            dupScanId,
+            deliveryId,
+            partId,
+            input.userId || null,
+            now,
+            input.scannedCode || part.part_number,
+            input.scannedVia || 'qr',
+            currentRecQty,
+            dupMsg,
+            input.employeeName || null,
+            input.employeeRole || null
+          )
+          .run();
+      } catch {
+        // Ignore audit insert error on duplicate
+      }
+
       return {
         duplicate: true,
         status: 'duplicate',
-        message: 'This part has already been scanned into this delivery.',
+        message: 'Duplicate scan – this part has already been received by another worker',
+        error: 'Duplicate scan – this part has already been received by another worker',
+        detailMessage: dupMsg,
+        alreadyScannedBy,
+        alreadyScannedAt,
         part: this.mapPartRow(part),
       };
     }
@@ -1574,9 +1704,15 @@ export class PalletTrackDbService {
         ? input.scannedCode || part.scanned_code || (scannedVia === 'qr' ? part.part_number : part.item_number)
         : null;
     const scannedAt = targetStatus === 'received' ? now : null;
+    const lastScannedById =
+      targetStatus === 'received' ? input.userId || part.last_scanned_by_id || null : null;
+    const lastScannedByName =
+      targetStatus === 'received'
+        ? input.employeeName || part.last_scanned_by_name || 'Worker'
+        : null;
 
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const addedQty = Math.max(0, recQty - part.received_quantity);
+    const addedQty = Math.max(0, recQty - currentRecQty);
     const scanStatus =
       targetStatus === 'received'
         ? isQtyMatch
@@ -1591,35 +1727,67 @@ export class PalletTrackDbService {
           : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required`
         : `Unticked ${part.part_number} (${part.item_number})`;
 
-    // Atomic transaction: Update part record AND record audit scan event
-    const stmts = [
-      this.db
-        .prepare(
-          `UPDATE delivery_parts
-           SET received_quantity = ?, verification_status = ?, status = ?,
-               scanned_via = ?, scanned_code = ?, scanned_at = ?, notes = COALESCE(?, notes),
-               updated_at = ?
-           WHERE delivery_id = ? AND id = ?`
-        )
-        .bind(
-          recQty,
-          verificationStatus,
-          targetStatus,
-          scannedVia,
-          scannedCode,
-          scannedAt,
-          input.notes || null,
-          now,
-          deliveryId,
-          partId
-        ),
+    // Conditional optimistic-concurrency SQL UPDATE guard:
+    // Ensures that if another worker modified this part row concurrently (version changed),
+    // this UPDATE affects 0 rows and we immediately re-check and reject duplicate scans.
+    const updateRes = await this.db
+      .prepare(
+        `UPDATE delivery_parts
+         SET received_quantity = ?, verification_status = ?, status = ?,
+             scanned_via = ?, scanned_code = ?, scanned_at = ?,
+             last_scanned_by_id = ?, last_scanned_by_name = ?,
+             notes = COALESCE(?, notes),
+             version = COALESCE(version, 1) + 1,
+             updated_at = ?
+         WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
+      )
+      .bind(
+        recQty,
+        verificationStatus,
+        targetStatus,
+        scannedVia,
+        scannedCode,
+        scannedAt,
+        lastScannedById,
+        lastScannedByName,
+        input.notes || null,
+        now,
+        deliveryId,
+        partId,
+        currentVersion
+      )
+      .run();
+
+    const rowsChanged = Number(updateRes.meta?.changes ?? 1);
+    if (rowsChanged === 0) {
+      // Another worker's concurrent update won the race! Re-read and return duplicate conflict if received
+      const latestPart = await this.db
+        .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+        .bind(deliveryId, partId)
+        .first<DeliveryPartRow>();
+
+      if (latestPart && latestPart.status === 'received') {
+        return {
+          duplicate: true,
+          status: 'duplicate',
+          message: 'Duplicate scan – this part has already been received by another worker',
+          error: 'Duplicate scan – this part has already been received by another worker',
+          alreadyScannedBy: latestPart.last_scanned_by_name || 'Another worker',
+          alreadyScannedAt: latestPart.scanned_at || latestPart.updated_at,
+          part: this.mapPartRow(latestPart),
+        };
+      }
+    }
+
+    // Record audit scan event and increment delivery version atomically
+    await this.db.batch([
       this.db
         .prepare(
           `INSERT INTO scan_events (
             id, delivery_id, part_id, user_id, timestamp, code,
             scan_type, scan_status, quantity_added, received_quantity_after,
-            scan_result, raw_ocr_text, employee_name, employee_role, event_action
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
           scanId,
@@ -1636,23 +1804,50 @@ export class PalletTrackDbService {
           input.rawOcrText || null,
           input.employeeName || null,
           input.employeeRole || null,
-          input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick')
+          input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick'),
+          cleanIdempotencyKey
         ),
       this.db
-        .prepare('UPDATE deliveries SET updated_at = ? WHERE id = ?')
+        .prepare(
+          'UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?'
+        )
         .bind(now, deliveryId),
-    ];
-
-    await this.db.batch(stmts);
+    ]);
 
     const updatedPart = await this.db
       .prepare('SELECT * FROM delivery_parts WHERE id = ?')
       .bind(partId)
       .first<DeliveryPartRow>();
 
+    const updatedDeliveryRow = await this.db
+      .prepare('SELECT version, delivery_status FROM deliveries WHERE id = ?')
+      .bind(deliveryId)
+      .first<{ version: number; delivery_status: string }>();
+
+    const statsRow = await this.db
+      .prepare(
+        `SELECT
+           COUNT(*) as total_count,
+           SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
+         FROM delivery_parts
+         WHERE delivery_id = ?`
+      )
+      .bind(deliveryId)
+      .first<{ total_count: number; received_count: number }>();
+
+    const totalCount = Number(statsRow?.total_count || 0);
+    const receivedCount = Number(statsRow?.received_count || 0);
+    const outstandingCount = Math.max(0, totalCount - receivedCount);
+
     return {
       duplicate: false,
       status: 'updated',
+      deliveryVersion: Number(updatedDeliveryRow?.version || 1),
+      deliveryStats: {
+        totalCount,
+        receivedCount,
+        outstandingCount,
+      },
       part: updatedPart ? this.mapPartRow(updatedPart) : null,
       scanEvent: {
         id: scanId,
@@ -1669,6 +1864,7 @@ export class PalletTrackDbService {
         quantityAdded: addedQty,
         receivedQuantity: recQty,
         message: scanResultMsg,
+        idempotencyKey: cleanIdempotencyKey || undefined,
       },
     };
   }
@@ -1819,7 +2015,16 @@ export class PalletTrackDbService {
         .first();
       await this.db.prepare('SELECT id FROM sessions LIMIT 1').first();
       await this.db
-        .prepare('SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at FROM delivery_parts LIMIT 1')
+        .prepare('SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1')
+        .first();
+      await this.db
+        .prepare('SELECT id, version FROM deliveries LIMIT 1')
+        .first();
+      await this.db
+        .prepare('SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1')
+        .first();
+      await this.db
+        .prepare('SELECT seq, id FROM realtime_events LIMIT 1')
         .first();
       PalletTrackDbService.verifiedDbs.add(this.db);
       return;
@@ -1863,6 +2068,7 @@ export class PalletTrackDbService {
         pallet_count INTEGER NOT NULL DEFAULT 1,
         supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
         notes TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -1887,6 +2093,8 @@ export class PalletTrackDbService {
         scanned_at TEXT,
         scanned_via TEXT,
         scanned_code TEXT,
+        last_scanned_by_id TEXT,
+        last_scanned_by_name TEXT,
         notes TEXT,
         flagged_for_review INTEGER NOT NULL DEFAULT 0,
         ocr_confidence TEXT,
@@ -1894,6 +2102,7 @@ export class PalletTrackDbService {
         original_ocr_values TEXT,
         last_edited_by TEXT,
         last_edited_at TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
@@ -1913,6 +2122,8 @@ export class PalletTrackDbService {
         received_quantity_after INTEGER,
         scan_result TEXT,
         raw_ocr_text TEXT,
+        idempotency_key TEXT,
+        sequence_number INTEGER,
         created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
       )`,
       `CREATE TABLE IF NOT EXISTS m1_synchronisations (
@@ -1925,6 +2136,19 @@ export class PalletTrackDbService {
         error_info TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS realtime_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        delivery_id TEXT,
+        part_id TEXT,
+        user_id TEXT,
+        employee_name TEXT,
+        employee_role TEXT,
+        delivery_version INTEGER,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
       )`,
     ];
 
@@ -1946,11 +2170,17 @@ export class PalletTrackDbService {
       'ALTER TABLE scan_events ADD COLUMN employee_name TEXT',
       'ALTER TABLE scan_events ADD COLUMN employee_role TEXT',
       "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
+      'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT',
+      'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER',
+      'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1',
       'ALTER TABLE delivery_parts ADD COLUMN revision TEXT',
       'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT',
       'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT',
       'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT',
+      'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1',
+      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT',
+      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT',
     ];
 
     for (const sql of alterCols) {
@@ -1977,7 +2207,10 @@ export class PalletTrackDbService {
       'CREATE INDEX IF NOT EXISTS idx_scans_part ON scan_events(part_id)',
       'CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scan_events(timestamp DESC)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)',
+      'CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC)',
+      'CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)',
     ];
 
     for (const sql of indexStatements) {

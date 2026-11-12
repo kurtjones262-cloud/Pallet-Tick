@@ -1,5 +1,6 @@
 import { D1Database } from '../db/types.ts';
 import { PalletTrackDbService, AuthenticatedUser } from './palletTrackDbService.ts';
+import { realtimeBroker } from '../realtime/realtimeHub.ts';
 
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -41,7 +42,16 @@ function errorResponse(
   );
 }
 
-function extractToken(request: Request): string | null {
+export function extractSessionTokenFromRequest(request: Request): string | null {
+  try {
+    const url = new URL(request.url);
+    const queryToken = url.searchParams.get('token');
+    if (queryToken && queryToken.trim()) {
+      return queryToken.trim();
+    }
+  } catch {
+    // Ignore URL parse error
+  }
   const authHeader = request.headers.get('authorization') || request.headers.get('Authorization');
   if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
     return authHeader.slice(7).trim();
@@ -54,6 +64,10 @@ function extractToken(request: Request): string | null {
     }
   }
   return null;
+}
+
+function extractToken(request: Request): string | null {
+  return extractSessionTokenFromRequest(request);
 }
 
 function buildSetCookieHeader(token: string, maxAge = 28800): string {
@@ -241,6 +255,7 @@ export async function handlePalletTrackApiRequest(
     if (path === '/api/auth/logout' && method === 'POST') {
       const token = extractToken(request);
       if (token) {
+        realtimeBroker.disconnectSessionToken(token);
         await service.revokeSession(token);
       }
       return jsonResponse(
@@ -361,6 +376,7 @@ export async function handlePalletTrackApiRequest(
           }
           try {
             const res = await service.resetUserPin(targetUserId, pinValue, currentUser);
+            realtimeBroker.disconnectUser(targetUserId, 'PIN reset by administrator');
             return jsonResponse(res);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
@@ -377,6 +393,9 @@ export async function handlePalletTrackApiRequest(
           const body: any = await request.json().catch(() => ({}));
           try {
             const updated = await service.updateUser(targetUserId, body, currentUser);
+            if (body.active === false || !updated.active) {
+              realtimeBroker.disconnectUser(targetUserId, 'Account deactivated by administrator');
+            }
             return jsonResponse(updated);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
@@ -392,6 +411,7 @@ export async function handlePalletTrackApiRequest(
         if ((sub === '' || sub === '/') && method === 'DELETE') {
           try {
             const deleted = await service.deleteUser(targetUserId, currentUser);
+            realtimeBroker.disconnectUser(targetUserId, 'Account deleted by administrator');
             return jsonResponse(deleted);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
@@ -403,6 +423,72 @@ export async function handlePalletTrackApiRequest(
           }
         }
       }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3b. Real-Time Multi-User Synchronisation & Catch-Up Endpoints
+    // -------------------------------------------------------------------------
+    if (path === '/api/realtime/events' && method === 'GET') {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+
+      const sinceSeq = Math.max(0, Number(url.searchParams.get('sinceSeq')) || 0);
+      const deliveryId = url.searchParams.get('deliveryId') || undefined;
+      const events = await realtimeBroker.getEventsSince(db, sinceSeq, deliveryId);
+      const latestSeq = await realtimeBroker.getLatestSequenceNumber(db);
+      const presence = realtimeBroker.getPresenceSummary(deliveryId || null);
+
+      return jsonResponse({
+        events,
+        latestSeq,
+        presence,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (path === '/api/realtime/presence' && method === 'GET') {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+
+      const deliveryId = url.searchParams.get('deliveryId') || null;
+      const presence = realtimeBroker.getPresenceSummary(deliveryId);
+      const latestSeq = await realtimeBroker.getLatestSequenceNumber(db);
+
+      return jsonResponse({
+        presence,
+        latestSeq,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // POST /api/deliveries/processing (Notify connected workers that a docket is being processed)
+    if (path === '/api/deliveries/processing' && method === 'POST') {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+
+      if (isEmployeeRole(currentUser.role)) {
+        return errorResponse('Forbidden: Employees cannot upload new deliveries.', 403, 'FORBIDDEN');
+      }
+
+      const body: any = await request.json().catch(() => ({}));
+      const rtEvent = await realtimeBroker.publishEvent(db, {
+        type: 'delivery:processing',
+        userId: currentUser.id,
+        employeeName: currentUser.employeeName,
+        employeeRole: currentUser.role,
+        payload: {
+          status: body.status || 'processing',
+          fileName: body.fileName || 'Delivery Docket',
+          fileCount: Number(body.fileCount) || 1,
+          employeeName: currentUser.employeeName,
+        },
+      });
+
+      return jsonResponse({
+        success: true,
+        sequenceNumber: rtEvent.sequenceNumber,
+      });
     }
 
     // -------------------------------------------------------------------------
@@ -461,6 +547,21 @@ export async function handlePalletTrackApiRequest(
         }
         body.createdBy = currentUser.id;
         const created = await service.createDelivery(body);
+        if (created) {
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: 'delivery:created',
+            deliveryId: created.id,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            deliveryVersion: created.version || 1,
+            payload: {
+              delivery: created,
+              createdByName: currentUser.employeeName,
+            },
+          });
+          return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+        }
         return jsonResponse(created, 201);
       }
     }
@@ -499,7 +600,37 @@ export async function handlePalletTrackApiRequest(
           }
 
           const body: any = await request.json().catch(() => ({}));
+          const prevDelivery = await service.getDeliveryById(deliveryId);
           const updated = await service.updateDelivery(deliveryId, body);
+          if (updated) {
+            const prevStatus = prevDelivery?.status || (prevDelivery as any)?.deliveryStatus;
+            const nextStatus = updated.status || (updated as any).deliveryStatus;
+            const eventType =
+              prevDelivery &&
+              prevStatus !== 'completed' &&
+              nextStatus === 'completed'
+                ? 'delivery:completed'
+                : prevDelivery &&
+                  prevStatus === 'completed' &&
+                  nextStatus === 'receiving'
+                ? 'delivery:reopened'
+                : 'delivery:updated';
+
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: eventType,
+              deliveryId: updated.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: updated.version || 1,
+              payload: {
+                delivery: updated,
+                status: nextStatus,
+                updatedByName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber });
+          }
           return jsonResponse(updated);
         }
       }
@@ -524,7 +655,21 @@ export async function handlePalletTrackApiRequest(
               employeeName: currentUser.employeeName,
               role: currentUser.role,
             });
-            return jsonResponse(added, 201);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'part:added',
+              deliveryId,
+              partId: added.part?.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: added.delivery?.version || 1,
+              payload: {
+                part: added.part,
+                delivery: added.delivery,
+                actorName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...added, sequenceNumber: rtEvent.sequenceNumber }, 201);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
             return errorResponse(
@@ -547,7 +692,19 @@ export async function handlePalletTrackApiRequest(
               employeeName: currentUser.employeeName,
               role: currentUser.role,
             });
-            return jsonResponse(saved, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'parts:batch_saved',
+              deliveryId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: saved.delivery?.version || 1,
+              payload: {
+                delivery: saved.delivery,
+                actorName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...saved, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
             return errorResponse(
@@ -578,6 +735,8 @@ export async function handlePalletTrackApiRequest(
         // Pass authenticated employee information server-side
         const receivePayload = {
           ...body,
+          scannedVia: body.scannedVia || body.scanType || 'qr',
+          scannedCode: body.scannedCode || body.code,
           userId: currentUser.id,
           employeeName: currentUser.employeeName,
           employeeRole: currentUser.role,
@@ -586,8 +745,58 @@ export async function handlePalletTrackApiRequest(
 
         const result = await service.updatePartReceivedQuantity(deliveryId, partId, receivePayload);
         if (result.duplicate) {
+          await realtimeBroker.publishEvent(db, {
+            type: 'part:duplicate_rejected',
+            deliveryId,
+            partId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: {
+              part: result.part,
+              alreadyScannedBy: (result as any).alreadyScannedBy,
+              alreadyScannedAt: (result as any).alreadyScannedAt,
+              attemptedBy: currentUser.employeeName,
+              message: result.message,
+            },
+          });
           return jsonResponse(result, 409); // 409 Conflict with strict duplicate scan payload
         }
+
+        if (!(result as any).idempotentReplay) {
+          const isUndo =
+            result.part?.status === 'outstanding' || Number(result.part?.receivedQuantity) === 0;
+          const isPartialQtyUpdate =
+            !isUndo &&
+            result.part?.verificationStatus === 'quantity_mismatch' &&
+            Number(result.part?.receivedQuantity) < Number(result.part?.quantity);
+          const eventType = isUndo
+            ? 'part:scan_reversed'
+            : body.scannedVia === 'manual' || isPartialQtyUpdate
+            ? 'quantity:updated'
+            : 'part:scanned';
+
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: eventType,
+            deliveryId,
+            partId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            deliveryVersion: (result as any).deliveryVersion || 1,
+            payload: {
+              part: result.part,
+              scanEvent: result.scanEvent,
+              scannedByName: currentUser.employeeName,
+              receivedQuantity: result.part?.receivedQuantity,
+              requiredQuantity: result.part?.quantity,
+              deliveryStats: (result as any).deliveryStats,
+              deliveryVersion: (result as any).deliveryVersion || 1,
+            },
+          });
+          return jsonResponse({ ...result, sequenceNumber: rtEvent.sequenceNumber }, 200);
+        }
+
         return jsonResponse(result, 200);
       }
 
@@ -604,7 +813,21 @@ export async function handlePalletTrackApiRequest(
               employeeName: currentUser.employeeName,
               role: currentUser.role,
             });
-            return jsonResponse(updated, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'part:edited',
+              deliveryId,
+              partId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: updated.delivery?.version || 1,
+              payload: {
+                part: updated.part,
+                delivery: updated.delivery,
+                actorName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
             return errorResponse(
@@ -622,7 +845,21 @@ export async function handlePalletTrackApiRequest(
               employeeName: currentUser.employeeName,
               role: currentUser.role,
             });
-            return jsonResponse(deleted, 200);
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'part:deleted',
+              deliveryId,
+              partId,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: deleted.delivery?.version || 1,
+              payload: {
+                deletedPartId: deleted.deletedPartId,
+                delivery: deleted.delivery,
+                actorName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...deleted, sequenceNumber: rtEvent.sequenceNumber }, 200);
           } catch (err: any) {
             const isForbidden = String(err?.message || '').startsWith('Forbidden:');
             return errorResponse(

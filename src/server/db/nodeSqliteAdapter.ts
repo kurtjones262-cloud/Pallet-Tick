@@ -78,40 +78,57 @@ export class NodeSqliteD1Adapter implements D1Database {
     this.db.exec('PRAGMA foreign_keys = ON;');
     this.db.exec('PRAGMA journal_mode = WAL;');
 
-    if (schemaSql) {
-      this.db.exec(schemaSql);
-    }
-
-    // Safely apply Phase 2 migrations if existing database was created in Phase 1
     const safeAddCol = (table: string, colDef: string) => {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
       } catch {}
     };
 
-    safeAddCol('users', 'employee_code TEXT');
-    safeAddCol('users', 'pin_salt TEXT');
-    safeAddCol('users', 'last_login_at TEXT');
-    safeAddCol('users', 'failed_login_attempts INTEGER NOT NULL DEFAULT 0');
-    safeAddCol('users', 'locked_until TEXT');
-    safeAddCol('users', 'created_by TEXT');
+    const runColumnMigrations = () => {
+      safeAddCol('users', 'employee_code TEXT');
+      safeAddCol('users', 'pin_salt TEXT');
+      safeAddCol('users', 'last_login_at TEXT');
+      safeAddCol('users', 'failed_login_attempts INTEGER NOT NULL DEFAULT 0');
+      safeAddCol('users', 'locked_until TEXT');
+      safeAddCol('users', 'created_by TEXT');
 
-    safeAddCol('scan_events', 'employee_name TEXT');
-    safeAddCol('scan_events', 'employee_role TEXT');
-    safeAddCol('scan_events', "event_action TEXT DEFAULT 'part_scan'");
+      safeAddCol('scan_events', 'employee_name TEXT');
+      safeAddCol('scan_events', 'employee_role TEXT');
+      safeAddCol('scan_events', "event_action TEXT DEFAULT 'part_scan'");
+      safeAddCol('scan_events', 'idempotency_key TEXT');
+      safeAddCol('scan_events', 'sequence_number INTEGER');
 
-    safeAddCol('delivery_parts', 'revision TEXT');
-    safeAddCol('delivery_parts', 'manually_edited INTEGER NOT NULL DEFAULT 0');
-    safeAddCol('delivery_parts', 'original_ocr_values TEXT');
-    safeAddCol('delivery_parts', 'last_edited_by TEXT');
-    safeAddCol('delivery_parts', 'last_edited_at TEXT');
+      safeAddCol('deliveries', 'version INTEGER NOT NULL DEFAULT 1');
+
+      safeAddCol('delivery_parts', 'revision TEXT');
+      safeAddCol('delivery_parts', 'manually_edited INTEGER NOT NULL DEFAULT 0');
+      safeAddCol('delivery_parts', 'original_ocr_values TEXT');
+      safeAddCol('delivery_parts', 'last_edited_by TEXT');
+      safeAddCol('delivery_parts', 'last_edited_at TEXT');
+      safeAddCol('delivery_parts', 'version INTEGER NOT NULL DEFAULT 1');
+      safeAddCol('delivery_parts', 'last_scanned_by_id TEXT');
+      safeAddCol('delivery_parts', 'last_scanned_by_name TEXT');
+    };
+
+    // Apply column additions to any pre-existing tables BEFORE schemaSql runs index creations
+    runColumnMigrations();
+
+    if (schemaSql) {
+      this.db.exec(schemaSql);
+    }
+
+    runColumnMigrations();
 
     // Upgrade users table if an older local SQLite table had a restrictive role CHECK constraint
     try {
       const tblInfo = this.db
         .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
         .get() as { sql?: string } | undefined;
-      if (tblInfo?.sql && tblInfo.sql.includes('CHECK') && !tblInfo.sql.includes('super_admin')) {
+      if (
+        tblInfo?.sql &&
+        tblInfo.sql.includes('CHECK') &&
+        (!tblInfo.sql.includes('super_admin') || !tblInfo.sql.includes('supervisor'))
+      ) {
         this.db.exec('PRAGMA foreign_keys = OFF;');
         this.db.exec(`
           CREATE TABLE users_new (
@@ -160,6 +177,43 @@ export class NodeSqliteD1Adapter implements D1Database {
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
         CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id);
+      `);
+    } catch {}
+
+    const phase5AlterStatements = [
+      'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1;',
+      'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1;',
+      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT;',
+      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT;',
+      'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT;',
+      'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER;',
+    ];
+    for (const stmt of phase5AlterStatements) {
+      try {
+        this.db.exec(stmt);
+      } catch {
+        // Column already exists
+      }
+    }
+
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS realtime_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          delivery_id TEXT,
+          part_id TEXT,
+          user_id TEXT,
+          employee_name TEXT,
+          employee_role TEXT,
+          delivery_version INTEGER,
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC);
+        CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC);
       `);
     } catch {}
   }

@@ -27,6 +27,7 @@ import {
 } from '../utils/offlineOcr';
 import { isPdfFile, extractPagesFromPdfFile } from '../utils/pdfImport';
 import { DocketOcrReviewModal } from './DocketOcrReviewModal';
+import { apiNotifyDocketProcessing } from '../services/palletTrackApi';
 
 interface NewDeliveryModalProps {
   onClose: () => void;
@@ -291,6 +292,13 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
       percent: 5,
       statusText: 'Running Tesseract.js primary docket extraction...',
     });
+
+    apiNotifyDocketProcessing({
+      fileName: capturedPages[0]?.name || 'Delivery Docket',
+      fileCount: capturedPages.length,
+      supplier: SUPPLIER_RULES[selectedSupplierRule]?.name,
+      status: 'processing',
+    }).catch(() => {});
 
     try {
       const imagesToProcess = capturedPages.map((p) => p.dataUrl);

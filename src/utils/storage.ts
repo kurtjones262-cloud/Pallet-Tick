@@ -35,6 +35,7 @@ import {
   checkBackendConnection,
   isBackendOnline,
 } from '../services/palletTrackApi';
+import { realtimeClient, ClientRealtimeEvent } from '../services/realtimeSync';
 
 
 const DELIVERIES_KEY = 'parttrack_deliveries_v2';
@@ -434,6 +435,7 @@ export function getActiveDelivery(): Delivery | null {
 export function updateDelivery(updated: Delivery): void {
   const deliveries = getStoredDeliveries();
   const index = deliveries.findIndex((d) => d.id === updated.id);
+  const previous = index >= 0 ? deliveries[index] : null;
   const now = new Date().toISOString();
   const withUpdatedTimestamp = { ...updated, updatedAt: now };
 
@@ -446,19 +448,26 @@ export function updateDelivery(updated: Delivery): void {
   saveStoredDeliveries(deliveries);
   saveDeliveryToIndexedDb(withUpdatedTimestamp).catch(console.error);
 
-  // Sync to central database
+  // Sync to central database only when creating a new delivery or when delivery-level fields change
   if (typeof window !== 'undefined') {
-    if (index >= 0) {
-      apiUpdateDelivery(updated.id, {
-        status: updated.status,
-        carrier: updated.carrier,
-        notes: updated.notes,
-        docketNumber: updated.docketNumber,
-        supplier: updated.supplier,
-      }).catch((err) => {
-
-        console.warn('Central database update sync notice:', err?.message || err);
-      });
+    if (previous) {
+      const metadataChanged =
+        previous.status !== updated.status ||
+        previous.carrier !== updated.carrier ||
+        previous.notes !== updated.notes ||
+        previous.docketNumber !== updated.docketNumber ||
+        previous.supplier !== updated.supplier;
+      if (metadataChanged) {
+        apiUpdateDelivery(updated.id, {
+          status: updated.status,
+          carrier: updated.carrier,
+          notes: updated.notes,
+          docketNumber: updated.docketNumber,
+          supplier: updated.supplier,
+        }).catch((err) => {
+          console.warn('Central database update sync notice:', err?.message || err);
+        });
+      }
     } else {
       apiCreateDelivery(withUpdatedTimestamp).catch((err) => {
         console.warn('Central database create sync notice:', err?.message || err);
@@ -839,6 +848,22 @@ export function confirmOcrPalletLabelScan(
   };
 
   updateDelivery(updatedDelivery);
+
+  if (typeof window !== 'undefined') {
+    const idempotencyKey = `ocr_${delivery.id}_${targetPart.id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    apiReceivePart(delivery.id, targetPart.id, {
+      receivedQuantity: addedPalletQty,
+      mode: 'increment',
+      idempotencyKey,
+      scannedVia: 'ocr_label',
+      scannedCode: params.recognizedPartNumber.trim(),
+      status: 'received',
+      rawOcrText: params.rawOcrText,
+      eventAction: 'part_scan_ocr_pallet',
+    }).catch((err) => {
+      console.warn('Central database OCR pallet label sync notice:', err?.message || err);
+    });
+  }
 
   return {
     updatedDelivery,
@@ -1460,7 +1485,502 @@ export function undoLastScan(delivery: Delivery): Delivery {
   };
 
   updateDelivery(updatedDelivery);
+
+  if (typeof window !== 'undefined') {
+    const restoredQty = shouldRestorePreviousReceived
+      ? Number(lastScan.previousReceivedQuantity) || 0
+      : 0;
+    const restoredStatus = shouldRestorePreviousReceived ? 'received' : 'outstanding';
+    apiReceivePart(delivery.id, part.id, {
+      receivedQuantity: restoredQty,
+      mode: 'set',
+      status: restoredStatus,
+      scannedVia: 'manual',
+      scannedCode: lastScan.code,
+      eventAction: 'part_untick',
+    }).catch((err) => {
+      console.warn('Central database undo sync notice:', err?.message || err);
+    });
+  }
+
   return updatedDelivery;
+}
+
+/**
+ * Commits a scanned part quantity authoritatively to the central D1 database.
+ * - Uses a unique `idempotencyKey` so network retries never double-count.
+ * - Detects server-side 409 Conflict when another worker scanned the same part
+ *   milliseconds earlier, returning `outcome: 'duplicate'` with who scanned it and when.
+ * - If the device is temporarily offline, queues the scan in `realtimeClient` as
+ *   `pending_sync` for server revalidation upon reconnect without marking it verified.
+ */
+export async function commitScanPartAuthoritative(
+  delivery: Delivery,
+  pending: PendingQuantityConfirmation,
+  enteredQuantity: number,
+  options?: { mode?: 'set' | 'increment'; rawOcrText?: string; notes?: string }
+): Promise<{
+  outcome: 'verified' | 'quantity_mismatch' | 'duplicate' | 'pending_sync';
+  updatedDelivery: Delivery;
+  updatedPart: DeliveryPart;
+  isCorrectQuantity: boolean;
+  requiredQuantity: number;
+  receivedQuantity: number;
+  alreadyScannedBy?: string;
+  alreadyScannedAt?: string;
+  message: string;
+}> {
+  const requiredQuantity = Math.max(1, pending.part.quantity ?? 1);
+  const enteredQty = Math.max(0, Math.round(enteredQuantity));
+  const mode = options?.mode || 'set';
+  const idempotencyKey = `scan_${delivery.id}_${pending.part.id}_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2, 7)}`;
+
+  try {
+    const res = await apiReceivePart(delivery.id, pending.part.id, {
+      receivedQuantity: enteredQty,
+      mode,
+      idempotencyKey,
+      scannedVia: pending.detectedType,
+      scannedCode: pending.code,
+      status: 'received',
+      notes: options?.notes,
+      rawOcrText: options?.rawOcrText,
+      eventAction: 'part_scan',
+    });
+
+    if (res.duplicate) {
+      // Another worker already scanned this part! Reconcile local state with server part
+      const serverPart: DeliveryPart = res.part
+        ? {
+            ...pending.part,
+            ...res.part,
+            pendingSync: false,
+          }
+        : {
+            ...pending.part,
+            status: 'received',
+            pendingSync: false,
+          };
+
+      const reconciledParts = delivery.parts.map((p) =>
+        p.id === pending.part.id ? serverPart : p
+      );
+      const reconciledDelivery: Delivery = {
+        ...delivery,
+        parts: reconciledParts,
+        updatedAt: new Date().toISOString(),
+      };
+      saveStoredDeliveries(
+        getStoredDeliveries().map((d) =>
+          d.id === reconciledDelivery.id ? reconciledDelivery : d
+        )
+      );
+
+      const who = res.alreadyScannedBy || 'another worker';
+      return {
+        outcome: 'duplicate',
+        updatedDelivery: reconciledDelivery,
+        updatedPart: serverPart,
+        isCorrectQuantity: false,
+        requiredQuantity,
+        receivedQuantity: serverPart.receivedQuantity ?? requiredQuantity,
+        alreadyScannedBy: res.alreadyScannedBy,
+        alreadyScannedAt: res.alreadyScannedAt,
+        message:
+          res.message ||
+          `Duplicate scan – this part has already been received by ${who}`,
+      };
+    }
+
+    // Server accepted and committed the scan in D1!
+    if (res.deliveryVersion) {
+      realtimeClient.acceptDeliveryVersion(delivery.id, res.deliveryVersion);
+    }
+
+    const now = new Date().toISOString();
+    const committedRecQty =
+      typeof res.part?.receivedQuantity === 'number'
+        ? res.part.receivedQuantity
+        : enteredQty;
+    const isCorrectQuantity = committedRecQty === requiredQuantity;
+
+    const updatedPart: DeliveryPart = {
+      ...pending.part,
+      ...(res.part || {}),
+      status: 'received',
+      receivedQuantity: committedRecQty,
+      verificationStatus: isCorrectQuantity ? 'verified' : 'quantity_mismatch',
+      scannedAt: res.part?.scannedAt || now,
+      scannedVia: pending.detectedType,
+      scannedCode: pending.code,
+      pendingSync: false,
+    };
+
+    const newParts = delivery.parts.map((p) =>
+      p.id === pending.part.id ? updatedPart : p
+    );
+    const docketNoLabel = pending.part.itemNumber.replace(/^ITM-0*/i, '');
+
+    const scanEvent: ScanEvent = res.scanEvent
+      ? {
+          id: res.scanEvent.id || `ev_${Date.now()}`,
+          timestamp: res.scanEvent.timestamp || now,
+          code: res.scanEvent.code || pending.code,
+          codeType: (res.scanEvent.codeType as ScanMethod) || pending.detectedType,
+          status: isCorrectQuantity ? 'match_success' : 'quantity_mismatch',
+          partId: pending.part.id,
+          partNumber: pending.part.partNumber,
+          itemNumber: pending.part.itemNumber,
+          requiredQuantity,
+          receivedQuantity: committedRecQty,
+          addedQuantity: enteredQty,
+          employeeName: res.scanEvent.employeeName,
+          employeeRole: res.scanEvent.employeeRole,
+          message:
+            res.scanEvent.message ||
+            (isCorrectQuantity
+              ? `Verified ${pending.part.partNumber} [No. ${docketNoLabel}] — Qty ${committedRecQty}/${requiredQuantity} matched`
+              : `Qty Mismatch ${pending.part.partNumber} [No. ${docketNoLabel}] — Scanned ${committedRecQty} of ${requiredQuantity} required`),
+        }
+      : {
+          id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: now,
+          code: pending.code,
+          codeType: pending.detectedType,
+          status: isCorrectQuantity ? 'match_success' : 'quantity_mismatch',
+          partId: pending.part.id,
+          partNumber: pending.part.partNumber,
+          itemNumber: pending.part.itemNumber,
+          requiredQuantity,
+          receivedQuantity: committedRecQty,
+          addedQuantity: enteredQty,
+          message: isCorrectQuantity
+            ? `Verified ${pending.part.partNumber} [No. ${docketNoLabel}] — Qty ${committedRecQty}/${requiredQuantity} matched`
+            : `Qty Mismatch ${pending.part.partNumber} [No. ${docketNoLabel}] — Scanned ${committedRecQty} of ${requiredQuantity} required`,
+        };
+
+    const updatedDelivery: Delivery = {
+      ...delivery,
+      version: res.deliveryVersion || (delivery.version || 1) + 1,
+      parts: newParts,
+      scanHistory: [
+        scanEvent,
+        ...delivery.scanHistory.filter((e) => e.id !== scanEvent.id),
+      ].slice(0, 300),
+      updatedAt: now,
+    };
+
+    saveStoredDeliveries(
+      getStoredDeliveries().map((d) =>
+        d.id === updatedDelivery.id ? updatedDelivery : d
+      )
+    );
+    saveDeliveryToIndexedDb(updatedDelivery).catch(() => {});
+
+    return {
+      outcome: isCorrectQuantity ? 'verified' : 'quantity_mismatch',
+      updatedDelivery,
+      updatedPart,
+      isCorrectQuantity,
+      requiredQuantity,
+      receivedQuantity: committedRecQty,
+      message: scanEvent.message,
+    };
+  } catch (err: any) {
+    // Offline or network drop: queue scan with idempotencyKey for server revalidation on reconnect
+    realtimeClient.enqueueOfflineScan({
+      idempotencyKey,
+      deliveryId: delivery.id,
+      partId: pending.part.id,
+      partNumber: pending.part.partNumber,
+      itemNumber: pending.part.itemNumber,
+      receivedQuantity: enteredQty,
+      mode,
+      scannedVia: pending.detectedType,
+      scannedCode: pending.code,
+      notes: options?.notes,
+      rawOcrText: options?.rawOcrText,
+      queuedAt: new Date().toISOString(),
+    });
+
+    const pendingPart: DeliveryPart = {
+      ...pending.part,
+      pendingSync: true,
+    };
+    const updatedParts = delivery.parts.map((p) =>
+      p.id === pending.part.id ? pendingPart : p
+    );
+    const updatedDelivery: Delivery = {
+      ...delivery,
+      parts: updatedParts,
+    };
+
+    return {
+      outcome: 'pending_sync',
+      updatedDelivery,
+      updatedPart: pendingPart,
+      isCorrectQuantity: false,
+      requiredQuantity,
+      receivedQuantity: pending.part.receivedQuantity ?? 0,
+      message:
+        'Connection temporarily unavailable — scan queued as Pending Sync and will be verified with the central server upon reconnection.',
+    };
+  }
+}
+
+/**
+ * Applies a server-broadcast real-time event to the local `deliveries` array,
+ * enforcing monotonic deliveryVersion ordering so stale/out-of-order events
+ * never overwrite newer state.
+ */
+export function applyRealtimeEventToDeliveries(
+  currentDeliveries: Delivery[],
+  event: ClientRealtimeEvent
+): {
+  deliveries: Delivery[];
+  changed: boolean;
+  notification?: {
+    type: 'info' | 'success' | 'warning';
+    title: string;
+    message: string;
+    deliveryId?: string;
+    partId?: string;
+  };
+} {
+  if (!event || !event.type) {
+    return { deliveries: currentDeliveries, changed: false };
+  }
+
+  const actor = event.employeeName || event.payload?.scannedByName || event.payload?.actorName || 'Coworker';
+
+  switch (event.type) {
+    case 'delivery:created': {
+      const incoming = event.payload?.delivery as Delivery | undefined;
+      if (!incoming || !incoming.id) {
+        return { deliveries: currentDeliveries, changed: false };
+      }
+      const normalized = normalizeDeliveryDocketNumbers(incoming);
+      const existsIdx = currentDeliveries.findIndex((d) => d.id === normalized.id);
+      let nextDeliveries: Delivery[];
+      if (existsIdx >= 0) {
+        nextDeliveries = currentDeliveries.map((d, i) =>
+          i === existsIdx ? normalized : d
+        );
+      } else {
+        nextDeliveries = [normalized, ...currentDeliveries];
+      }
+      saveStoredDeliveries(nextDeliveries);
+      saveDeliveryToIndexedDb(normalized).catch(() => {});
+      return {
+        deliveries: nextDeliveries,
+        changed: true,
+        notification: {
+          type: 'info',
+          title: `New Delivery Docket: ${normalized.docketNumber}`,
+          message: `${actor} uploaded ${normalized.supplier} (${normalized.parts.length} parts)`,
+          deliveryId: normalized.id,
+        },
+      };
+    }
+
+    case 'delivery:updated':
+    case 'delivery:completed':
+    case 'delivery:reopened': {
+      const incoming = event.payload?.delivery as Delivery | undefined;
+      if (!incoming || !incoming.id) {
+        return { deliveries: currentDeliveries, changed: false };
+      }
+      const normalized = normalizeDeliveryDocketNumbers(incoming);
+      const nextDeliveries = currentDeliveries.map((d) => {
+        if (d.id !== normalized.id) return d;
+        if (
+          typeof d.version === 'number' &&
+          typeof normalized.version === 'number' &&
+          normalized.version < d.version
+        ) {
+          return d;
+        }
+        return {
+          ...d,
+          ...normalized,
+          docketAttachments:
+            normalized.docketAttachments?.length > 0
+              ? normalized.docketAttachments
+              : d.docketAttachments || [],
+        };
+      });
+      saveStoredDeliveries(nextDeliveries);
+      return {
+        deliveries: nextDeliveries,
+        changed: true,
+        notification:
+          event.type === 'delivery:completed'
+            ? {
+                type: 'success',
+                title: `Delivery ${normalized.docketNumber} Completed`,
+                message: `Marked complete by ${actor}`,
+                deliveryId: normalized.id,
+              }
+            : event.type === 'delivery:reopened'
+            ? {
+                type: 'info',
+                title: `Delivery ${normalized.docketNumber} Reopened`,
+                message: `Reopened for receiving by ${actor}`,
+                deliveryId: normalized.id,
+              }
+            : undefined,
+      };
+    }
+
+    case 'part:scanned':
+    case 'quantity:updated':
+    case 'part:scan_reversed': {
+      const deliveryId = event.deliveryId;
+      const incomingPart = event.payload?.part as DeliveryPart | undefined;
+      const incomingScan = event.payload?.scanEvent as ScanEvent | undefined;
+      if (!deliveryId || !incomingPart) {
+        return { deliveries: currentDeliveries, changed: false };
+      }
+
+      let changed = false;
+      const nextDeliveries = currentDeliveries.map((del) => {
+        if (del.id !== deliveryId) return del;
+        if (
+          typeof del.version === 'number' &&
+          typeof event.deliveryVersion === 'number' &&
+          event.deliveryVersion < del.version
+        ) {
+          return del;
+        }
+
+        const nextParts = del.parts.map((p) => {
+          if (p.id !== incomingPart.id) return p;
+          if (
+            typeof p.version === 'number' &&
+            typeof incomingPart.version === 'number' &&
+            incomingPart.version < p.version
+          ) {
+            return p;
+          }
+          changed = true;
+          return {
+            ...p,
+            ...incomingPart,
+            itemNumber: p.itemNumber || incomingPart.itemNumber,
+            docketLineIndex: p.docketLineIndex || incomingPart.docketLineIndex,
+            pendingSync: false,
+          };
+        });
+
+        let nextHistory = del.scanHistory || [];
+        if (incomingScan && incomingScan.id) {
+          if (!nextHistory.some((s) => s.id === incomingScan.id)) {
+            const mappedScan: ScanEvent = {
+              id: incomingScan.id,
+              timestamp: incomingScan.timestamp || event.timestamp,
+              code: incomingScan.code || incomingPart.partNumber,
+              codeType:
+                ((incomingScan as any).codeType as ScanMethod) ||
+                incomingPart.scannedVia ||
+                'qr',
+              status: (incomingScan.status as any) || 'match_success',
+              partId: incomingPart.id,
+              partNumber: incomingPart.partNumber,
+              itemNumber: incomingPart.itemNumber,
+              requiredQuantity: incomingPart.quantity,
+              receivedQuantity: incomingPart.receivedQuantity,
+              addedQuantity: (incomingScan as any).quantityAdded,
+              employeeName: incomingScan.employeeName || event.employeeName,
+              employeeRole: incomingScan.employeeRole || event.employeeRole,
+              message:
+                incomingScan.message ||
+                `${actor} scanned ${incomingPart.partNumber} (${incomingPart.receivedQuantity}/${incomingPart.quantity})`,
+            };
+            nextHistory = [mappedScan, ...nextHistory].slice(0, 300);
+            changed = true;
+          }
+        }
+
+        if (!changed) return del;
+        return {
+          ...del,
+          version: event.deliveryVersion || (del.version || 1) + 1,
+          parts: nextParts,
+          scanHistory: nextHistory,
+          updatedAt: event.timestamp || new Date().toISOString(),
+        };
+      });
+
+      if (changed) {
+        saveStoredDeliveries(nextDeliveries);
+      }
+
+      return {
+        deliveries: nextDeliveries,
+        changed,
+        notification: {
+          type: event.type === 'part:scan_reversed' ? 'warning' : 'success',
+          title:
+            event.type === 'part:scan_reversed'
+              ? `Scan Reversed: ${incomingPart.partNumber}`
+              : `Scanned: ${incomingPart.partNumber} (No. ${incomingPart.itemNumber})`,
+          message:
+            event.type === 'part:scan_reversed'
+              ? `${actor} unticked ${incomingPart.partNumber}`
+              : `${actor} received ${incomingPart.receivedQuantity ?? 1}/${incomingPart.quantity ?? 1}`,
+          deliveryId,
+          partId: incomingPart.id,
+        },
+      };
+    }
+
+    case 'part:added':
+    case 'part:edited':
+    case 'part:deleted':
+    case 'parts:batch_saved': {
+      const deliveryId = event.deliveryId;
+      const incomingDelivery = event.payload?.delivery as Delivery | undefined;
+      if (!deliveryId || !incomingDelivery) {
+        return { deliveries: currentDeliveries, changed: false };
+      }
+      const normalized = normalizeDeliveryDocketNumbers(incomingDelivery);
+      const nextDeliveries = currentDeliveries.map((d) =>
+        d.id === deliveryId
+          ? {
+              ...d,
+              ...normalized,
+              docketAttachments:
+                normalized.docketAttachments?.length > 0
+                  ? normalized.docketAttachments
+                  : d.docketAttachments || [],
+            }
+          : d
+      );
+      saveStoredDeliveries(nextDeliveries);
+      const partNo = event.payload?.part?.partNumber || '';
+      return {
+        deliveries: nextDeliveries,
+        changed: true,
+        notification: {
+          type: 'info',
+          title:
+            event.type === 'part:added'
+              ? `Part Added: ${partNo}`
+              : event.type === 'part:deleted'
+              ? 'Part Removed from Docket'
+              : `Parts List Updated`,
+          message: `Updated by ${actor}`,
+          deliveryId,
+          partId: event.partId,
+        },
+      };
+    }
+
+    default:
+      return { deliveries: currentDeliveries, changed: false };
+  }
 }
 
 // ============================================================================

@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, X, Ban, ShieldAlert, Layers, Hash, Calendar, CheckCircle2 } from 'lucide-react';
+import { AlertTriangle, X, Ban, ShieldAlert, Layers, Hash, Calendar, CheckCircle2, UserCheck } from 'lucide-react';
 
 export interface DuplicateScanModalData {
   partNumber: string;
@@ -9,6 +9,8 @@ export interface DuplicateScanModalData {
   itemNumber?: string;
   palletNumber?: string | number;
   scannedAt?: string;
+  scannedBy?: string;
+  customMessage?: string;
   receivedQuantity?: number;
 }
 
@@ -93,9 +95,12 @@ export const DuplicateScanModal: React.FC<DuplicateScanModalProps> = ({ data, on
             </h2>
           </div>
 
-          {/* Exact Required Message */}
-          <p className="text-base sm:text-lg font-bold text-white leading-snug max-w-xs">
-            This part has already been scanned into this delivery.
+          {/* Primary Duplicate Scan Message */}
+          <p className="text-base sm:text-lg font-bold text-white leading-snug max-w-sm">
+            {data.customMessage ||
+              (data.scannedBy
+                ? 'Duplicate scan – this part has already been received by another worker'
+                : 'This part has already been scanned into this delivery.')}
           </p>
 
           {/* Part Identification Box (Red Warning Styling) */}
@@ -122,8 +127,14 @@ export const DuplicateScanModal: React.FC<DuplicateScanModalProps> = ({ data, on
               </div>
             ) : null}
 
-            {/* Part Metadata Badges (Item / Line, Pallet, Prior Scan Time) */}
+            {/* Part Metadata Badges (Item / Line, Pallet, Prior Scan Time, Worker) */}
             <div className="pt-2 border-t border-red-500/20 flex flex-wrap items-center gap-2 text-xs font-mono">
+              {data.scannedBy ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-900/80 text-red-100 border border-red-400/50 font-bold">
+                  <UserCheck className="w-3.5 h-3.5 text-red-300" />
+                  By {data.scannedBy}
+                </span>
+              ) : null}
               {data.itemNumber ? (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-900/60 text-red-200 border border-red-500/30">
                   <Hash className="w-3 h-3 text-red-400" />

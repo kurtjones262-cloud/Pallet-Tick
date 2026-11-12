@@ -11,10 +11,13 @@ import { SettingsModal } from './components/SettingsModal';
 import { Delivery, PendingQuantityConfirmation, UserAccount } from './types/delivery';
 import {
   getActiveDelivery,
+  getStoredDeliveries,
   updateDelivery,
   processScannedCode,
   getStoredSettings,
   syncDeliveriesFromCentralDatabase,
+  applyRealtimeEventToDeliveries,
+  commitScanPartAuthoritative,
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { SplashScreen } from './components/SplashScreen';
@@ -33,6 +36,7 @@ import {
   apiCheckProvisionStatus,
   getStoredUser,
 } from './services/palletTrackApi';
+import { realtimeClient } from './services/realtimeSync';
 
 export function App() {
   // Phase 2 Multi-User & RBAC State
@@ -151,7 +155,25 @@ export function App() {
       syncDeliveriesFromCentralDatabase()
         .then(() => reloadDelivery())
         .catch(console.warn);
+
+      // Start live multi-user WebSocket synchronisation
+      realtimeClient.start(getActiveDelivery()?.id || null);
+    } else {
+      realtimeClient.stop();
     }
+
+    const unsubRealtimeEvent = realtimeClient.onEvent((event) => {
+      const { changed } = applyRealtimeEventToDeliveries(getStoredDeliveries(), event);
+      if (changed) {
+        reloadDelivery();
+      }
+    });
+
+    const unsubAuthRevoked = realtimeClient.onAuthRevoked(() => {
+      realtimeClient.stop();
+      setCurrentUser(null);
+      setActiveTab('dashboard');
+    });
 
     const handleDeliveriesUpdate = () => reloadDelivery();
     const handleActiveChange = () => reloadDelivery();
@@ -162,11 +184,21 @@ export function App() {
     window.addEventListener('parttrack_connection_required', handleConnectionRequired);
 
     return () => {
+      unsubRealtimeEvent();
+      unsubAuthRevoked();
       window.removeEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
       window.removeEventListener('parttrack_connection_required', handleConnectionRequired);
     };
   }, [initAppWorkspace, reloadDelivery, currentUser]);
+
+  // Keep active delivery room and worker status synchronised across tabs/deliveries
+  useEffect(() => {
+    if (!currentUser) return;
+    const workerStatus =
+      activeTab === 'scanner' ? 'scanning' : activeDelivery ? 'viewing' : 'dashboard';
+    realtimeClient.joinDeliveryRoom(activeDelivery?.id || null, workerStatus);
+  }, [currentUser, activeDelivery?.id, activeTab]);
 
   // Global Ctrl+K / Cmd+K focuses search bar in Orders
   useEffect(() => {
@@ -206,12 +238,13 @@ export function App() {
     try {
       sessionStorage.setItem('pallettrack_explicit_logout', 'true');
     } catch {}
+    realtimeClient.stop();
     await apiLogout();
     setCurrentUser(null);
     setActiveTab('dashboard');
   };
 
-  const handleSimulateScan = (code: string) => {
+  const handleSimulateScan = async (code: string) => {
     if (!activeDelivery) return;
     const { updatedDelivery, result } = processScannedCode(activeDelivery, code);
     const settings = getStoredSettings();
@@ -244,17 +277,49 @@ export function App() {
         palletNumber: result.part?.palletNumber,
         scannedAt: result.part?.scannedAt,
         receivedQuantity: result.part?.receivedQuantity,
+        scannedBy: result.part?.lastScannedByName,
       });
       return;
     }
 
-    handleUpdateDelivery(updatedDelivery);
-
-    if (result.status === 'matched') {
+    if (result.status === 'matched' && result.part) {
+      const authRes = await commitScanPartAuthoritative(
+        activeDelivery,
+        {
+          part: result.part,
+          code,
+          detectedType: result.detectedType,
+          matchedMode: result.detectedType === 'barcode' ? 'docket-no' : 'exact-part',
+        },
+        result.part.receivedQuantity ?? result.part.quantity ?? 1,
+        { mode: 'set' }
+      );
+      if (authRes.outcome === 'duplicate') {
+        playAudio.duplicate(settings.soundEnabled);
+        triggerHaptic('duplicate', settings.vibrationEnabled);
+        speakAlert(
+          `Duplicate scan: ${result.part.partNumber}`,
+          settings.speechEnabled
+        );
+        setGlobalDuplicateWarning({
+          partNumber: result.part.partNumber,
+          description: result.part.description || '',
+          code,
+          itemNumber: result.part.itemNumber,
+          palletNumber: result.part.palletNumber,
+          scannedAt: authRes.alreadyScannedAt || result.part.scannedAt,
+          receivedQuantity: result.part.receivedQuantity,
+          scannedBy: authRes.alreadyScannedBy || result.part.lastScannedByName,
+          customMessage: authRes.message,
+        });
+        return;
+      }
+      handleUpdateDelivery(authRes.updatedDelivery);
       playAudio.success(settings.soundEnabled);
       triggerHaptic('success', settings.vibrationEnabled);
-      speakAlert(`Matched ${result.part?.partNumber}`, settings.speechEnabled);
+      speakAlert(`Matched ${result.part.partNumber}`, settings.speechEnabled);
     } else {
+      handleUpdateDelivery(updatedDelivery);
       playAudio.unexpected(settings.soundEnabled);
       triggerHaptic('unexpected', settings.vibrationEnabled);
       speakAlert('Unexpected part', settings.speechEnabled);

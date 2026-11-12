@@ -29,6 +29,7 @@ import {
 } from '../types/delivery';
 import {
   confirmScannedPartQuantity,
+  commitScanPartAuthoritative,
   parseBarcodeDocketNo,
   getDeliverySupplierRule,
   setDeliverySupplierRule,
@@ -39,6 +40,7 @@ import {
   updateDelivery,
 } from '../utils/storage';
 import { isBackendOnline } from '../services/palletTrackApi';
+import { realtimeClient } from '../services/realtimeSync';
 
 import {
   recognizePalletLabelOffline,
@@ -152,6 +154,55 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     };
   }, [activeScanConfirmation, activeDuplicateWarning, onScanConfirmationChange]);
 
+  // Announce active scanning status to real-time room while ScannerView is mounted
+  useEffect(() => {
+    if (delivery?.id) {
+      realtimeClient.joinDeliveryRoom(delivery.id, 'scanning');
+    }
+    return () => {
+      if (delivery?.id) {
+        realtimeClient.setWorkerStatus('viewing');
+      }
+    };
+  }, [delivery?.id]);
+
+  // App Settings (sound, vibration, speech)
+  const [appSettings] = useState(() => getStoredSettings());
+
+  // Real-time concurrent scan guard: if another worker completes scanning the exact part
+  // that this worker currently has open in the Scan Confirmation sheet, immediately alert!
+  useEffect(() => {
+    if (!activeScanConfirmation?.matchedPart || !delivery) return;
+    const livePart = delivery.parts.find(
+      (p) => p.id === activeScanConfirmation.matchedPart?.id
+    );
+    if (
+      livePart &&
+      livePart.status === 'received' &&
+      (livePart.receivedQuantity ?? 0) >= Math.max(1, livePart.quantity ?? 1)
+    ) {
+      activeScanConfirmationRef.current = null;
+      setActiveScanConfirmation(null);
+      playAudio.duplicate(appSettings.soundEnabled);
+      triggerHaptic('duplicate', appSettings.vibrationEnabled);
+      triggerVisualFlash('red');
+      const dupData: DuplicateScanModalData = {
+        partNumber: livePart.partNumber,
+        description: livePart.description,
+        code: activeScanConfirmation.rawCode,
+        itemNumber: livePart.itemNumber,
+        palletNumber: livePart.palletNumber,
+        scannedAt: livePart.scannedAt,
+        scannedBy: livePart.lastScannedByName || 'Another worker',
+        customMessage:
+          'Duplicate scan – this part has already been received by another worker',
+        receivedQuantity: livePart.receivedQuantity,
+      };
+      activeDuplicateWarningRef.current = dupData;
+      setActiveDuplicateWarning(dupData);
+    }
+  }, [delivery, activeScanConfirmation, appSettings]);
+
   // Status and feedback states
   const [scanFeedback, setScanFeedback] = useState<ScanFeedback | null>(null);
   const [flashColor, setFlashColor] = useState<'green' | 'orange' | 'red' | null>(null);
@@ -169,9 +220,6 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const [isSupplierModalOpen, setIsSupplierModalOpen] = useState<boolean>(false);
   const [isManualModalOpen, setIsManualModalOpen] = useState<boolean>(false);
   const [manualCodeInput, setManualCodeInput] = useState<string>('');
-
-  // App Settings (sound, vibration, speech)
-  const [appSettings] = useState(() => getStoredSettings());
 
   // Preferred Supplier Rule ID state (syncs across session and when no delivery is active)
   const [preferredRuleId, setPreferredRuleId] = useState<SupplierRuleId>(() =>
@@ -677,6 +725,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           itemNumber: duplicateCheck.itemNumber,
           palletNumber: duplicateCheck.palletNumber,
           scannedAt: duplicateCheck.scannedAt,
+          scannedBy: duplicateCheck.scannedBy,
+          customMessage: duplicateCheck.scannedBy
+            ? 'Duplicate scan – this part has already been received by another worker'
+            : undefined,
           receivedQuantity: duplicateCheck.receivedQuantity,
         });
         return;
@@ -733,6 +785,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const detectedDesc = matched ? matched.description : '';
       const detectedQty = matched ? Math.max(1, matched.quantity ?? 1) : 1;
 
+      if (matched) {
+        realtimeClient.notifyScanningActivity({
+          action: 'confirming_scan',
+          partId: matched.id,
+          partNumber: matched.partNumber,
+          itemNumber: matched.itemNumber,
+          summary: `Scanning ${matched.partNumber} (No. ${matched.itemNumber})`,
+        });
+      }
+
       // Play detection chime & feedback
       playAudio.success(appSettings.soundEnabled);
       triggerHaptic('success', appSettings.vibrationEnabled);
@@ -757,23 +819,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   );
 
   /**
-   * Handle SAVE & SCAN NEXT action from confirmation modal
+   * Handle SAVE & SCAN NEXT action from confirmation modal.
+   * Uses authoritative server commit (`commitScanPartAuthoritative`) so concurrent
+   * scans of the same part across multiple devices are atomically checked in D1.
    */
   const handleSaveAndScanNext = useCallback(
-    (payload: ConfirmedScanPayload) => {
+    async (payload: ConfirmedScanPayload) => {
       const currentDelivery = deliveryRef.current;
       if (!currentDelivery) return;
 
-      if (!isBackendOnline()) {
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
-        }
-        return;
-      }
-
       const now = new Date().toISOString();
-
-      let updatedDelivery: Delivery;
 
       const scanMethodToCodeType: ScanMethod =
         payload.scanMethod === 'qr_code'
@@ -784,9 +839,16 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           ? 'manual'
           : 'barcode';
 
+      // Debounce same code for 1.5 seconds so camera doesn't re-trigger immediately
+      lastScannedCodeRef.current = payload.rawCode;
+      lastScannedTimeRef.current = Date.now();
+
+      // Close confirmation sheet immediately for responsive UX while committing
+      activeScanConfirmationRef.current = null;
+      setActiveScanConfirmation(null);
+
       if (payload.matchedPart) {
-        // Save matched part verification using existing logic
-        const res = confirmScannedPartQuantity(
+        const res = await commitScanPartAuthoritative(
           currentDelivery,
           {
             code: payload.rawCode,
@@ -798,51 +860,108 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               description: payload.description,
             },
           },
-          payload.quantity
+          payload.quantity,
+          {
+            mode: scanMethodToCodeType === 'ocr_label' ? 'increment' : 'set',
+          }
         );
-        updatedDelivery = res.updatedDelivery;
-      } else {
-        // Save unlisted part into unexpectedParts and scanHistory
-        const unexpectedItem: UnexpectedPart = {
-          id: `unexp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          code: payload.rawCode || payload.partNumber,
-          codeType: scanMethodToCodeType,
-          scannedAt: now,
-          notes: payload.description
-            ? `${payload.partNumber} (${payload.description}) - Qty ${payload.quantity}`
-            : `Qty ${payload.quantity}`,
-        };
 
-        const scanEvent: ScanEvent = {
-          id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          timestamp: now,
-          code: payload.rawCode || payload.partNumber,
-          codeType: scanMethodToCodeType,
-          status: 'unexpected_warning',
-          partNumber: payload.partNumber,
-          requiredQuantity: 0,
-          receivedQuantity: payload.quantity,
-          addedQuantity: payload.quantity,
-          message: `Recorded unexpected item ${payload.partNumber} — Qty ${payload.quantity}`,
-        };
+        onUpdateDeliveryRef.current(res.updatedDelivery);
 
-        updatedDelivery = {
-          ...currentDelivery,
-          unexpectedParts: [unexpectedItem, ...currentDelivery.unexpectedParts],
-          scanHistory: [scanEvent, ...currentDelivery.scanHistory].slice(0, 300),
-          updatedAt: now,
-        };
-        updateDelivery(updatedDelivery);
+        if (res.outcome === 'duplicate') {
+          triggerDuplicateWarning({
+            partNumber: res.updatedPart.partNumber || payload.partNumber,
+            description: res.updatedPart.description || payload.description,
+            code: payload.rawCode,
+            itemNumber: res.updatedPart.itemNumber,
+            palletNumber: res.updatedPart.palletNumber,
+            scannedAt: res.alreadyScannedAt || res.updatedPart.scannedAt,
+            scannedBy: res.alreadyScannedBy || res.updatedPart.lastScannedByName || 'Another worker',
+            customMessage:
+              'Duplicate scan – this part has already been received by another worker',
+            receivedQuantity: res.receivedQuantity,
+          });
+          return;
+        }
+
+        if (res.outcome === 'pending_sync') {
+          playAudio.unexpected(appSettings.soundEnabled);
+          triggerHaptic('unexpected', appSettings.vibrationEnabled);
+          triggerVisualFlash('orange');
+          setScanFeedback({
+            type: 'pending_sync',
+            code: payload.rawCode,
+            message: `⏳ Pending Sync: ${payload.partNumber} (will verify on reconnect)`,
+            timestamp: Date.now(),
+          });
+          if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
+          feedbackTimeoutRef.current = setTimeout(() => {
+            setScanFeedback(null);
+          }, 4500);
+          return;
+        }
+
+        // Verified or quantity mismatch committed to D1
+        if (res.isCorrectQuantity) {
+          playAudio.success(appSettings.soundEnabled);
+          triggerHaptic('success', appSettings.vibrationEnabled);
+          triggerVisualFlash('green');
+        } else {
+          playAudio.unexpected(appSettings.soundEnabled);
+          triggerHaptic('unexpected', appSettings.vibrationEnabled);
+          triggerVisualFlash('orange');
+        }
+
+        setScanFeedback({
+          type: res.isCorrectQuantity ? 'success' : 'quantity_mismatch',
+          code: payload.rawCode,
+          message: `✓ Saved: ${payload.partNumber} (Qty ${res.receivedQuantity}/${res.requiredQuantity})`,
+          timestamp: Date.now(),
+        });
+        if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
+        feedbackTimeoutRef.current = setTimeout(() => {
+          setScanFeedback(null);
+        }, 3500);
+        return;
       }
 
+      // Save unlisted part into unexpectedParts and scanHistory
+      const unexpectedItem: UnexpectedPart = {
+        id: `unexp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        code: payload.rawCode || payload.partNumber,
+        codeType: scanMethodToCodeType,
+        scannedAt: now,
+        notes: payload.description
+          ? `${payload.partNumber} (${payload.description}) - Qty ${payload.quantity}`
+          : `Qty ${payload.quantity}`,
+      };
+
+      const scanEvent: ScanEvent = {
+        id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: now,
+        code: payload.rawCode || payload.partNumber,
+        codeType: scanMethodToCodeType,
+        status: 'unexpected_warning',
+        partNumber: payload.partNumber,
+        requiredQuantity: 0,
+        receivedQuantity: payload.quantity,
+        addedQuantity: payload.quantity,
+        message: `Recorded unexpected item ${payload.partNumber} — Qty ${payload.quantity}`,
+      };
+
+      const updatedDelivery: Delivery = {
+        ...currentDelivery,
+        unexpectedParts: [unexpectedItem, ...currentDelivery.unexpectedParts],
+        scanHistory: [scanEvent, ...currentDelivery.scanHistory].slice(0, 300),
+        updatedAt: now,
+      };
+      updateDelivery(updatedDelivery);
       onUpdateDeliveryRef.current(updatedDelivery);
 
-      // Audio & visual feedback
       playAudio.success(appSettings.soundEnabled);
       triggerHaptic('success', appSettings.vibrationEnabled);
       triggerVisualFlash('green');
 
-      // Brief toast notification on camera
       setScanFeedback({
         type: 'success',
         code: payload.rawCode,
@@ -853,16 +972,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       feedbackTimeoutRef.current = setTimeout(() => {
         setScanFeedback(null);
       }, 3500);
-
-      // Debounce same code for 1.5 seconds so camera doesn't re-trigger immediately
-      lastScannedCodeRef.current = payload.rawCode;
-      lastScannedTimeRef.current = Date.now();
-
-      // Return immediately to live camera scanner!
-      activeScanConfirmationRef.current = null;
-      setActiveScanConfirmation(null);
     },
-    [appSettings, triggerVisualFlash]
+    [appSettings, triggerVisualFlash, triggerDuplicateWarning]
   );
 
   /**

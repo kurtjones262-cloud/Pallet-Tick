@@ -9,6 +9,7 @@ export interface DuplicateScanResult {
   itemNumber?: string;
   palletNumber?: string | number;
   scannedAt?: string;
+  scannedBy?: string;
   receivedQuantity?: number;
   reason?: 'part_already_received' | 'part_number_already_received' | 'unexpected_already_scanned';
 }
@@ -137,6 +138,13 @@ export function detectDuplicateScan(
         ) ||
         candidatePart;
 
+      const matchingHistoryEvent = (delivery.scanHistory || []).find(
+        (ev) =>
+          ev.partId === alreadyReceivedInstance.id &&
+          ev.status !== 'undo_performed' &&
+          ev.employeeName
+      );
+
       return {
         isDuplicate: true,
         matchedPart: alreadyReceivedInstance,
@@ -145,6 +153,10 @@ export function detectDuplicateScan(
         itemNumber: alreadyReceivedInstance.itemNumber,
         palletNumber: alreadyReceivedInstance.palletNumber,
         scannedAt: alreadyReceivedInstance.scannedAt,
+        scannedBy:
+          alreadyReceivedInstance.lastScannedByName ||
+          matchingHistoryEvent?.employeeName ||
+          undefined,
         receivedQuantity: alreadyReceivedInstance.receivedQuantity,
         reason: isThisPartReceived ? 'part_already_received' : 'part_number_already_received',
       };

@@ -1,4 +1,6 @@
 import express, { type Request as ExpressRequest, type Response as ExpressResponse } from 'express';
+import http from 'http';
+import { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -46,7 +48,12 @@ app.use('/tesseract', express.static(path.resolve(__dirname, 'node_modules/tesse
 
 
 import { getLocalDevDatabase } from './src/server/db/nodeSqliteAdapter.ts';
-import { handlePalletTrackApiRequest } from './src/server/api/palletTrackApiRouter.ts';
+import {
+  handlePalletTrackApiRequest,
+  extractSessionTokenFromRequest,
+} from './src/server/api/palletTrackApiRouter.ts';
+import { PalletTrackDbService } from './src/server/api/palletTrackDbService.ts';
+import { realtimeBroker } from './src/server/realtime/realtimeHub.ts';
 
 const localDb = getLocalDevDatabase();
 
@@ -56,6 +63,7 @@ app.use(async (req, res, next) => {
     req.path.startsWith('/api/deliveries') ||
     req.path.startsWith('/api/users') ||
     req.path.startsWith('/api/auth') ||
+    req.path.startsWith('/api/realtime') ||
     req.path === '/api/health'
   ) {
     try {
@@ -305,7 +313,90 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+  const dbService = new PalletTrackDbService(localDb);
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    try {
+      const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost:3000'}`);
+      if (reqUrl.pathname !== '/api/realtime/ws') {
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(req, socket, head, async (ws) => {
+        try {
+          const headers = new Headers();
+          for (const [k, v] of Object.entries(req.headers)) {
+            if (typeof v === 'string') headers.set(k, v);
+            else if (Array.isArray(v)) v.forEach((val) => headers.append(k, val));
+          }
+          const webReq = new Request(reqUrl.toString(), { headers });
+          const token = extractSessionTokenFromRequest(webReq);
+
+          if (!token) {
+            ws.send(
+              JSON.stringify({
+                type: 'auth_error',
+                code: 'UNAUTHORIZED',
+                error: 'Authentication required for real-time synchronisation.',
+              })
+            );
+            ws.close(4001, 'Unauthorized: Missing session token');
+            return;
+          }
+
+          const user = await dbService.validateSession(token);
+          if (!user || !user.active) {
+            ws.send(
+              JSON.stringify({
+                type: 'auth_error',
+                code: 'SESSION_INVALID',
+                error: 'Invalid, expired, or deactivated session.',
+              })
+            );
+            ws.close(4001, 'Unauthorized: Invalid or expired session');
+            return;
+          }
+
+          const initialDeliveryId = reqUrl.searchParams.get('deliveryId') || null;
+          const lastSeq = Number(reqUrl.searchParams.get('lastSeq')) || 0;
+          const connectionId = realtimeBroker.registerClient(
+            ws as any,
+            user,
+            token,
+            initialDeliveryId,
+            lastSeq,
+            localDb
+          );
+
+          ws.on('message', (data) => {
+            const text = typeof data === 'string' ? data : data.toString('utf-8');
+            realtimeBroker.handleClientMessage(connectionId, text, localDb).catch(() => {});
+          });
+
+          ws.on('close', () => {
+            realtimeBroker.unregisterClient(connectionId);
+          });
+
+          ws.on('error', () => {
+            realtimeBroker.unregisterClient(connectionId);
+          });
+        } catch {
+          try {
+            ws.close(4000, 'Internal connection error');
+          } catch {
+            // Ignore
+          }
+        }
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`PalletTick server running on http://localhost:${PORT}`);
   });
 }

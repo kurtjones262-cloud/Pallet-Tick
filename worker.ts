@@ -8,7 +8,12 @@
  */
 
 import { D1Database } from './src/server/db/types.ts';
-import { handlePalletTrackApiRequest } from './src/server/api/palletTrackApiRouter.ts';
+import {
+  handlePalletTrackApiRequest,
+  extractSessionTokenFromRequest,
+} from './src/server/api/palletTrackApiRouter.ts';
+import { PalletTrackDbService } from './src/server/api/palletTrackDbService.ts';
+import { realtimeBroker, RealtimeEvent } from './src/server/realtime/realtimeHub.ts';
 
 export interface Env {
   GEMINI_API_KEY?: string;
@@ -17,6 +22,10 @@ export interface Env {
   GEMINI_FALLBACK_MODELS?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
   DB?: D1Database;
+  REALTIME_HUB?: {
+    idFromName(name: string): unknown;
+    get(id: unknown): { fetch(request: Request): Promise<Response> };
+  };
   [key: string]: unknown;
 }
 
@@ -581,11 +590,82 @@ export default {
       );
     }
 
-    // Handle PalletTrack Centralised Database & Authentication API routes
+    // Handle WebSocket Upgrade on /api/realtime/ws (via Durable Object or Worker WebSocketPair)
+    if (url.pathname === '/api/realtime/ws') {
+      const upgradeHeader = request.headers.get('Upgrade') || request.headers.get('upgrade');
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        return new Response(JSON.stringify({ error: 'Expected WebSocket Upgrade header' }), {
+          status: 426,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        });
+      }
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: 'D1 database not bound' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        });
+      }
+
+      const token = extractSessionTokenFromRequest(request);
+      if (!token) {
+        return new Response(JSON.stringify({ error: 'Unauthorized: Missing session token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        });
+      }
+
+      const service = new PalletTrackDbService(env.DB);
+      await service.ensureSchemaReady();
+      const user = await service.validateSession(token);
+      if (!user || !user.active) {
+        return new Response(JSON.stringify({ error: 'Unauthorized: Invalid or expired session' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        });
+      }
+
+      // If Cloudflare Durable Object REALTIME_HUB is bound, delegate room coordination to the Durable Object
+      if (env.REALTIME_HUB && typeof env.REALTIME_HUB.idFromName === 'function') {
+        const doId = env.REALTIME_HUB.idFromName('global-pallettrack-hub');
+        const stub = env.REALTIME_HUB.get(doId);
+        const forwardedHeaders = new Headers(request.headers);
+        forwardedHeaders.set('X-Authenticated-User', JSON.stringify(user));
+        forwardedHeaders.set('X-Session-Token', token);
+        return stub.fetch(new Request(request.url, { headers: forwardedHeaders }));
+      }
+
+      // Standard Cloudflare Worker WebSocketPair handling
+      const WebSocketPairCtor = (globalThis as any).WebSocketPair;
+      if (typeof WebSocketPairCtor === 'function') {
+        const pair = new WebSocketPairCtor();
+        const clientWs = pair[0];
+        const serverWs = pair[1];
+        serverWs.accept();
+
+        const initialDeliveryId = url.searchParams.get('deliveryId') || null;
+        const connId = realtimeBroker.registerClient(serverWs, user, token, initialDeliveryId);
+
+        serverWs.addEventListener('message', (evt: any) => {
+          const text = typeof evt.data === 'string' ? evt.data : String(evt.data || '');
+          realtimeBroker.handleClientMessage(connId, text, env.DB).catch(() => {});
+        });
+        serverWs.addEventListener('close', () => {
+          realtimeBroker.unregisterClient(connId);
+        });
+        serverWs.addEventListener('error', () => {
+          realtimeBroker.unregisterClient(connId);
+        });
+
+        return new Response(null, { status: 101, webSocket: clientWs } as any);
+      }
+    }
+
+    // Handle PalletTrack Centralised Database, Real-Time & Authentication API routes
     if (
       url.pathname.startsWith('/api/auth') ||
       url.pathname.startsWith('/api/deliveries') ||
-      url.pathname.startsWith('/api/users')
+      url.pathname.startsWith('/api/users') ||
+      url.pathname.startsWith('/api/realtime')
     ) {
       if (!env.DB) {
         return new Response(
@@ -600,6 +680,25 @@ export default {
           }
         );
       }
+
+      if (env.REALTIME_HUB && typeof env.REALTIME_HUB.idFromName === 'function') {
+        realtimeBroker.setDurableObjectForwarder(async (event: RealtimeEvent) => {
+          try {
+            const doId = env.REALTIME_HUB!.idFromName('global-pallettrack-hub');
+            const stub = env.REALTIME_HUB!.get(doId);
+            await stub.fetch(
+              new Request('https://internal.pallettrack/broadcast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(event),
+              })
+            );
+          } catch {
+            // Ignore DO forwarding notice
+          }
+        });
+      }
+
       const apiResponse = await handlePalletTrackApiRequest(request, env.DB, env);
       if (apiResponse) return apiResponse;
     }
@@ -662,3 +761,66 @@ export default {
     });
   },
 };
+
+/**
+ * Cloudflare Durable Object: PalletTrackRealtimeHub
+ * Coordinates multi-user WebSocket rooms, presence, and instantaneous event fan-out
+ * across Cloudflare edge isolates while D1 remains the authoritative state store.
+ */
+export class PalletTrackRealtimeHub {
+  private broker = new (realtimeBroker.constructor as any)();
+  private env: Env;
+
+  constructor(_state: unknown, env: Env) {
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/broadcast' && request.method === 'POST') {
+      const event = (await request.json().catch(() => null)) as RealtimeEvent | null;
+      if (event) {
+        this.broker.broadcastEvent(event);
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+
+    const upgradeHeader = request.headers.get('Upgrade') || request.headers.get('upgrade');
+    if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
+      const userJson = request.headers.get('X-Authenticated-User');
+      const token = request.headers.get('X-Session-Token') || '';
+      if (!userJson) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const user = JSON.parse(userJson);
+      const WebSocketPairCtor = (globalThis as any).WebSocketPair;
+      const pair = new WebSocketPairCtor();
+      const clientWs = pair[0];
+      const serverWs = pair[1];
+      serverWs.accept();
+
+      const initialDeliveryId = url.searchParams.get('deliveryId') || null;
+      const connId = this.broker.registerClient(serverWs, user, token, initialDeliveryId);
+
+      serverWs.addEventListener('message', (evt: any) => {
+        const text = typeof evt.data === 'string' ? evt.data : String(evt.data || '');
+        this.broker.handleClientMessage(connId, text, this.env.DB).catch(() => {});
+      });
+      serverWs.addEventListener('close', () => {
+        this.broker.unregisterClient(connId);
+      });
+      serverWs.addEventListener('error', () => {
+        this.broker.unregisterClient(connId);
+      });
+
+      return new Response(null, { status: 101, webSocket: clientWs } as any);
+    }
+
+    return new Response(JSON.stringify({ status: 'ok', hub: 'PalletTrackRealtimeHub' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}
+

@@ -69,6 +69,7 @@ export interface DeliveryRow {
   pallet_count: number;
   supplier_profile: string;
   notes: string | null;
+  version?: number;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -94,6 +95,8 @@ export interface DeliveryPartRow {
   scanned_at: string | null;
   scanned_via: string | null;
   scanned_code: string | null;
+  last_scanned_by_id?: string | null;
+  last_scanned_by_name?: string | null;
   notes: string | null;
   flagged_for_review: number;
   ocr_confidence: string | null;
@@ -101,6 +104,7 @@ export interface DeliveryPartRow {
   original_ocr_values?: string | null;
   last_edited_by?: string | null;
   last_edited_at?: string | null;
+  version?: number;
   created_at: string;
   updated_at: string;
 }
@@ -121,6 +125,8 @@ export interface ScanEventRow {
   employee_name?: string | null;
   employee_role?: string | null;
   event_action?: string | null;
+  idempotency_key?: string | null;
+  sequence_number?: number | null;
   created_at?: string;
 }
 
@@ -136,3 +142,18 @@ export interface M1SynchronisationRow {
   created_at: string;
   updated_at: string;
 }
+
+export interface RealtimeEventRow {
+  seq: number;
+  id: string;
+  event_type: string;
+  delivery_id: string | null;
+  part_id: string | null;
+  user_id: string | null;
+  employee_name: string | null;
+  employee_role: string | null;
+  delivery_version: number | null;
+  payload: string;
+  created_at: string;
+}
+

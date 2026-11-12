@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   pallet_count INTEGER NOT NULL DEFAULT 1 CHECK (pallet_count >= 1),
   supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
   notes TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
   created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -73,6 +74,8 @@ CREATE TABLE IF NOT EXISTS delivery_parts (
   scanned_at TEXT,
   scanned_via TEXT,
   scanned_code TEXT,
+  last_scanned_by_id TEXT,
+  last_scanned_by_name TEXT,
   notes TEXT,
   flagged_for_review INTEGER NOT NULL DEFAULT 0 CHECK (flagged_for_review IN (0, 1)),
   ocr_confidence TEXT,
@@ -80,6 +83,7 @@ CREATE TABLE IF NOT EXISTS delivery_parts (
   original_ocr_values TEXT,
   last_edited_by TEXT,
   last_edited_at TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -102,6 +106,8 @@ CREATE TABLE IF NOT EXISTS scan_events (
   received_quantity_after INTEGER,
   scan_result TEXT,
   raw_ocr_text TEXT,
+  idempotency_key TEXT,
+  sequence_number INTEGER,
   created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
 );
 
@@ -117,6 +123,22 @@ CREATE TABLE IF NOT EXISTS m1_synchronisations (
   error_info TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+-- 7. Real-Time Events Table
+-- Monotonically ordered real-time event log for multi-user synchronisation & catch-up
+CREATE TABLE IF NOT EXISTS realtime_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  delivery_id TEXT,
+  part_id TEXT,
+  user_id TEXT,
+  employee_name TEXT,
+  employee_role TEXT,
+  delivery_version INTEGER,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 
 -- Indexes for performance and high-frequency scan queries
@@ -135,4 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_scans_delivery ON scan_events(delivery_id);
 CREATE INDEX IF NOT EXISTS idx_scans_part ON scan_events(part_id);
 CREATE INDEX IF NOT EXISTS idx_scans_user ON scan_events(user_id);
 CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scan_events(timestamp DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id);
+CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC);
+CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC);
+

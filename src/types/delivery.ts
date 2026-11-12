@@ -72,6 +72,10 @@ export interface DeliveryPart {
   scannedAt?: string; // ISO string
   scannedVia?: ScanMethod;
   scannedCode?: string;
+  lastScannedById?: string;
+  lastScannedByName?: string;
+  version?: number;
+  pendingSync?: boolean;
   notes?: string;
   flaggedForReview?: boolean;
   ocrConfidence?: 'high' | 'medium' | 'low';
@@ -120,6 +124,7 @@ export interface ScanEvent {
   employeeName?: string;
   employeeRole?: string;
   eventAction?: string;
+  idempotencyKey?: string;
   message: string;
 }
 
@@ -143,6 +148,7 @@ export interface Delivery {
   orderNumber?: string;
   palletCount?: number;
   notes?: string;
+  version?: number;
   status: 'receiving' | 'completed';
   docketAttachments: DocketAttachment[];
   parts: DeliveryPart[];
@@ -151,9 +157,11 @@ export interface Delivery {
 }
 
 export interface ScanFeedback {
-  type: 'success' | 'quantity_mismatch' | 'duplicate' | 'unexpected' | 'undo';
+  type: 'success' | 'quantity_mismatch' | 'duplicate' | 'unexpected' | 'undo' | 'pending_sync';
   code: string;
   matchedPart?: DeliveryPart;
+  alreadyScannedBy?: string;
+  alreadyScannedAt?: string;
   message: string;
   timestamp: number;
 }
@@ -193,4 +201,29 @@ export interface UserAccount {
   totalScans?: number;
   lastScanAt?: string | null;
 }
+
+export interface WorkerPresence {
+  connectionId: string;
+  userId: string;
+  employeeName: string;
+  employeeCode: string;
+  role: string;
+  activeDeliveryId: string | null;
+  status: 'dashboard' | 'viewing' | 'scanning';
+  connectedAt: string;
+  lastActivityAt: string;
+  lastScanSummary?: string;
+}
+
+export interface DeliveryPresenceSummary {
+  deliveryId: string | null;
+  connectedWorkersCount: number;
+  deliveryWorkersCount?: number;
+  connectedDevicesCount: number;
+  workers: WorkerPresence[];
+  deliveryWorkers?: WorkerPresence[];
+  allConnectedWorkers: WorkerPresence[];
+  timestamp: string;
+}
+
 

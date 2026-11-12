@@ -9,25 +9,36 @@ export interface BackendHealth {
   hasAdmin?: boolean;
   latencyMs?: number;
   lastChecked?: string;
+  lastSyncedAt?: string;
   error?: string;
 }
 
 const TOKEN_KEY = 'pallettrack_token';
 const USER_KEY = 'pallettrack_user';
+const LAST_SYNCED_KEY = 'parttrack_last_synced_at';
 
 let inMemoryToken: string | null = null;
+let inMemoryLastSyncedAt: string | undefined = undefined;
 try {
   inMemoryToken = localStorage.getItem(TOKEN_KEY);
+  inMemoryLastSyncedAt = localStorage.getItem(LAST_SYNCED_KEY) || undefined;
 } catch {
   // fallback for memory-only environments
 }
 
 export function getAuthToken(): string | null {
+  if (!inMemoryToken) {
+    try {
+      inMemoryToken = localStorage.getItem(TOKEN_KEY);
+    } catch {
+      // ignore
+    }
+  }
   return inMemoryToken;
 }
 
 export function getStoredSessionToken(): string | null {
-  return inMemoryToken;
+  return getAuthToken();
 }
 
 export function setAuthToken(token: string | null) {
@@ -64,7 +75,41 @@ export function setStoredUser(user: UserAccount | null) {
   }
 }
 
-let lastKnownHealth: BackendHealth = { connected: true, lastChecked: new Date().toISOString() };
+export function getLastSyncedAt(): string | undefined {
+  if (!inMemoryLastSyncedAt) {
+    try {
+      inMemoryLastSyncedAt = localStorage.getItem(LAST_SYNCED_KEY) || undefined;
+    } catch {
+      // ignore
+    }
+  }
+  return inMemoryLastSyncedAt;
+}
+
+export function markBackendSynced(timestampIso?: string) {
+  const nowIso = timestampIso || new Date().toISOString();
+  inMemoryLastSyncedAt = nowIso;
+  try {
+    localStorage.setItem(LAST_SYNCED_KEY, nowIso);
+  } catch {
+    // ignore
+  }
+  const updatedHealth: BackendHealth = {
+    ...lastKnownHealth,
+    connected: true,
+    dbConnected: true,
+    lastChecked: nowIso,
+    lastSyncedAt: nowIso,
+    error: undefined,
+  };
+  notifyHealthListeners(updatedHealth);
+}
+
+let lastKnownHealth: BackendHealth = {
+  connected: true,
+  lastChecked: new Date().toISOString(),
+  lastSyncedAt: inMemoryLastSyncedAt || new Date().toISOString(),
+};
 const listeners = new Set<(health: BackendHealth) => void>();
 
 export function subscribeToBackendHealth(listener: (health: BackendHealth) => void): () => void {
@@ -97,57 +142,99 @@ function getAuthHeaders(extraHeaders: Record<string, string> = {}): Record<strin
 
 /**
  * Checks connection health to the centralized Cloudflare D1 / Worker backend.
+ * Includes cache-busting and automatic retry on transient timeout/cold-start.
  */
-export async function checkBackendConnection(): Promise<BackendHealth> {
+export async function checkBackendConnection(maxAttempts = 2): Promise<BackendHealth> {
   const start = performance.now();
-  try {
-    const url = resolveApiUrl('/api/health');
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 4000);
+  let lastErrorMsg = 'Network unreachable';
 
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const url = resolveApiUrl('/api/health');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    const latencyMs = Math.round(performance.now() - start);
+      const res = await fetch(url, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+          'Cache-Control': 'no-cache',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-    if (res.ok) {
-      const data: any = await res.json().catch(() => ({}));
-      const health: BackendHealth = {
-        connected: Boolean(data.dbConnected !== false),
-        app: data.app || 'PartTrack',
-        database: data.database || 'Cloudflare D1',
-        dbConnected: data.dbConnected,
-        hasAdmin: data.hasAdmin,
-        latencyMs,
-        lastChecked: new Date().toISOString(),
-      };
-      notifyHealthListeners(health);
-      return health;
-    } else {
-      const health: BackendHealth = {
-        connected: false,
-        latencyMs,
-        lastChecked: new Date().toISOString(),
-        error: `HTTP ${res.status}: Backend unavailable`,
-      };
-      notifyHealthListeners(health);
-      return health;
+      const latencyMs = Math.round(performance.now() - start);
+      const nowIso = new Date().toISOString();
+
+      if (res.ok) {
+        const contentType = res.headers.get('content-type') || '';
+        const rawText = await res.text().catch(() => '');
+        let data: any = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          data = null;
+        }
+
+        if (!data || typeof data !== 'object') {
+          lastErrorMsg = contentType.includes('text/html')
+            ? 'API endpoint returned HTML instead of JSON. Check Cloudflare Worker /api/* routing.'
+            : 'Invalid JSON response from /api/health.';
+        } else {
+          const isConnected = Boolean(data.dbConnected !== false && data.status !== 'degraded');
+          if (isConnected) {
+            inMemoryLastSyncedAt = nowIso;
+            try {
+              localStorage.setItem(LAST_SYNCED_KEY, nowIso);
+            } catch {
+              // ignore
+            }
+          }
+          const health: BackendHealth = {
+            connected: isConnected,
+            app: data.app || 'PartTrack',
+            database: data.database || 'Cloudflare D1',
+            dbConnected: data.dbConnected,
+            hasAdmin: data.hasAdmin,
+            latencyMs,
+            lastChecked: nowIso,
+            lastSyncedAt: isConnected ? nowIso : getLastSyncedAt(),
+            error: isConnected
+              ? undefined
+              : data.error || 'Cloudflare D1 database connection is degraded.',
+          };
+          notifyHealthListeners(health);
+          return health;
+        }
+      } else {
+        const errBody: any = await res.json().catch(() => ({}));
+        lastErrorMsg =
+          errBody?.error || `HTTP ${res.status}: Central D1 backend unavailable`;
+      }
+    } catch (err: any) {
+      const isAbort = err?.name === 'AbortError' || String(err?.message || '').includes('abort');
+      lastErrorMsg = isAbort
+        ? 'Connection timed out waiting for Cloudflare Worker (8s)'
+        : err?.message || 'Network unreachable';
     }
-  } catch (err: any) {
-    const latencyMs = Math.round(performance.now() - start);
-    const health: BackendHealth = {
-      connected: false,
-      latencyMs,
-      lastChecked: new Date().toISOString(),
-      error: err?.message || 'Network unreachable',
-    };
-    notifyHealthListeners(health);
-    return health;
+
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, 350));
+    }
   }
+
+  const latencyMs = Math.round(performance.now() - start);
+  const health: BackendHealth = {
+    connected: false,
+    latencyMs,
+    lastChecked: new Date().toISOString(),
+    lastSyncedAt: getLastSyncedAt(),
+    error: lastErrorMsg,
+  };
+  notifyHealthListeners(health);
+  return health;
 }
 
 export function isBackendOnline(): boolean {
@@ -167,12 +254,15 @@ export async function apiCheckProvisionStatus(): Promise<{
   const url = resolveApiUrl('/api/auth/provision-status');
   const res = await fetch(url, {
     method: 'GET',
+    cache: 'no-store',
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) {
     throw new Error(`Failed to check provision status (HTTP ${res.status})`);
   }
-  return await res.json();
+  const data = await res.json();
+  markBackendSynced();
+  return data;
 }
 
 export async function apiSetupAdmin(data: {
@@ -195,6 +285,7 @@ export async function apiSetupAdmin(data: {
 
   setAuthToken(body.token);
   setStoredUser(body.user);
+  markBackendSynced();
   return body;
 }
 
@@ -219,6 +310,7 @@ export async function apiLogin(
 
   setAuthToken(body.token);
   setStoredUser(body.user);
+  markBackendSynced();
   return body;
 }
 
@@ -241,23 +333,37 @@ export async function apiGetSession(): Promise<{ authenticated: boolean; user: U
   const token = getAuthToken();
   if (!token) {
     setStoredUser(null);
-    throw new Error('No active session');
+    const err: any = new Error('No active session');
+    err.status = 401;
+    throw err;
   }
 
   const url = resolveApiUrl('/api/auth/session');
   const res = await fetch(url, {
     method: 'GET',
+    cache: 'no-store',
     headers: getAuthHeaders({ Accept: 'application/json' }),
   });
 
   if (!res.ok) {
-    setAuthToken(null);
-    setStoredUser(null);
-    throw new Error('Session invalid or expired');
+    if (res.status === 401 || res.status === 403) {
+      setAuthToken(null);
+      setStoredUser(null);
+      const err: any = new Error('Session invalid or expired');
+      err.status = res.status;
+      throw err;
+    }
+    const err: any = new Error(`Session check failed (HTTP ${res.status})`);
+    err.status = res.status;
+    err.isTransient = true;
+    throw err;
   }
 
   const body = await res.json();
-  setStoredUser(body.user);
+  if (body?.user) {
+    setStoredUser(body.user);
+  }
+  markBackendSynced();
   return body;
 }
 
@@ -371,15 +477,21 @@ export async function apiFetchDeliveries(): Promise<Delivery[]> {
   const url = resolveApiUrl('/api/deliveries');
   const res = await fetch(url, {
     method: 'GET',
+    cache: 'no-store',
     headers: getAuthHeaders({ Accept: 'application/json' }),
   });
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Failed to load deliveries from central database (HTTP ${res.status})`);
+    const err: any = new Error(
+      body.error || `Failed to load deliveries from central database (HTTP ${res.status})`
+    );
+    err.status = res.status;
+    throw err;
   }
 
   const deliveries = await res.json();
+  markBackendSynced();
   return deliveries;
 }
 
@@ -528,7 +640,9 @@ export async function apiReceivePart(
     throw new Error(data.error || `Failed to record receiving transaction (HTTP ${res.status})`);
   }
 
-  return await res.json();
+  const result = await res.json();
+  markBackendSynced();
+  return result;
 }
 
 /**
@@ -769,12 +883,16 @@ export async function apiFetchRealtimeEvents(
   const url = resolveApiUrl(`/api/realtime/events?${params.toString()}`);
   const res = await fetch(url, {
     method: 'GET',
+    cache: 'no-store',
     headers: getAuthHeaders({ Accept: 'application/json' }),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body.error || `Failed to fetch real-time events (HTTP ${res.status})`);
+    const err: any = new Error(body.error || `Failed to fetch real-time events (HTTP ${res.status})`);
+    err.status = res.status;
+    throw err;
   }
+  markBackendSynced(body.timestamp);
   return body;
 }
 

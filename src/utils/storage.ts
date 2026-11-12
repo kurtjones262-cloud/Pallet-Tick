@@ -221,7 +221,8 @@ let isSyncingCentralDb = false;
 
 /**
  * Synchronises local deliveries with the centralised Cloudflare D1 / Worker backend.
- * Retains IndexedDB and localStorage as local cache.
+ * Retains IndexedDB and localStorage as local cache and preserves any local-only dockets
+ * and docket photo attachments.
  */
 export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
   if (isSyncingCentralDb || typeof window === 'undefined') return getStoredDeliveries();
@@ -232,37 +233,132 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
       return getStoredDeliveries();
     }
 
-    const centralList = await apiFetchDeliveries();
-    if (Array.isArray(centralList) && centralList.length > 0) {
-      const normalizedList = centralList.map(normalizeDeliveryDocketNumbers);
-      saveStoredDeliveries(normalizedList);
-      const activeId = getActiveDeliveryId();
-      if (!activeId || !normalizedList.some((d) => d.id === activeId)) {
-        setActiveDeliveryId(normalizedList[0].id);
+    const locals = getStoredDeliveries();
+    const localById = new Map<string, Delivery>();
+    const localByDocket = new Map<string, Delivery>();
+    for (const loc of locals) {
+      localById.set(loc.id, loc);
+      if (loc.docketNumber) {
+        localByDocket.set(loc.docketNumber.trim().toLowerCase(), loc);
       }
-      return normalizedList;
-    } else {
-      // If the central database is freshly provisioned and empty,
-      // upload the local working deliveries into the central database.
-      const locals = getStoredDeliveries();
-      if (locals.length > 0) {
-        await apiMigrateDeliveries(locals);
-        const refreshed = await apiFetchDeliveries();
-        if (refreshed.length > 0) {
-          const normalizedRefreshed = refreshed.map(normalizeDeliveryDocketNumbers);
-          saveStoredDeliveries(normalizedRefreshed);
-          return normalizedRefreshed;
+    }
+
+    let centralList = await apiFetchDeliveries();
+
+    // Ensure any locally created deliveries (e.g. uploaded while offline) are migrated to central D1
+    if (locals.length > 0) {
+      const centralIds = new Set((centralList || []).map((d) => d.id));
+      const centralDockets = new Set(
+        (centralList || []).map((d) => (d.docketNumber || '').trim().toLowerCase())
+      );
+      const unmigratedLocals = locals.filter(
+        (loc) =>
+          !centralIds.has(loc.id) &&
+          !centralDockets.has((loc.docketNumber || '').trim().toLowerCase())
+      );
+      if (unmigratedLocals.length > 0) {
+        try {
+          await apiMigrateDeliveries(unmigratedLocals);
+          centralList = await apiFetchDeliveries();
+        } catch (migErr) {
+          console.warn('Local delivery migration notice:', migErr);
         }
       }
     }
-    return getStoredDeliveries();
 
+    if (Array.isArray(centralList) && centralList.length > 0) {
+      const mergedList = centralList.map((centralDel) => {
+        const normalized = normalizeDeliveryDocketNumbers(centralDel);
+        const matchingLocal =
+          localById.get(normalized.id) ||
+          localByDocket.get((normalized.docketNumber || '').trim().toLowerCase());
+        if (!matchingLocal) return normalized;
+
+        return {
+          ...normalized,
+          docketAttachments:
+            normalized.docketAttachments && normalized.docketAttachments.length > 0
+              ? normalized.docketAttachments
+              : matchingLocal.docketAttachments || [],
+          unexpectedParts:
+            normalized.unexpectedParts && normalized.unexpectedParts.length > 0
+              ? normalized.unexpectedParts
+              : matchingLocal.unexpectedParts || [],
+          scanHistory:
+            normalized.scanHistory && normalized.scanHistory.length > 0
+              ? normalized.scanHistory
+              : matchingLocal.scanHistory || [],
+        };
+      });
+
+      // Keep any local deliveries that still haven't been pushed (e.g. if user is unauthenticated)
+      const mergedIds = new Set(mergedList.map((d) => d.id));
+      const mergedDockets = new Set(
+        mergedList.map((d) => (d.docketNumber || '').trim().toLowerCase())
+      );
+      for (const loc of locals) {
+        if (
+          !mergedIds.has(loc.id) &&
+          !mergedDockets.has((loc.docketNumber || '').trim().toLowerCase())
+        ) {
+          mergedList.push(normalizeDeliveryDocketNumbers(loc));
+        }
+      }
+
+      saveStoredDeliveries(mergedList);
+      const activeId = getActiveDeliveryId();
+      if (!activeId || !mergedList.some((d) => d.id === activeId)) {
+        setActiveDeliveryId(mergedList[0].id);
+      }
+      return mergedList;
+    }
+
+    return getStoredDeliveries();
   } catch (err) {
     console.warn('Central database sync notice:', err);
     return getStoredDeliveries();
   } finally {
     isSyncingCentralDb = false;
   }
+}
+
+/**
+ * Full manual/automatic reconnection & live sync workflow triggered by Retry / Sync Now buttons.
+ */
+export async function reconnectAndSyncWithCentralDb(): Promise<{
+  connected: boolean;
+  error?: string;
+}> {
+  const health = await checkBackendConnection(2);
+  if (!health.connected) {
+    return {
+      connected: false,
+      error: health.error || 'Could not reach central Cloudflare D1 database.',
+    };
+  }
+
+  try {
+    await realtimeClient.reconnectNow(getActiveDeliveryId());
+  } catch (e) {
+    console.warn('Realtime reconnect notice:', e);
+  }
+
+  try {
+    await syncDeliveriesFromCentralDatabase();
+  } catch (e) {
+    console.warn('Central DB sync notice:', e);
+  }
+
+  try {
+    await realtimeClient.flushPendingOfflineScans();
+  } catch (e) {
+    console.warn('Offline queue flush notice:', e);
+  }
+
+  return {
+    connected: true,
+    error: realtimeClient.getState().lastError,
+  };
 }
 
 

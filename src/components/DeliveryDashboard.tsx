@@ -40,6 +40,7 @@ import {
   getStoredDeliveries,
   updateDelivery,
   getPartVerificationState,
+  reconnectAndSyncWithCentralDb,
 } from '../utils/storage';
 import { DocketPhotosModal } from './DocketPhotosModal';
 import { PartTrackLogo } from './PartTrackLogo';
@@ -85,14 +86,29 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   );
   const [backendHealth, setBackendHealth] = useState<BackendHealth>({ connected: true });
   const [rtState, setRtState] = useState<RealtimeClientState>(() => realtimeClient.getState());
+  const [isSyncingNow, setIsSyncingNow] = useState(false);
   const [actionsMenuOpen, setActionsMenuOpen] = useState(false);
   const [isDocketPhotosOpen, setIsDocketPhotosOpen] = useState(false);
   const [isExportingPdf, setIsExportingPdf] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
+  const handleManualSync = async () => {
+    if (isSyncingNow) return;
+    setIsSyncingNow(true);
+    try {
+      await reconnectAndSyncWithCentralDb();
+      setAllDeliveries(getStoredDeliveries());
+    } finally {
+      setIsSyncingNow(false);
+    }
+  };
+
   // Monitor network connectivity, real-time WebSocket state, and storage updates
   useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
+    const handleOnline = () => {
+      setIsOnline(true);
+      reconnectAndSyncWithCentralDb().catch(() => {});
+    };
     const handleOffline = () => setIsOnline(false);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -104,10 +120,13 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
 
     const unsubHealth = subscribeToBackendHealth(setBackendHealth);
     const unsubRt = realtimeClient.onStateChange((state, presence) => {
+      const currentRt = realtimeClient.getState();
       setRtState({
         status: state,
         presence,
-        pendingOfflineScansCount: realtimeClient.getOfflineQueue().length,
+        pendingOfflineScansCount: currentRt.pendingOfflineScansCount,
+        lastSyncedAt: currentRt.lastSyncedAt,
+        lastError: currentRt.lastError,
       });
     });
 
@@ -546,8 +565,26 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
 
               <span className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)]">
                 Last Sync:{' '}
-                <strong className="text-white">{formatTimeAgo(delivery?.updatedAt)}</strong>
+                <strong className="text-white">
+                  {formatTimeAgo(
+                    backendHealth.lastSyncedAt ||
+                      rtState.lastSyncedAt ||
+                      backendHealth.lastChecked ||
+                      delivery?.updatedAt
+                  )}
+                </strong>
               </span>
+
+              <button
+                type="button"
+                onClick={handleManualSync}
+                disabled={isSyncingNow}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-[10px] font-mono font-bold text-[var(--pt-primary-light,#C084FC)] hover:text-white transition-colors cursor-pointer"
+                title="Synchronise with central Cloudflare D1 database and reconnect live WebSocket"
+              >
+                <RefreshCw className={`w-3 h-3 ${isSyncingNow ? 'animate-spin' : ''}`} />
+                <span>{isSyncingNow ? 'Syncing...' : !backendHealth.connected ? 'Retry' : 'Sync'}</span>
+              </button>
             </div>
 
             <div className="flex items-center gap-3 text-[11px] text-[var(--pt-text-secondary,#A3A8BD)]">

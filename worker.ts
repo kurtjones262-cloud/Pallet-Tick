@@ -649,7 +649,15 @@ export default {
         serverWs.accept();
 
         const initialDeliveryId = url.searchParams.get('deliveryId') || null;
-        const connId = realtimeBroker.registerClient(serverWs, user, token, initialDeliveryId);
+        const lastSeq = Math.max(0, Number(url.searchParams.get('lastSeq')) || 0);
+        const connId = realtimeBroker.registerClient(
+          serverWs,
+          user,
+          token,
+          initialDeliveryId,
+          lastSeq,
+          env.DB
+        );
 
         serverWs.addEventListener('message', (evt: any) => {
           const text = typeof evt.data === 'string' ? evt.data : String(evt.data || '');
@@ -859,7 +867,15 @@ export class PalletTrackRealtimeHub {
       serverWs.accept();
 
       const initialDeliveryId = url.searchParams.get('deliveryId') || null;
-      const connId = this.broker.registerClient(serverWs, user, token, initialDeliveryId);
+      const lastSeq = Math.max(0, Number(url.searchParams.get('lastSeq')) || 0);
+      const connId = this.broker.registerClient(
+        serverWs,
+        user,
+        token,
+        initialDeliveryId,
+        lastSeq,
+        this.env.DB
+      );
       await this.scheduleHeartbeatAlarmIfNeeded();
 
       serverWs.addEventListener('message', (evt: any) => {

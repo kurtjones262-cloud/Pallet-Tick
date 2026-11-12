@@ -36,6 +36,7 @@ import {
   apiLogout,
   apiCheckProvisionStatus,
   getStoredUser,
+  getAuthToken,
 } from './services/palletTrackApi';
 import { realtimeClient } from './services/realtimeSync';
 import { getStoredTheme, applyThemeToDocument } from './config/theme';
@@ -116,7 +117,20 @@ export function App() {
         if (isMounted) {
           setCurrentUser(session.user);
         }
-      } catch {
+      } catch (err: any) {
+        const isExplicitUnauthorized = err?.status === 401 || err?.status === 403;
+        const cachedUser = getStoredUser();
+        const cachedToken = getAuthToken();
+
+        // If a transient network error or 5xx occurred while the worker already has a cached session,
+        // preserve their session so they are not logged out during brief connectivity drops.
+        if (!isExplicitUnauthorized && cachedUser && cachedToken) {
+          if (isMounted) {
+            setCurrentUser(cachedUser);
+          }
+          return;
+        }
+
         // In development/preview environment, if no active session exists and the user
         // has not explicitly signed out, auto-authenticate the default terminal account
         // so the preview opens directly into the working workspace.

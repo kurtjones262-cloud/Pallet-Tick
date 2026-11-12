@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { WifiOff, RefreshCw, AlertTriangle, X } from 'lucide-react';
-import { checkBackendConnection } from '../services/palletTrackApi.ts';
+import { reconnectAndSyncWithCentralDb } from '../utils/storage.ts';
 
 interface ConnectionRequiredModalProps {
   isOpen: boolean;
@@ -23,12 +23,12 @@ export const ConnectionRequiredModal: React.FC<ConnectionRequiredModalProps> = (
     setIsRetrying(true);
     setRetryError(null);
     try {
-      const health = await checkBackendConnection();
-      if (health.connected) {
+      const res = await reconnectAndSyncWithCentralDb();
+      if (res.connected) {
         if (onConnected) onConnected();
         onDismiss();
       } else {
-        setRetryError(health.error || 'Could not establish connection to the central database.');
+        setRetryError(res.error || 'Could not establish connection to the central database.');
       }
     } catch (e: any) {
       setRetryError(e?.message || 'Network check failed.');

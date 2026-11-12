@@ -248,16 +248,30 @@ export class PalletTrackRealtimeBroker {
       timestamp: nowIso,
     });
 
-    if (db && typeof lastSeq === 'number' && lastSeq > 0) {
-      this.getEventsSince(db, lastSeq, initialDeliveryId || undefined)
-        .then((missedEvents) => {
-          if (missedEvents.length > 0) {
+    if (db) {
+      this.getLatestSequenceNumber(db)
+        .then(async (latestDbSeq) => {
+          if (typeof lastSeq === 'number' && lastSeq > 0 && latestDbSeq > lastSeq) {
+            const missedEvents = await this.getEventsSince(
+              db,
+              lastSeq,
+              initialDeliveryId || undefined
+            );
+            if (missedEvents.length > 0) {
+              this.safeSend(socket, {
+                type: 'sync_catchup',
+                sinceSeq: lastSeq,
+                latestSeq: this.latestSeq,
+                presence: this.getPresenceSummary(initialDeliveryId || null),
+                events: missedEvents,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          } else if (latestDbSeq > 0) {
             this.safeSend(socket, {
-              type: 'sync_catchup',
-              sinceSeq: lastSeq,
-              latestSeq: this.latestSeq,
-              events: missedEvents,
+              type: 'pong',
               timestamp: new Date().toISOString(),
+              latestSeq: latestDbSeq,
             });
           }
         })
@@ -386,10 +400,11 @@ export class PalletTrackRealtimeBroker {
 
     switch (msg.type) {
       case 'ping': {
+        const latestSeq = db ? await this.getLatestSequenceNumber(db) : this.latestSeq;
         this.safeSend(client.socket, {
           type: 'pong',
           timestamp: new Date().toISOString(),
-          latestSeq: this.latestSeq,
+          latestSeq,
         });
         break;
       }

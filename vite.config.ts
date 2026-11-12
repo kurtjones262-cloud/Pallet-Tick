@@ -69,7 +69,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          cacheId: 'parttrack-pwa-v4',
+          cacheId: 'parttrack-pwa-v5',
           cleanupOutdatedCaches: true,
           clientsClaim: true,
           skipWaiting: true,

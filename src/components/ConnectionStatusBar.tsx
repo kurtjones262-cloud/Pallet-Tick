@@ -5,12 +5,17 @@ import {
   checkBackendConnection,
   BackendHealth,
   getStoredUser,
+  getStoredSessionToken,
 } from '../services/palletTrackApi.ts';
 import {
   realtimeClient,
   RealtimeClientState,
   RealtimeSyncEvent,
 } from '../services/realtimeSync.ts';
+import {
+  reconnectAndSyncWithCentralDb,
+  getActiveDeliveryId,
+} from '../utils/storage.ts';
 import { WorkerPresence } from '../types/delivery.ts';
 
 interface LiveActivityNotice {
@@ -24,6 +29,7 @@ interface LiveActivityNotice {
 export const ConnectionStatusBar: React.FC = () => {
   const [health, setHealth] = useState<BackendHealth>({ connected: true });
   const [isChecking, setIsChecking] = useState(false);
+  const [retryDiagnostic, setRetryDiagnostic] = useState<string | null>(null);
   const [rtState, setRtState] = useState<RealtimeClientState>(() => realtimeClient.getState());
   const [liveNotice, setLiveNotice] = useState<LiveActivityNotice | null>(null);
 
@@ -34,12 +40,26 @@ export const ConnectionStatusBar: React.FC = () => {
       checkBackendConnection().catch(() => {});
     }, 10000);
 
-    const unsubscribeHealth = subscribeToBackendHealth(setHealth);
+    const unsubscribeHealth = subscribeToBackendHealth((nextHealth) => {
+      setHealth(nextHealth);
+      if (nextHealth.connected) {
+        setRetryDiagnostic(null);
+        if (
+          realtimeClient.getConnectionState() === 'disconnected' &&
+          getStoredSessionToken()
+        ) {
+          realtimeClient.start(getActiveDeliveryId());
+        }
+      }
+    });
     const unsubscribeRtState = realtimeClient.onStateChange((state, presence) => {
+      const currentRt = realtimeClient.getState();
       setRtState({
         status: state,
         presence,
-        pendingOfflineScansCount: realtimeClient.getOfflineQueue().length,
+        pendingOfflineScansCount: currentRt.pendingOfflineScansCount,
+        lastSyncedAt: currentRt.lastSyncedAt,
+        lastError: currentRt.lastError,
       });
     });
 
@@ -102,10 +122,10 @@ export const ConnectionStatusBar: React.FC = () => {
     });
 
     const handleWindowOnline = () => {
-      checkBackendConnection().catch(() => {});
+      reconnectAndSyncWithCentralDb().catch(() => {});
     };
     const handleWindowOffline = () => {
-      setHealth({ connected: false, error: 'Device is offline' });
+      setHealth({ connected: false, error: 'Device network is offline' });
     };
 
     window.addEventListener('online', handleWindowOnline);
@@ -131,15 +151,23 @@ export const ConnectionStatusBar: React.FC = () => {
 
   const handleRetry = async () => {
     setIsChecking(true);
+    setRetryDiagnostic(null);
     try {
-      await checkBackendConnection();
-      realtimeClient.flushPendingOfflineScans().catch(() => {});
+      const result = await reconnectAndSyncWithCentralDb();
+      if (!result.connected) {
+        setRetryDiagnostic(result.error || 'Connection attempt failed.');
+      } else if (result.error) {
+        setRetryDiagnostic(result.error);
+      }
+    } catch (err: any) {
+      setRetryDiagnostic(err?.message || 'Unable to reach server.');
     } finally {
       setIsChecking(false);
     }
   };
 
   if (!health.connected) {
+    const diagnosticDetail = retryDiagnostic || health.error;
     return (
       <div
         role="alert"
@@ -155,6 +183,8 @@ export const ConnectionStatusBar: React.FC = () => {
               Receiving paused.
               {rtState.pendingOfflineScansCount > 0
                 ? ` (${rtState.pendingOfflineScansCount} scan pending server verification)`
+                : diagnosticDetail
+                ? ` ${diagnosticDetail}`
                 : ' Reconnect to sync with central D1 database.'}
             </span>
           </div>
@@ -165,7 +195,7 @@ export const ConnectionStatusBar: React.FC = () => {
           className="ml-3 shrink-0 flex items-center gap-1 px-2.5 py-1 bg-[#F59E0B]/25 hover:bg-[#F59E0B]/40 border border-[#F59E0B]/50 rounded-lg text-amber-200 font-mono font-bold tracking-wide transition-colors cursor-pointer"
         >
           <RefreshCw className={`w-3 h-3 ${isChecking ? 'animate-spin' : ''}`} />
-          <span>{isChecking ? 'Checking...' : 'Retry'}</span>
+          <span>{isChecking ? 'Reconnecting...' : 'Retry'}</span>
         </button>
       </div>
     );
@@ -181,6 +211,9 @@ export const ConnectionStatusBar: React.FC = () => {
     (w: WorkerPresence) => w.status === 'scanning'
   );
   const totalOnlineCount = Math.max(1, presence?.connectedWorkersCount || 1);
+  const isRealtimeConnecting =
+    rtState.status === 'reconnecting' || rtState.status === 'connecting';
+  const hasSyncWarning = rtState.status === 'disconnected' && Boolean(rtState.lastError);
 
   return (
     <div className="bg-[var(--pt-bg-secondary,#101321)] text-white border-b border-[var(--pt-border,#29243D)] px-3 sm:px-6 py-1.5 text-[11px] flex items-center justify-between gap-2 z-20 shrink-0">
@@ -190,20 +223,32 @@ export const ConnectionStatusBar: React.FC = () => {
           <div className="flex items-center gap-1.5 font-mono">
             <span
               className={`w-2 h-2 rounded-full ${
-                rtState.status === 'connected'
-                  ? 'bg-[#00D979] shadow-[0_0_8px_#00D979]'
-                  : rtState.status === 'reconnecting' || rtState.status === 'connecting'
+                hasSyncWarning
+                  ? 'bg-[#EF4444]'
+                  : isRealtimeConnecting
                   ? 'bg-[#F59E0B] animate-ping'
-                  : 'bg-slate-500'
+                  : 'bg-[#00D979] shadow-[0_0_8px_#00D979]'
               }`}
             />
             <span className="text-[10px] uppercase tracking-wider font-bold text-white">
-              {rtState.status === 'connected'
-                ? 'ONLINE • SYNCED'
-                : rtState.status === 'reconnecting' || rtState.status === 'connecting'
+              {hasSyncWarning
+                ? 'SYNC ERROR'
+                : isRealtimeConnecting
                 ? 'CONNECTING'
-                : 'SYNC ERROR'}
+                : 'ONLINE • SYNCED'}
             </span>
+            {hasSyncWarning && (
+              <button
+                type="button"
+                onClick={handleRetry}
+                disabled={isChecking}
+                className="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[9px] text-white font-mono cursor-pointer"
+                title={rtState.lastError || 'Reconnect live sync'}
+              >
+                <RefreshCw className={`w-2.5 h-2.5 ${isChecking ? 'animate-spin' : ''}`} />
+                <span>Retry</span>
+              </button>
+            )}
           </div>
 
           {/* Connected Workers Count */}

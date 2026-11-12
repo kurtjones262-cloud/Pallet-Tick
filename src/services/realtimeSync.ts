@@ -2,7 +2,10 @@ import {
   getStoredSessionToken,
   apiReceivePart,
   apiFetchRealtimeEvents,
+  markBackendSynced,
+  getLastSyncedAt,
 } from './palletTrackApi';
+import { resolveApiUrl } from '../utils/apiConfig';
 import { DeliveryPresenceSummary, ScanMethod } from '../types/delivery';
 
 export type RealtimeConnectionState =
@@ -47,6 +50,8 @@ export interface RealtimeClientState {
   status: RealtimeConnectionState;
   presence: DeliveryPresenceSummary;
   pendingOfflineScansCount: number;
+  lastSyncedAt?: string;
+  lastError?: string;
 }
 
 export interface QueuedOfflineScan {
@@ -80,6 +85,8 @@ class PalletTrackRealtimeClient {
   private fallbackPollTimer: ReturnType<typeof setInterval> | null = null;
   private manuallyStopped = false;
   private isFlushingOfflineQueue = false;
+  private lastSyncedAt: string | undefined = getLastSyncedAt();
+  private lastError: string | undefined = undefined;
 
   private presenceSummary: DeliveryPresenceSummary = {
     deliveryId: null,
@@ -151,6 +158,53 @@ class PalletTrackRealtimeClient {
     this.startFallbackCatchUpLoop();
   }
 
+  /**
+   * Forces an immediate WebSocket reconnection, HTTP catch-up sync, and offline scan queue flush.
+   */
+  public async reconnectNow(deliveryId?: string | null): Promise<void> {
+    if (deliveryId !== undefined) {
+      this.activeDeliveryId = deliveryId;
+    }
+    const token = getStoredSessionToken();
+    if (!token) {
+      this.lastError = 'Authentication session required for live sync';
+      this.setConnectionState('disconnected');
+      return;
+    }
+
+    this.manuallyStopped = false;
+    this.lastError = undefined;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (this.ws) {
+        try {
+          this.ws.onclose = null;
+          this.ws.onerror = null;
+          this.ws.onmessage = null;
+          this.ws.close(1000, 'Reconnecting now');
+        } catch {
+          // Ignore
+        }
+        this.ws = null;
+      }
+      this.connectWebSocket();
+    } else {
+      if (this.activeDeliveryId) {
+        this.joinDeliveryRoom(this.activeDeliveryId, this.workerStatus);
+      }
+      this.requestCatchUpSync();
+    }
+
+    this.startFallbackCatchUpLoop();
+    await this.fetchCatchUpHttp();
+    await this.flushOfflineScanQueue().catch(() => {});
+  }
+
   public stop() {
     this.manuallyStopped = true;
     if (this.reconnectTimer) {
@@ -185,6 +239,8 @@ class PalletTrackRealtimeClient {
       status: this.connectionState,
       presence: this.presenceSummary,
       pendingOfflineScansCount: this.getOfflineQueue().length,
+      lastSyncedAt: this.lastSyncedAt || getLastSyncedAt(),
+      lastError: this.lastError,
     };
   }
 
@@ -397,6 +453,24 @@ class PalletTrackRealtimeClient {
   // Internal WebSocket Connection & Catch-Up Synchronisation
   // =========================================================================
 
+  private buildWebSocketUrl(token: string): string {
+    const params = new URLSearchParams({
+      token,
+      lastSeq: String(Math.max(0, this.lastSequenceNumber || 0)),
+    });
+    if (this.activeDeliveryId) {
+      params.set('deliveryId', this.activeDeliveryId);
+    }
+
+    const resolvedHttp = resolveApiUrl(`/api/realtime/ws?${params.toString()}`);
+    if (/^https?:\/\//i.test(resolvedHttp)) {
+      return resolvedHttp.replace(/^http/i, 'ws');
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}${resolvedHttp}`;
+  }
+
   private connectWebSocket() {
     if (this.manuallyStopped) return;
     const token = getStoredSessionToken();
@@ -416,12 +490,7 @@ class PalletTrackRealtimeClient {
     );
 
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const params = new URLSearchParams({ token });
-      if (this.activeDeliveryId) {
-        params.set('deliveryId', this.activeDeliveryId);
-      }
-      const wsUrl = `${protocol}//${window.location.host}/api/realtime/ws?${params.toString()}`;
+      const wsUrl = this.buildWebSocketUrl(token);
       const socket = new WebSocket(wsUrl);
       this.ws = socket;
 
@@ -429,6 +498,10 @@ class PalletTrackRealtimeClient {
         if (this.ws !== socket) return;
         const wasReconnect = this.reconnectAttempts > 0 || this.lastSequenceNumber > 0;
         this.reconnectAttempts = 0;
+        this.lastError = undefined;
+        const nowIso = new Date().toISOString();
+        this.lastSyncedAt = nowIso;
+        markBackendSynced(nowIso);
         this.setConnectionState('connected');
         this.startPingLoop();
 
@@ -457,6 +530,7 @@ class PalletTrackRealtimeClient {
         this.stopPingLoop();
 
         if (evt.code === 4001 || evt.code === 4003) {
+          this.lastError = evt.reason || 'Session expired or revoked';
           this.setConnectionState('disconnected');
           this.authRevokedListeners.forEach((cb) =>
             cb(evt.reason || 'Session expired or revoked')
@@ -477,7 +551,8 @@ class PalletTrackRealtimeClient {
       socket.onerror = () => {
         // onclose will handle reconnection
       };
-    } catch {
+    } catch (err: any) {
+      this.lastError = err?.message || 'WebSocket connection error';
       this.scheduleReconnect();
     }
   }
@@ -491,8 +566,13 @@ class PalletTrackRealtimeClient {
     }
     if (!data || typeof data.type !== 'string') return;
 
+    const nowIso = new Date().toISOString();
+    this.lastSyncedAt = nowIso;
+
     switch (data.type) {
       case 'connected': {
+        this.lastError = undefined;
+        markBackendSynced(data.timestamp || nowIso);
         if (typeof data.latestSeq === 'number' && this.lastSequenceNumber === 0) {
           this.lastSequenceNumber = data.latestSeq;
         }
@@ -504,7 +584,7 @@ class PalletTrackRealtimeClient {
       }
 
       case 'ping': {
-        this.sendJson({ type: 'pong', timestamp: new Date().toISOString() });
+        this.sendJson({ type: 'pong', timestamp: nowIso });
         if (
           typeof data.latestSeq === 'number' &&
           data.latestSeq > this.lastSequenceNumber
@@ -526,6 +606,7 @@ class PalletTrackRealtimeClient {
 
       case 'auth_error':
       case 'auth_revoked': {
+        this.lastError = data.reason || data.error || 'Session revoked';
         this.stop();
         this.authRevokedListeners.forEach((cb) =>
           cb(data.reason || data.error || 'Session revoked')
@@ -533,7 +614,9 @@ class PalletTrackRealtimeClient {
         break;
       }
 
+      case 'sync_catchup':
       case 'sync_response': {
+        markBackendSynced(data.timestamp || nowIso);
         if (data.presence) {
           this.presenceSummary = data.presence;
           this.notifyStateListeners();
@@ -553,6 +636,7 @@ class PalletTrackRealtimeClient {
       }
 
       case 'event': {
+        markBackendSynced(data.event?.timestamp || nowIso);
         if (data.event) {
           this.dispatchIncomingEvent(data.event);
         }
@@ -624,6 +708,10 @@ class PalletTrackRealtimeClient {
         this.lastSequenceNumber,
         this.activeDeliveryId
       );
+      const nowIso = res.timestamp || new Date().toISOString();
+      this.lastSyncedAt = nowIso;
+      this.lastError = undefined;
+      markBackendSynced(nowIso);
       if (res.presence) {
         this.presenceSummary = res.presence;
         this.notifyStateListeners();
@@ -639,8 +727,10 @@ class PalletTrackRealtimeClient {
       if (typeof res.latestSeq === 'number' && res.latestSeq > this.lastSequenceNumber) {
         this.lastSequenceNumber = res.latestSeq;
       }
-    } catch {
-      // Ignore transient HTTP catch-up failure
+    } catch (err: any) {
+      if (err?.status === 401 || err?.status === 403) {
+        this.lastError = 'Session expired. Please sign in again.';
+      }
     }
   }
 
@@ -669,7 +759,7 @@ class PalletTrackRealtimeClient {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.sendJson({ type: 'ping', timestamp: new Date().toISOString() });
       }
-    }, 15000);
+    }, 10000);
   }
 
   private stopPingLoop() {
@@ -685,6 +775,9 @@ class PalletTrackRealtimeClient {
       if (this.manuallyStopped || !getStoredSessionToken()) return;
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         this.fetchCatchUpHttp().catch(() => {});
+        if (!this.reconnectTimer && this.connectionState !== 'connecting') {
+          this.scheduleReconnect();
+        }
       }
     }, 4000);
   }

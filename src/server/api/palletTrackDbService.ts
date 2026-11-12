@@ -1990,8 +1990,8 @@ export class PalletTrackDbService {
 
   /**
    * Ensures all required D1 tables and columns exist on the connected database.
-   * Uses a per-database in-flight Promise mutex so concurrent requests await the same
-   * initialization and never race or conflict with Wrangler migrations.
+   * Uses a per-database in-flight Promise mutex and a single-query fast probe so
+   * Cloudflare Workers never exceeds subrequest limits or times out on cold starts.
    */
   async ensureSchemaReady(): Promise<void> {
     if (PalletTrackDbService.verifiedDbs.has(this.db)) return;
@@ -2011,20 +2011,15 @@ export class PalletTrackDbService {
   private async runSchemaBootstrap(): Promise<void> {
     try {
       await this.db
-        .prepare('SELECT id, employee_code, role, active FROM users LIMIT 1')
-        .first();
-      await this.db.prepare('SELECT id FROM sessions LIMIT 1').first();
-      await this.db
-        .prepare('SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1')
-        .first();
-      await this.db
-        .prepare('SELECT id, version FROM deliveries LIMIT 1')
-        .first();
-      await this.db
-        .prepare('SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1')
-        .first();
-      await this.db
-        .prepare('SELECT seq, id FROM realtime_events LIMIT 1')
+        .prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM (SELECT id, employee_code, role, active FROM users LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id FROM sessions LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, version FROM deliveries LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT seq, id FROM realtime_events LIMIT 1)) AS schema_ready`
+        )
         .first();
       PalletTrackDbService.verifiedDbs.add(this.db);
       return;
@@ -2152,42 +2147,74 @@ export class PalletTrackDbService {
       )`,
     ];
 
-    for (const sql of createStatements) {
-      try {
-        await this.db.prepare(sql).run();
-      } catch (e) {
-        console.warn('Schema bootstrap table notice:', e);
+    try {
+      await this.db.batch(createStatements.map((sql) => this.db.prepare(sql)));
+    } catch {
+      for (const sql of createStatements) {
+        try {
+          await this.db.prepare(sql).run();
+        } catch (e) {
+          console.warn('Schema bootstrap table notice:', e);
+        }
       }
     }
 
-    const alterCols = [
-      'ALTER TABLE users ADD COLUMN employee_code TEXT',
-      'ALTER TABLE users ADD COLUMN pin_salt TEXT',
-      'ALTER TABLE users ADD COLUMN last_login_at TEXT',
-      'ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE users ADD COLUMN locked_until TEXT',
-      'ALTER TABLE users ADD COLUMN created_by TEXT',
-      'ALTER TABLE scan_events ADD COLUMN employee_name TEXT',
-      'ALTER TABLE scan_events ADD COLUMN employee_role TEXT',
-      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
-      'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT',
-      'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER',
-      'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1',
-      'ALTER TABLE delivery_parts ADD COLUMN revision TEXT',
-      'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT',
-      'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT',
-      'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT',
-      'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1',
-      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT',
-      'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT',
+    const alterCols: Array<{ table: string; col: string; sql: string }> = [
+      { table: 'users', col: 'employee_code', sql: 'ALTER TABLE users ADD COLUMN employee_code TEXT' },
+      { table: 'users', col: 'pin_salt', sql: 'ALTER TABLE users ADD COLUMN pin_salt TEXT' },
+      { table: 'users', col: 'last_login_at', sql: 'ALTER TABLE users ADD COLUMN last_login_at TEXT' },
+      { table: 'users', col: 'failed_login_attempts', sql: 'ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0' },
+      { table: 'users', col: 'locked_until', sql: 'ALTER TABLE users ADD COLUMN locked_until TEXT' },
+      { table: 'users', col: 'created_by', sql: 'ALTER TABLE users ADD COLUMN created_by TEXT' },
+      { table: 'scan_events', col: 'employee_name', sql: 'ALTER TABLE scan_events ADD COLUMN employee_name TEXT' },
+      { table: 'scan_events', col: 'employee_role', sql: 'ALTER TABLE scan_events ADD COLUMN employee_role TEXT' },
+      { table: 'scan_events', col: 'event_action', sql: "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'" },
+      { table: 'scan_events', col: 'idempotency_key', sql: 'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT' },
+      { table: 'scan_events', col: 'sequence_number', sql: 'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER' },
+      { table: 'deliveries', col: 'version', sql: 'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+      { table: 'delivery_parts', col: 'revision', sql: 'ALTER TABLE delivery_parts ADD COLUMN revision TEXT' },
+      { table: 'delivery_parts', col: 'manually_edited', sql: 'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0' },
+      { table: 'delivery_parts', col: 'original_ocr_values', sql: 'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT' },
+      { table: 'delivery_parts', col: 'last_edited_by', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT' },
+      { table: 'delivery_parts', col: 'last_edited_at', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT' },
+      { table: 'delivery_parts', col: 'version', sql: 'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+      { table: 'delivery_parts', col: 'last_scanned_by_id', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT' },
+      { table: 'delivery_parts', col: 'last_scanned_by_name', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT' },
     ];
 
-    for (const sql of alterCols) {
-      try {
-        await this.db.prepare(sql).run();
-      } catch {
-        // Column already exists
+    try {
+      const pragmaBatch = await this.db.batch<{ name: string }>([
+        this.db.prepare('PRAGMA table_info(users)'),
+        this.db.prepare('PRAGMA table_info(scan_events)'),
+        this.db.prepare('PRAGMA table_info(deliveries)'),
+        this.db.prepare('PRAGMA table_info(delivery_parts)'),
+      ]);
+      const existingByTable: Record<string, Set<string>> = {
+        users: new Set((pragmaBatch[0]?.results || []).map((r) => r.name)),
+        scan_events: new Set((pragmaBatch[1]?.results || []).map((r) => r.name)),
+        deliveries: new Set((pragmaBatch[2]?.results || []).map((r) => r.name)),
+        delivery_parts: new Set((pragmaBatch[3]?.results || []).map((r) => r.name)),
+      };
+      const missingAlters = alterCols.filter(
+        (item) =>
+          existingByTable[item.table] &&
+          existingByTable[item.table].size > 0 &&
+          !existingByTable[item.table].has(item.col)
+      );
+      for (const item of missingAlters) {
+        try {
+          await this.db.prepare(item.sql).run();
+        } catch {
+          // Column already exists
+        }
+      }
+    } catch {
+      for (const item of alterCols) {
+        try {
+          await this.db.prepare(item.sql).run();
+        } catch {
+          // Column already exists
+        }
       }
     }
 
@@ -2213,11 +2240,15 @@ export class PalletTrackDbService {
       'CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)',
     ];
 
-    for (const sql of indexStatements) {
-      try {
-        await this.db.prepare(sql).run();
-      } catch {
-        // Ignore index notice
+    try {
+      await this.db.batch(indexStatements.map((sql) => this.db.prepare(sql)));
+    } catch {
+      for (const sql of indexStatements) {
+        try {
+          await this.db.prepare(sql).run();
+        } catch {
+          // Ignore index notice
+        }
       }
     }
 

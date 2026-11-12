@@ -37,9 +37,15 @@ import {
   apiCheckProvisionStatus,
   getStoredUser,
   getAuthToken,
+  setAuthToken,
+  setStoredUser,
 } from './services/palletTrackApi';
 import { realtimeClient } from './services/realtimeSync';
-import { getStoredTheme, applyThemeToDocument } from './config/theme';
+import {
+  getStoredTheme,
+  getStoredThemeMode,
+  applyThemeToDocument,
+} from './config/theme';
 
 export function App() {
   // Phase 2 Multi-User & RBAC State
@@ -73,10 +79,12 @@ export function App() {
   const [initError, setInitError] = useState<string | null>(null);
   const [showSplash, setShowSplash] = useState(true);
 
-  // Apply stored PartTrack theme immediately and when user changes
+  // Apply stored PartTrack colour theme + Dark/Light mode immediately and whenever the active user changes
   useEffect(() => {
-    const themeId = getStoredTheme(currentUser?.id || currentUser?.employeeCode);
-    applyThemeToDocument(themeId);
+    const userKey = currentUser?.id || currentUser?.employeeCode || null;
+    const themeId = getStoredTheme(userKey);
+    const mode = getStoredThemeMode(userKey);
+    applyThemeToDocument(themeId, mode);
   }, [currentUser]);
 
   const reloadDelivery = useCallback(() => {
@@ -193,6 +201,8 @@ export function App() {
 
     const unsubAuthRevoked = realtimeClient.onAuthRevoked(() => {
       realtimeClient.stop();
+      setAuthToken(null);
+      setStoredUser(null);
       setCurrentUser(null);
       setActiveTab('dashboard');
     });

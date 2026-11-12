@@ -194,7 +194,7 @@ export function saveStoredSettings(settings: AppSettings): void {
 }
 
 export function getStoredDeliveries(): Delivery[] {
-  if (typeof window === 'undefined') return [];
+  if (typeof localStorage === 'undefined') return [];
   try {
     const raw = localStorage.getItem(DELIVERIES_KEY);
     if (!raw) {
@@ -221,16 +221,23 @@ let isSyncingCentralDb = false;
 
 /**
  * Synchronises local deliveries with the centralised Cloudflare D1 / Worker backend.
- * Retains IndexedDB and localStorage as local cache and preserves any local-only dockets
- * and docket photo attachments.
+ * Retains IndexedDB and localStorage as local cache, flushes pending offline scans first,
+ * preserves newer local versions, preserves docket photo attachments, and prevents duplicates.
  */
 export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
-  if (isSyncingCentralDb || typeof window === 'undefined') return getStoredDeliveries();
+  if (isSyncingCentralDb || typeof localStorage === 'undefined') return getStoredDeliveries();
   isSyncingCentralDb = true;
   try {
     const health = await checkBackendConnection();
     if (!health.connected) {
       return getStoredDeliveries();
+    }
+
+    // 1. Flush any pending offline scans first so central D1 has all queued scans
+    try {
+      await realtimeClient.flushOfflineScanQueue();
+    } catch {
+      // Ignore flush notice
     }
 
     const locals = getStoredDeliveries();
@@ -245,7 +252,7 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
 
     let centralList = await apiFetchDeliveries();
 
-    // Ensure any locally created deliveries (e.g. uploaded while offline) are migrated to central D1
+    // 2. Ensure any locally created deliveries (e.g. uploaded while offline) are migrated to central D1
     if (locals.length > 0) {
       const centralIds = new Set((centralList || []).map((d) => d.id));
       const centralDockets = new Set(
@@ -267,15 +274,95 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
     }
 
     if (Array.isArray(centralList) && centralList.length > 0) {
-      const mergedList = centralList.map((centralDel) => {
+      const seenMergedIds = new Set<string>();
+      const seenMergedDockets = new Set<string>();
+      const mergedList: Delivery[] = [];
+
+      for (const centralDel of centralList) {
         const normalized = normalizeDeliveryDocketNumbers(centralDel);
+        const normDocket = (normalized.docketNumber || '').trim().toLowerCase();
+        if (seenMergedIds.has(normalized.id) || (normDocket && seenMergedDockets.has(normDocket))) {
+          continue;
+        }
+        seenMergedIds.add(normalized.id);
+        if (normDocket) seenMergedDockets.add(normDocket);
+
         const matchingLocal =
           localById.get(normalized.id) ||
-          localByDocket.get((normalized.docketNumber || '').trim().toLowerCase());
-        if (!matchingLocal) return normalized;
+          (normDocket ? localByDocket.get(normDocket) : undefined);
 
-        return {
-          ...normalized,
+        if (!matchingLocal) {
+          mergedList.push(normalized);
+          continue;
+        }
+
+        const localVersion = Number(matchingLocal.version) || 1;
+        const centralVersion = Number(normalized.version) || 1;
+        const localTime = Date.parse(matchingLocal.updatedAt || matchingLocal.createdAt || '') || 0;
+        const centralTime = Date.parse(normalized.updatedAt || normalized.createdAt || '') || 0;
+        const localIsNewer =
+          localVersion > centralVersion ||
+          (localVersion === centralVersion && localTime > centralTime);
+
+        // Merge parts: preserve newer part versions or pendingSync flags
+        const localPartsById = new Map(matchingLocal.parts.map((p) => [p.id, p]));
+        const localPartsByKey = new Map(
+          matchingLocal.parts.map((p) => [
+            `${(p.itemNumber || '').trim()}__${(p.partNumber || '').trim().toUpperCase()}`,
+            p,
+          ])
+        );
+
+        const mergedParts = normalized.parts.map((cPart) => {
+          const lPart =
+            localPartsById.get(cPart.id) ||
+            localPartsByKey.get(
+              `${(cPart.itemNumber || '').trim()}__${(cPart.partNumber || '').trim().toUpperCase()}`
+            );
+          if (!lPart) return cPart;
+
+          const lPartVer = Number(lPart.version) || 1;
+          const cPartVer = Number(cPart.version) || 1;
+          if (cPart.status === 'received') {
+            return { ...cPart, pendingSync: false };
+          }
+          if (lPart.pendingSync) {
+            return lPart;
+          }
+          if (lPartVer > cPartVer || (lPart.status === 'received' && localIsNewer)) {
+            return lPart;
+          }
+          return cPart;
+        });
+
+        // Preserve any locally added parts that have not yet appeared in central
+        const centralPartIds = new Set(mergedParts.map((p) => p.id));
+        for (const lPart of matchingLocal.parts) {
+          if (!centralPartIds.has(lPart.id) && (lPart.manuallyEdited || lPart.pendingSync)) {
+            mergedParts.push(lPart);
+          }
+        }
+
+        // Merge scanHistory without duplicates
+        const historyMap = new Map<string, any>();
+        for (const ev of normalized.scanHistory || []) {
+          if (ev?.id) historyMap.set(ev.id, ev);
+        }
+        for (const ev of matchingLocal.scanHistory || []) {
+          if (ev?.id && !historyMap.has(ev.id)) {
+            historyMap.set(ev.id, ev);
+          }
+        }
+        const mergedScanHistory = Array.from(historyMap.values()).sort(
+          (a, b) => (Date.parse(b.timestamp || '') || 0) - (Date.parse(a.timestamp || '') || 0)
+        );
+
+        mergedList.push({
+          ...(localIsNewer ? matchingLocal : normalized),
+          id: normalized.id,
+          version: Math.max(localVersion, centralVersion),
+          updatedAt: localTime > centralTime ? matchingLocal.updatedAt : normalized.updatedAt,
+          parts: mergedParts,
           docketAttachments:
             normalized.docketAttachments && normalized.docketAttachments.length > 0
               ? normalized.docketAttachments
@@ -284,23 +371,19 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
             normalized.unexpectedParts && normalized.unexpectedParts.length > 0
               ? normalized.unexpectedParts
               : matchingLocal.unexpectedParts || [],
-          scanHistory:
-            normalized.scanHistory && normalized.scanHistory.length > 0
-              ? normalized.scanHistory
-              : matchingLocal.scanHistory || [],
-        };
-      });
+          scanHistory: mergedScanHistory,
+        });
+      }
 
       // Keep any local deliveries that still haven't been pushed (e.g. if user is unauthenticated)
-      const mergedIds = new Set(mergedList.map((d) => d.id));
-      const mergedDockets = new Set(
-        mergedList.map((d) => (d.docketNumber || '').trim().toLowerCase())
-      );
       for (const loc of locals) {
+        const locDocket = (loc.docketNumber || '').trim().toLowerCase();
         if (
-          !mergedIds.has(loc.id) &&
-          !mergedDockets.has((loc.docketNumber || '').trim().toLowerCase())
+          !seenMergedIds.has(loc.id) &&
+          (!locDocket || !seenMergedDockets.has(locDocket))
         ) {
+          seenMergedIds.add(loc.id);
+          if (locDocket) seenMergedDockets.add(locDocket);
           mergedList.push(normalizeDeliveryDocketNumbers(loc));
         }
       }
@@ -463,7 +546,7 @@ export function clearAllDeliveries(): void {
 }
 
 export function saveStoredDeliveries(deliveries: Delivery[]): void {
-  if (typeof window === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(DELIVERIES_KEY, JSON.stringify(deliveries));
   } catch (quotaErr) {
@@ -494,15 +577,19 @@ export function saveStoredDeliveries(deliveries: Delivery[]): void {
     }
   }
   try {
-    deliveries.forEach((d) => saveDeliveryToIndexedDb(d).catch(console.error));
-    window.dispatchEvent(new CustomEvent('parttrack_deliveries_updated'));
+    if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
+      deliveries.forEach((d) => saveDeliveryToIndexedDb(d).catch(console.error));
+    }
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('parttrack_deliveries_updated'));
+    }
   } catch (e) {
     console.error('Failed to dispatch delivery update:', e);
   }
 }
 
 export function getActiveDeliveryId(): string | null {
-  if (typeof window === 'undefined') return null;
+  if (typeof localStorage === 'undefined') return null;
   try {
     return localStorage.getItem(ACTIVE_DELIVERY_KEY);
   } catch {
@@ -511,10 +598,12 @@ export function getActiveDeliveryId(): string | null {
 }
 
 export function setActiveDeliveryId(id: string): void {
-  if (typeof window === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(ACTIVE_DELIVERY_KEY, id);
-    window.dispatchEvent(new CustomEvent('parttrack_active_delivery_changed', { detail: id }));
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('parttrack_active_delivery_changed', { detail: id }));
+    }
   } catch {}
 }
 
@@ -1812,6 +1901,15 @@ export async function commitScanPartAuthoritative(
       ...delivery,
       parts: updatedParts,
     };
+
+    saveStoredDeliveries(
+      getStoredDeliveries().map((d) =>
+        d.id === updatedDelivery.id ? updatedDelivery : d
+      )
+    );
+    if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
+      saveDeliveryToIndexedDb(updatedDelivery).catch(() => {});
+    }
 
     return {
       outcome: 'pending_sync',

@@ -634,6 +634,23 @@ export async function handlePalletTrackApiRequest(
           }
           return jsonResponse(updated);
         }
+
+        // DELETE /api/deliveries/:id
+        if (method === 'DELETE') {
+          if (isEmployeeRole(currentUser.role)) {
+            return errorResponse(
+              'Forbidden: Employees cannot delete deliveries.',
+              403,
+              'FORBIDDEN'
+            );
+          }
+
+          const deleted = await service.deleteDelivery(deliveryId);
+          if (!deleted) {
+            return errorResponse(`Delivery not found: ${deliveryId}`, 404, 'NOT_FOUND');
+          }
+          return jsonResponse({ success: true, id: deliveryId });
+        }
       }
 
       // GET /api/deliveries/:id/parts

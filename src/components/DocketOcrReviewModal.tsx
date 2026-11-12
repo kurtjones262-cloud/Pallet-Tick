@@ -437,8 +437,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-0 sm:p-4">
-      <div className="w-full max-w-6xl h-[100dvh] sm:h-[92vh] bg-[#F6F5F2] sm:border border-[#E4E3DE] sm:rounded-[6px] shadow-2xl flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-0 sm:p-4">
+      <div className="pt-themed-modal w-full max-w-6xl h-[100dvh] sm:h-[92vh] bg-[var(--pt-bg-secondary,#101321)] sm:border border-[var(--pt-border,#29243D)] sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-4 py-3 border-b border-[#E4E3DE] bg-white flex items-center justify-between gap-3 shrink-0">
           <div>

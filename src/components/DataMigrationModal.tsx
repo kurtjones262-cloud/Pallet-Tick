@@ -131,7 +131,6 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
         importedCount: res.importedCount,
         skippedCount: res.skippedCount,
       });
-      // Refresh items list
       setItems((prev) =>
         prev.map((i) =>
           toMigrate.some((m) => m.id === i.delivery.id)
@@ -157,27 +156,27 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-xl bg-[#0D1117] border border-cyan-800/60 rounded-xl shadow-2xl flex flex-col max-h-[88vh] overflow-hidden text-zinc-100"
+        className="w-full max-w-xl bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl flex flex-col max-h-[88vh] overflow-hidden text-[var(--pt-text,#FFFFFF)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="bg-[#161B22] px-5 py-4 border-b border-zinc-800 flex items-center justify-between">
+        <div className="bg-[var(--pt-card,#15182A)] px-5 py-4 border-b border-[var(--pt-border,#29243D)] flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-cyan-950/80 border border-cyan-700/50 flex items-center justify-center text-cyan-400">
+            <div className="w-10 h-10 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] flex items-center justify-center text-[var(--pt-primary-light,#C084FC)]">
               <Database className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white tracking-wide">
+              <h2 className="text-base font-bold text-[var(--pt-text,#FFFFFF)] tracking-wide">
                 Central Database Migration
               </h2>
-              <p className="text-xs text-zinc-400">
+              <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)]">
                 Safely migrate on-device records into Cloudflare D1
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="text-zinc-400 hover:text-white p-1 rounded-lg transition-colors"
+            className="text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] p-1 rounded-lg transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -186,30 +185,32 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4">
           {/* Safeguard Notice */}
-          <div className="bg-cyan-950/30 border border-cyan-800/40 rounded-lg p-3.5 flex items-start gap-3">
-            <ShieldCheck className="w-5 h-5 text-cyan-400 shrink-0 mt-0.5" />
-            <div className="text-xs text-zinc-300 space-y-1">
-              <p className="font-semibold text-cyan-300">Safe Multi-Device Transition</p>
+          <div className="bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] rounded-xl p-3.5 flex items-start gap-3">
+            <ShieldCheck className="w-5 h-5 text-[var(--pt-primary-light,#C084FC)] shrink-0 mt-0.5" />
+            <div className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] space-y-1">
+              <p className="font-semibold text-[var(--pt-primary-light,#C084FC)]">
+                Safe Multi-Device Transition
+              </p>
               <p>
                 To avoid overwriting conflicting records across devices, deliveries already in the
-                central database are preserved. Local storage & IndexedDB data are never deleted.
+                central database are preserved. Local storage &amp; IndexedDB data are never deleted.
               </p>
             </div>
           </div>
 
           {error && (
-            <div className="bg-red-950/50 border border-red-500/50 text-red-200 text-xs p-3 rounded-lg flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <div className="bg-[#EF4444]/15 border border-[#EF4444]/50 text-[#EF4444] text-xs p-3 rounded-xl flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-[#EF4444] shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
           )}
 
           {migrationResult && (
-            <div className="bg-emerald-950/40 border border-emerald-500/50 text-emerald-200 text-xs p-3.5 rounded-lg flex items-start gap-2.5">
-              <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+            <div className="bg-[#00D979]/15 border border-[#00D979]/50 text-[#00D979] text-xs p-3.5 rounded-xl flex items-start gap-2.5">
+              <CheckCircle className="w-5 h-5 text-[#00D979] shrink-0 mt-0.5" />
               <div>
-                <p className="font-bold text-emerald-100">Migration Successful!</p>
-                <p>
+                <p className="font-bold">Migration Successful!</p>
+                <p className="text-[var(--pt-text,#FFFFFF)] mt-0.5">
                   Imported {migrationResult.importedCount} delivery record(s) into the central
                   database. {migrationResult.skippedCount} existing record(s) kept safely.
                 </p>
@@ -219,19 +220,19 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
 
           {/* Stats Bar */}
           <div className="grid grid-cols-2 gap-3 text-xs">
-            <div className="bg-[#161B22] p-3 rounded-lg border border-zinc-800 flex items-center justify-between">
-              <span className="text-zinc-400 flex items-center gap-1.5">
-                <HardDrive className="w-4 h-4 text-amber-400" /> Ready to Import:
+            <div className="bg-[var(--pt-card,#15182A)] p-3 rounded-xl border border-[var(--pt-border,#29243D)] flex items-center justify-between">
+              <span className="text-[var(--pt-text-secondary,#A3A8BD)] flex items-center gap-1.5">
+                <HardDrive className="w-4 h-4 text-[#F59E0B]" /> Ready to Import:
               </span>
-              <span className="font-bold font-mono text-cyan-300 text-sm">
+              <span className="font-bold font-mono text-[var(--pt-primary-light,#C084FC)] text-sm">
                 {newDeliveriesCount}
               </span>
             </div>
-            <div className="bg-[#161B22] p-3 rounded-lg border border-zinc-800 flex items-center justify-between">
-              <span className="text-zinc-400 flex items-center gap-1.5">
-                <Cloud className="w-4 h-4 text-emerald-400" /> Already Synced:
+            <div className="bg-[var(--pt-card,#15182A)] p-3 rounded-xl border border-[var(--pt-border,#29243D)] flex items-center justify-between">
+              <span className="text-[var(--pt-text-secondary,#A3A8BD)] flex items-center gap-1.5">
+                <Cloud className="w-4 h-4 text-[#00D979]" /> Already Synced:
               </span>
-              <span className="font-bold font-mono text-emerald-400 text-sm">
+              <span className="font-bold font-mono text-[#00D979] text-sm">
                 {alreadySyncedCount}
               </span>
             </div>
@@ -239,13 +240,13 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
 
           {/* Deliveries List Preview */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs text-zinc-400 font-semibold px-1">
+            <div className="flex items-center justify-between text-xs text-[var(--pt-text-secondary,#A3A8BD)] font-semibold px-1">
               <span>Local Delivery Records ({items.length})</span>
               {newDeliveriesCount > 0 && (
                 <button
                   type="button"
                   onClick={handleSelectAllNew}
-                  className="text-cyan-400 hover:text-cyan-300 underline"
+                  className="text-[var(--pt-primary-light,#C084FC)] hover:underline cursor-pointer"
                 >
                   Select All New
                 </button>
@@ -253,12 +254,12 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
             </div>
 
             {loading ? (
-              <div className="py-8 flex flex-col items-center justify-center text-zinc-400 text-xs gap-2">
-                <Loader2 className="w-6 h-6 animate-spin text-cyan-400" />
+              <div className="py-8 flex flex-col items-center justify-center text-[var(--pt-text-secondary,#A3A8BD)] text-xs gap-2">
+                <Loader2 className="w-6 h-6 animate-spin text-[var(--pt-primary,#A020F0)]" />
                 <span>Checking records against central database...</span>
               </div>
             ) : items.length === 0 ? (
-              <div className="py-8 text-center text-zinc-500 text-xs">
+              <div className="py-8 text-center text-[var(--pt-text-muted,#737B94)] text-xs">
                 No local delivery records found.
               </div>
             ) : (
@@ -267,12 +268,12 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
                   <div
                     key={d.id}
                     onClick={() => !existsInCentral && handleToggleSelect(d.id)}
-                    className={`p-3 rounded-lg border transition-all text-xs flex items-center justify-between ${
+                    className={`p-3 rounded-xl border transition-all text-xs flex items-center justify-between ${
                       existsInCentral
-                        ? 'bg-zinc-900/40 border-zinc-800/80 opacity-70 cursor-not-allowed'
+                        ? 'bg-[var(--pt-bg,#080B12)]/40 border-[var(--pt-border,#29243D)] opacity-70 cursor-not-allowed'
                         : selected
-                        ? 'bg-cyan-950/30 border-cyan-500/70 cursor-pointer'
-                        : 'bg-zinc-900/60 border-zinc-800 cursor-pointer hover:border-zinc-700'
+                        ? 'bg-[var(--pt-card,#15182A)] border-[var(--pt-primary,#A020F0)] cursor-pointer'
+                        : 'bg-[var(--pt-bg,#080B12)] border-[var(--pt-border,#29243D)] cursor-pointer hover:border-[var(--pt-primary,#A020F0)]/50'
                     }`}
                   >
                     <div className="flex items-center gap-3 min-w-0">
@@ -281,13 +282,13 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
                         checked={selected}
                         disabled={existsInCentral}
                         onChange={() => {}}
-                        className="rounded border-zinc-700 text-cyan-500 focus:ring-0 shrink-0"
+                        className="rounded border-[var(--pt-border,#29243D)] accent-[var(--pt-primary,#A020F0)] focus:ring-0 shrink-0"
                       />
                       <div className="truncate">
-                        <div className="font-bold font-mono text-zinc-100 truncate">
+                        <div className="font-bold font-mono text-[var(--pt-text,#FFFFFF)] truncate">
                           {d.docketNumber}
                         </div>
-                        <div className="text-[11px] text-zinc-400 truncate">
+                        <div className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] truncate">
                           {d.supplier} · {d.deliveryDate} · {d.parts?.length || 0} parts
                         </div>
                       </div>
@@ -295,11 +296,11 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
 
                     <div className="shrink-0 ml-2">
                       {existsInCentral ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-500/40 text-[10px] text-emerald-300 font-mono">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#00D979]/15 border border-[#00D979]/40 text-[10px] text-[#00D979] font-mono">
                           <CheckCircle className="w-3 h-3" /> Synced
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-500/40 text-[10px] text-cyan-300 font-mono">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-[10px] text-[var(--pt-primary-light,#C084FC)] font-mono">
                           Ready
                         </span>
                       )}
@@ -312,11 +313,11 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="bg-[#161B22] px-5 py-3.5 border-t border-zinc-800 flex items-center justify-between">
+        <div className="bg-[var(--pt-card,#15182A)] px-5 py-3.5 border-t border-[var(--pt-border,#29243D)] flex items-center justify-between">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-xs font-semibold text-zinc-400 hover:text-white transition-colors"
+            className="px-4 py-2 text-xs font-mono font-semibold text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] transition-colors cursor-pointer"
           >
             Close
           </button>
@@ -325,7 +326,7 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
             type="button"
             onClick={handleMigrate}
             disabled={migrating || loading || newDeliveriesCount === 0}
-            className="px-5 py-2.5 rounded-lg text-xs font-bold text-white bg-cyan-600 hover:bg-cyan-500 active:bg-cyan-700 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 transition-colors shadow-lg"
+            className="px-5 py-2.5 rounded-xl text-xs font-mono font-bold pt-btn-primary disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 transition-colors shadow-lg cursor-pointer"
           >
             {migrating ? (
               <>
@@ -334,7 +335,7 @@ export const DataMigrationModal: React.FC<DataMigrationModalProps> = ({
               </>
             ) : (
               <>
-                <span>Verify & Migrate to Central DB</span>
+                <span>Verify &amp; Migrate to Central DB</span>
                 <ArrowRight className="w-4 h-4" />
               </>
             )}

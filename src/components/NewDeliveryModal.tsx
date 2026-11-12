@@ -358,27 +358,27 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
         />
       ) : (
         <div
-          className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4"
+          className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
           onClick={onClose}
         >
           <div
-            className="w-full max-w-lg bg-[#F6F5F2] border-t sm:border border-[#E4E3DE] sm:rounded-[6px] shadow-xl overflow-hidden max-h-[92dvh] flex flex-col"
+            className="w-full max-w-lg bg-[var(--pt-bg-secondary,#101321)] border-t sm:border border-[var(--pt-border,#29243D)] rounded-t-2xl sm:rounded-2xl shadow-2xl overflow-hidden max-h-[92dvh] flex flex-col text-[var(--pt-text,#FFFFFF)]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-[#E4E3DE] flex items-center justify-between bg-white shrink-0">
-              <div className="flex items-center gap-2">
-                <h3 className="font-semibold text-sm text-[#18181B]">
+            <div className="px-4 py-3 border-b border-[var(--pt-border,#29243D)] flex items-center justify-between bg-[var(--pt-card,#15182A)] shrink-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="font-semibold text-sm text-[var(--pt-text,#FFFFFF)]">
                   Upload Invoice / Docket (Camera, Gallery or Files)
                 </h3>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-[3px] bg-emerald-50 text-[#059669] font-mono text-[10px] font-semibold border border-emerald-200">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--pt-bg,#080B12)] text-[var(--pt-primary-light,#C084FC)] font-mono text-[10px] font-semibold border border-[var(--pt-border,#29243D)]">
                   <Sparkles className="w-2.5 h-2.5" />
                   <span>Tesseract OCR · Gemini Fallback</span>
                 </span>
               </div>
               <button
                 onClick={onClose}
-                className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"
+                className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -386,9 +386,6 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
 
             {/* ============================================================ */}
             {/* DEDICATED HTML FILE INPUTS FOR MOBILE & DESKTOP              */}
-            {/* 1. CAMERA: Rear camera photo capture (accept="image/*" + capture="environment") */}
-            {/* 2. GALLERY: Multi-select image gallery picker (accept="image/*" + multiple) */}
-            {/* 3. FILES: Multi-select system file picker for PDFs, images & documents */}
             {/* ============================================================ */}
             <input
               id="invoice-upload-camera-input"
@@ -403,7 +400,6 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 e.target.value = '';
               }}
             />
-            {/* 2. GALLERY: Multi-select image picker for selecting multiple invoice photos at once */}
             <input
               id="invoice-upload-gallery-input"
               ref={galleryInputRef}
@@ -435,11 +431,11 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             <div className="flex-1 overflow-y-auto">
               {isProcessing ? (
                 <div className="py-12 px-6 flex flex-col items-center justify-center text-center">
-                  <div className="w-10 h-10 rounded-full border-2 border-[#E4E3DE] border-t-[#059669] animate-spin mb-4 flex items-center justify-center">
-                    <Sparkles className="w-4 h-4 text-[#059669]" />
+                  <div className="w-10 h-10 rounded-full border-2 border-[var(--pt-border,#29243D)] border-t-[var(--pt-primary,#A020F0)] animate-spin mb-4 flex items-center justify-center">
+                    <Sparkles className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)]" />
                   </div>
 
-                  <span className="text-[11px] font-mono uppercase tracking-widest text-[#059669] font-semibold mb-1">
+                  <span className="text-[11px] font-mono uppercase tracking-widest text-[var(--pt-primary-light,#C084FC)] font-semibold mb-1">
                     Tesseract.js Primary OCR · Gemini AI Fallback
                   </span>
 
@@ -447,46 +443,46 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                     className={`text-sm font-bold mb-1 ${
                       (ocrProgress?.statusText || '').toLowerCase().includes('retrying') ||
                       (ocrProgress?.statusText || '').toLowerCase().includes('fallback')
-                        ? 'text-amber-700 bg-amber-50 border border-amber-200 px-3 py-1 rounded-[4px]'
-                        : 'text-[#18181B]'
+                        ? 'text-[#F59E0B] bg-[#F59E0B]/15 border border-[#F59E0B]/40 px-3 py-1 rounded-md'
+                        : 'text-[var(--pt-text,#FFFFFF)]'
                     }`}
                   >
                     {ocrProgress?.statusText || 'Analyzing your delivery docket...'}
                   </h4>
 
-                  <p className="text-xs text-zinc-500 max-w-xs leading-relaxed mb-5">
+                  <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] max-w-xs leading-relaxed mb-5">
                     Extracting positioned words, column coordinates, and supplier table lines (Laser Central &amp; GCI) with automatic Gemini fallback verification.
                   </p>
 
                   {/* Progress Bar */}
-                  <div className="w-full max-w-xs h-1.5 bg-[#E4E3DE] rounded-full overflow-hidden mb-2">
+                  <div className="w-full max-w-xs h-1.5 bg-[var(--pt-bg,#080B12)] rounded-full overflow-hidden mb-2 border border-[var(--pt-border,#29243D)]">
                     <div
-                      className="h-full bg-[#059669] transition-all duration-300"
+                      className="h-full bg-[var(--pt-primary,#A020F0)] transition-all duration-300"
                       style={{ width: `${ocrProgress?.percent || 20}%` }}
                     />
                   </div>
 
-                  <span className="font-mono text-xs text-zinc-400 tabular-nums">
+                  <span className="font-mono text-xs text-[var(--pt-text-muted,#737B94)] tabular-nums">
                     {ocrProgress?.percent || 20}% complete · Page {ocrProgress?.currentPage || 1} of{' '}
                     {ocrProgress?.totalPages || 1}
                   </span>
                 </div>
               ) : (
-                <div className="divide-y divide-[#E4E3DE]">
+                <div className="divide-y divide-[var(--pt-border,#29243D)]">
                   {ocrError && (
-                    <div className="px-4 py-3 bg-red-50 text-xs text-red-700 space-y-2">
+                    <div className="px-4 py-3 bg-[#EF4444]/15 text-xs text-[#EF4444] space-y-2">
                       <div className="flex items-start gap-2">
-                        <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                        <AlertCircle className="w-4 h-4 text-[#EF4444] shrink-0 mt-0.5" />
                         <span>{ocrError}</span>
                       </div>
                       {capturedPages.length > 0 && (
                         <div className="flex items-center justify-between gap-2 pl-6 pt-1">
-                          <span className="text-[11px] text-red-600/90 font-mono">
+                          <span className="text-[11px] text-[#EF4444] font-mono">
                             Your {capturedPages.length} uploaded page(s) are preserved.
                           </span>
                           <button
                             onClick={handleExtractPartsFromDocket}
-                            className="px-3 py-1.5 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white font-semibold text-xs cursor-pointer shadow-2xs"
+                            className="px-3 py-1.5 rounded-lg pt-btn-primary font-mono font-bold text-xs cursor-pointer shadow-2xs"
                           >
                             Retry Extraction
                           </button>
@@ -496,11 +492,11 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   )}
 
                   {/* Step 1: Supplier Dropdown Menu */}
-                  <div className="p-4 bg-white">
+                  <div className="p-4 bg-[var(--pt-card,#15182A)]">
                     <div className="flex items-center justify-between mb-2">
                       <label
                         htmlFor="new-delivery-supplier-select"
-                        className="text-[10px] font-semibold uppercase tracking-[0.1em] text-zinc-500"
+                        className="text-[10px] font-mono font-semibold uppercase tracking-[0.1em] text-[var(--pt-text-secondary,#A3A8BD)]"
                       >
                         1. Select Supplier
                       </label>
@@ -513,19 +509,19 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                         onChange={(e) =>
                           handleSelectSupplier(e.target.value as SupplierRuleId)
                         }
-                        className="w-full h-10 pl-3 pr-9 rounded-[4px] bg-white border border-[#E4E3DE] hover:border-[#059669] focus:border-[#059669] text-xs font-bold text-[#18181B] outline-none cursor-pointer appearance-none shadow-2xs transition-colors"
+                        className="w-full h-10 pl-3 pr-9 rounded-xl bg-[var(--pt-input-bg,#080B12)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] focus:border-[var(--pt-primary,#A020F0)] text-xs font-mono font-bold text-[var(--pt-text,#FFFFFF)] outline-none cursor-pointer appearance-none shadow-2xs transition-colors"
                       >
                         <option value="laser_central">Laser Central</option>
                         <option value="gci">GCI</option>
                         <option value="ocr_label">OCR Label Scanner</option>
                       </select>
-                      <ChevronDown className="w-4 h-4 text-zinc-500 pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" />
+                      <ChevronDown className="w-4 h-4 text-[var(--pt-text-secondary,#A3A8BD)] pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" />
                     </div>
                   </div>
 
                   {/* Step 2: 3-Option Mobile & Desktop Upload Selection Interface */}
                   <div
-                    className="p-4 bg-white"
+                    className="p-4 bg-[var(--pt-card,#15182A)]"
                     onDragOver={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
@@ -539,18 +535,18 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                     }}
                   >
                     <div className="flex items-center justify-between mb-2.5">
-                      <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-zinc-500">
+                      <span className="text-[10px] font-mono font-semibold uppercase tracking-[0.1em] text-[var(--pt-text-secondary,#A3A8BD)]">
                         2. Upload Invoice / Docket (Multi-File Supported)
                       </span>
-                      <span className="px-1.5 py-0.5 rounded-[3px] bg-emerald-50 text-[#059669] border border-emerald-200 font-mono text-[9px] font-semibold">
+                      <span className="px-1.5 py-0.5 rounded-md bg-[var(--pt-bg,#080B12)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)] font-mono text-[9px] font-semibold">
                         Select 1 or Multiple Files
                       </span>
                     </div>
 
-                    <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
-                      Tap <span className="font-semibold text-[#18181B]">1. Camera</span> to capture photos,{' '}
-                      <span className="font-semibold text-[#059669]">2. Gallery</span> to select multiple photos from your gallery (JPG, JPEG, PNG, WebP), or{' '}
-                      <span className="font-semibold text-[#18181B]">3. Files</span> to select multiple PDFs, images, or documents at once.
+                    <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mb-3 leading-relaxed">
+                      Tap <span className="font-semibold text-[var(--pt-text,#FFFFFF)]">1. Camera</span> to capture photos,{' '}
+                      <span className="font-semibold text-[var(--pt-primary-light,#C084FC)]">2. Gallery</span> to select multiple photos from your gallery (JPG, JPEG, PNG, WebP), or{' '}
+                      <span className="font-semibold text-[var(--pt-text,#FFFFFF)]">3. Files</span> to select multiple PDFs, images, or documents at once.
                     </p>
 
                     {/* Three Clear Mobile Upload Options: 1. CAMERA, 2. GALLERY, 3. FILES */}
@@ -559,18 +555,18 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                       <button
                         type="button"
                         onClick={() => cameraInputRef.current?.click()}
-                        className={`p-3 rounded-[5px] bg-[#059669] hover:bg-[#047857] text-white flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
+                        className={`p-3 rounded-xl pt-btn-primary flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
                       >
-                        <div className="w-9 h-9 rounded-full bg-white/15 flex items-center justify-center">
-                          <Camera className="w-4 h-4 text-white" />
+                        <div className="w-9 h-9 rounded-full bg-black/15 flex items-center justify-center">
+                          <Camera className="w-4 h-4" />
                         </div>
                         <div>
                           <span className="block font-mono text-[11px] font-bold uppercase tracking-wider">
                             1. Camera
                           </span>
-                          <span className="block text-[10px] text-emerald-100 leading-tight mt-0.5">
+                          <span className="block text-[10px] opacity-85 leading-tight mt-0.5">
                             Capture new photo
                           </span>
                         </div>
@@ -580,18 +576,24 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                       <button
                         type="button"
                         onClick={() => galleryInputRef.current?.click()}
-                        className={`p-3 rounded-[5px] bg-emerald-50/70 hover:bg-emerald-100/70 border-2 border-[#059669] text-[#18181B] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
+                        className={`p-3 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] border-2 border-[var(--pt-primary,#A020F0)] text-[var(--pt-text,#FFFFFF)] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
                       >
-                        <div className="w-9 h-9 rounded-full bg-[#059669] text-white flex items-center justify-center shadow-2xs">
+                        <div
+                          className="w-9 h-9 rounded-full flex items-center justify-center shadow-2xs"
+                          style={{
+                            backgroundColor: 'var(--pt-primary)',
+                            color: 'var(--pt-primary-contrast)',
+                          }}
+                        >
                           <Images className="w-4 h-4" />
                         </div>
                         <div>
-                          <span className="block font-mono text-[11px] font-bold uppercase tracking-wider text-[#059669]">
+                          <span className="block font-mono text-[11px] font-bold uppercase tracking-wider text-[var(--pt-primary-light,#C084FC)]">
                             2. Gallery
                           </span>
-                          <span className="block text-[10px] text-zinc-600 leading-tight mt-0.5">
+                          <span className="block text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] leading-tight mt-0.5">
                             Select 1 or more photos
                           </span>
                         </div>
@@ -601,18 +603,18 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                       <button
                         type="button"
                         onClick={() => filesInputRef.current?.click()}
-                        className={`p-3 rounded-[5px] bg-white hover:bg-zinc-50 border border-[#E4E3DE] hover:border-[#059669] text-[#18181B] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-2xs select-none ${
+                        className={`p-3 rounded-xl bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-[var(--pt-text,#FFFFFF)] flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer transition-colors shadow-2xs select-none ${
                           isLoadingFiles ? 'opacity-60 pointer-events-none' : ''
                         }`}
                       >
-                        <div className="w-9 h-9 rounded-full bg-zinc-100 border border-zinc-200 flex items-center justify-center">
-                          <FolderOpen className="w-4 h-4 text-[#18181B]" />
+                        <div className="w-9 h-9 rounded-full bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] flex items-center justify-center">
+                          <FolderOpen className="w-4 h-4 text-[var(--pt-text,#FFFFFF)]" />
                         </div>
                         <div>
-                          <span className="block font-mono text-[11px] font-bold uppercase tracking-wider text-[#18181B]">
+                          <span className="block font-mono text-[11px] font-bold uppercase tracking-wider text-[var(--pt-text,#FFFFFF)]">
                             3. Files
                           </span>
-                          <span className="block text-[10px] text-zinc-500 leading-tight mt-0.5">
+                          <span className="block text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] leading-tight mt-0.5">
                             Select multiple files
                           </span>
                         </div>
@@ -620,24 +622,24 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                     </div>
 
                     {isLoadingFiles && (
-                      <div className="py-3 px-3 mb-2 rounded-[4px] bg-emerald-50/70 border border-emerald-200 flex items-center gap-2.5 text-xs text-emerald-900">
-                        <div className="w-4 h-4 rounded-full border-2 border-emerald-300 border-t-[#059669] animate-spin shrink-0" />
+                      <div className="py-3 px-3 mb-2 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] flex items-center gap-2.5 text-xs text-[var(--pt-text,#FFFFFF)]">
+                        <div className="w-4 h-4 rounded-full border-2 border-[var(--pt-border,#29243D)] border-t-[var(--pt-primary,#A020F0)] animate-spin shrink-0" />
                         <span className="font-mono text-[11px]">
                           {loadingFileStatus || 'Staging selected files...'}
                         </span>
                       </div>
                     )}
 
-                    {/* Staged / Selected Files Queue (Shown Before Processing — Requires Confirmation) */}
+                    {/* Staged / Selected Files Queue */}
                     {capturedPages.length > 0 && (
-                      <div className="pt-3 border-t border-[#E4E3DE] space-y-3">
+                      <div className="pt-3 border-t border-[var(--pt-border,#29243D)] space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5">
-                            <span className="text-[11px] font-bold text-[#18181B]">
+                            <span className="text-[11px] font-bold text-[var(--pt-text,#FFFFFF)]">
                               Selected Files Ready ({capturedPages.length}{' '}
                               {capturedPages.length === 1 ? 'Page' : 'Pages'})
                             </span>
-                            <span className="px-1.5 py-0.5 rounded-[3px] bg-amber-100 text-amber-800 font-mono text-[9px] font-semibold">
+                            <span className="px-1.5 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/40 font-mono text-[9px] font-semibold">
                               Awaiting Confirmation
                             </span>
                           </div>
@@ -646,7 +648,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                               type="button"
                               onClick={() => galleryInputRef.current?.click()}
                               disabled={isLoadingFiles}
-                              className="px-2 py-1 rounded-[3px] bg-emerald-50 hover:bg-emerald-100 text-[#059669] border border-emerald-200 text-[10px] font-mono font-semibold cursor-pointer"
+                              className="px-2 py-1 rounded-md bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)] text-[10px] font-mono font-semibold cursor-pointer"
                             >
                               + Add Photos
                             </button>
@@ -654,14 +656,14 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                               type="button"
                               onClick={() => filesInputRef.current?.click()}
                               disabled={isLoadingFiles}
-                              className="px-2 py-1 rounded-[3px] bg-zinc-100 hover:bg-zinc-200 text-[#18181B] border border-zinc-200 text-[10px] font-mono font-semibold cursor-pointer"
+                              className="px-2 py-1 rounded-md bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] text-[var(--pt-text,#FFFFFF)] border border-[var(--pt-border,#29243D)] text-[10px] font-mono font-semibold cursor-pointer"
                             >
                               + Add Files
                             </button>
                             <button
                               type="button"
                               onClick={handleClearAllPages}
-                              className="text-[11px] font-medium text-red-600 hover:text-red-700 cursor-pointer ml-1"
+                              className="text-[11px] font-medium text-[#EF4444] hover:underline cursor-pointer ml-1"
                             >
                               Clear All
                             </button>
@@ -673,40 +675,46 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                           {capturedPages.map((page, idx) => (
                             <div
                               key={page.id}
-                              className="relative group rounded-[4px] border border-[#E4E3DE] bg-zinc-50 overflow-hidden flex flex-col"
+                              className="relative group rounded-xl border border-[var(--pt-border,#29243D)] bg-[var(--pt-bg,#080B12)] overflow-hidden flex flex-col"
                             >
-                              <div className="relative aspect-[4/3] bg-zinc-100 overflow-hidden">
+                              <div className="relative aspect-[4/3] bg-black/40 overflow-hidden">
                                 <img
                                   src={page.dataUrl}
                                   alt={page.name || `Page ${idx + 1}`}
                                   className="w-full h-full object-cover"
                                 />
                                 <div className="absolute top-1 left-1 flex items-center gap-1 flex-wrap">
-                                  <span className="px-1.5 py-0.5 bg-black/75 backdrop-blur-xs text-white font-mono text-[10px] rounded">
+                                  <span className="px-1.5 py-0.5 bg-black/75 backdrop-blur-xs text-white font-mono text-[10px] rounded pt-keep-white">
                                     P{idx + 1}
                                   </span>
-                                  <span className="px-1.5 py-0.5 bg-[#059669]/90 text-white font-mono text-[9px] font-semibold rounded uppercase">
+                                  <span
+                                    className="px-1.5 py-0.5 font-mono text-[9px] font-semibold rounded uppercase"
+                                    style={{
+                                      backgroundColor: 'var(--pt-primary)',
+                                      color: 'var(--pt-primary-contrast)',
+                                    }}
+                                  >
                                     {page.fileFormat || (page.sourceType === 'pdf' ? 'PDF' : 'IMG')}
                                   </span>
                                 </div>
                                 <button
                                   type="button"
                                   onClick={() => handleRemovePage(page.id)}
-                                  className="absolute top-1 right-1 p-1 bg-red-600/90 text-white rounded hover:bg-red-700 cursor-pointer"
+                                  className="absolute top-1 right-1 p-1 bg-red-600/90 text-white rounded hover:bg-red-700 cursor-pointer pt-keep-white"
                                   title="Remove file"
                                 >
                                   <Trash2 className="w-3 h-3" />
                                 </button>
                               </div>
-                              <div className="px-2 py-1.5 bg-white border-t border-[#E4E3DE] flex items-center justify-between gap-1 text-[10px]">
+                              <div className="px-2 py-1.5 bg-[var(--pt-bg-secondary,#101321)] border-t border-[var(--pt-border,#29243D)] flex items-center justify-between gap-1 text-[10px]">
                                 <span
-                                  className="font-medium text-[#18181B] truncate"
+                                  className="font-medium text-[var(--pt-text,#FFFFFF)] truncate"
                                   title={page.name}
                                 >
                                   {page.name}
                                 </span>
                                 {page.fileSize ? (
-                                  <span className="font-mono text-[9px] text-zinc-400 shrink-0">
+                                  <span className="font-mono text-[9px] text-[var(--pt-text-muted,#737B94)] shrink-0">
                                     {formatBytes(page.fileSize)}
                                   </span>
                                 ) : null}
@@ -719,9 +727,9 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                         <button
                           type="button"
                           onClick={handleExtractPartsFromDocket}
-                          className="w-full h-11 px-4 bg-[#18181B] hover:bg-zinc-800 text-white font-semibold text-xs tracking-wider uppercase rounded-[4px] flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-sm"
+                          className="w-full h-11 px-4 pt-btn-primary font-mono font-bold text-xs tracking-wider uppercase rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-sm"
                         >
-                          <Check className="w-4 h-4 text-emerald-400 stroke-[2.5]" />
+                          <Check className="w-4 h-4 stroke-[2.5]" />
                           <span>
                             Confirm &amp; Compile Parts List ({capturedPages.length}{' '}
                             {capturedPages.length === 1 ? 'Page' : 'Pages'})

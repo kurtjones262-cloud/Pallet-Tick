@@ -71,7 +71,7 @@ export interface QueuedOfflineScan {
 
 const OFFLINE_QUEUE_STORAGE_KEY = 'pallettick_pending_offline_scans_v1';
 
-class PalletTrackRealtimeClient {
+export class PalletTrackRealtimeClient {
   private ws: WebSocket | null = null;
   private connectionState: RealtimeConnectionState = 'disconnected';
   private activeDeliveryId: string | null = null;
@@ -369,10 +369,34 @@ class PalletTrackRealtimeClient {
 
   public enqueueOfflineScan(scan: QueuedOfflineScan) {
     const queue = this.getOfflineQueue();
-    if (!queue.some((item) => item.idempotencyKey === scan.idempotencyKey)) {
-      queue.push(scan);
-      this.saveOfflineQueue(queue);
+    if (queue.some((item) => item.idempotencyKey === scan.idempotencyKey)) {
+      return;
     }
+    // For single-part 'set' scans, if the same part on the same delivery is already queued offline,
+    // update its quantity in place instead of queueing duplicate requests for the same part.
+    const effectiveMode = scan.mode || 'set';
+    if (effectiveMode !== 'increment') {
+      const existingIdx = queue.findIndex(
+        (item) =>
+          item.deliveryId === scan.deliveryId &&
+          item.partId === scan.partId &&
+          (item.mode || 'set') !== 'increment'
+      );
+      if (existingIdx >= 0) {
+        queue[existingIdx] = {
+          ...queue[existingIdx],
+          receivedQuantity: scan.receivedQuantity,
+          scannedVia: scan.scannedVia,
+          scannedCode: scan.scannedCode,
+          notes: scan.notes ?? queue[existingIdx].notes,
+          rawOcrText: scan.rawOcrText ?? queue[existingIdx].rawOcrText,
+        };
+        this.saveOfflineQueue(queue);
+        return;
+      }
+    }
+    queue.push(scan);
+    this.saveOfflineQueue(queue);
   }
 
   public removeOfflineScan(idempotencyKey: string) {
@@ -391,6 +415,8 @@ class PalletTrackRealtimeClient {
       scan: QueuedOfflineScan;
       outcome: 'accepted' | 'duplicate' | 'error';
       alreadyScannedBy?: string;
+      idempotentReplay?: boolean;
+      part?: any;
     }>
   > {
     if (this.isFlushingOfflineQueue) return [];
@@ -402,6 +428,8 @@ class PalletTrackRealtimeClient {
       scan: QueuedOfflineScan;
       outcome: 'accepted' | 'duplicate' | 'error';
       alreadyScannedBy?: string;
+      idempotentReplay?: boolean;
+      part?: any;
     }> = [];
 
     try {
@@ -426,11 +454,14 @@ class PalletTrackRealtimeClient {
               scan: item,
               outcome: 'duplicate',
               alreadyScannedBy: res.alreadyScannedBy,
+              part: res.part,
             });
           } else {
             outcomes.push({
               scan: item,
               outcome: 'accepted',
+              idempotentReplay: Boolean(res.idempotentReplay),
+              part: res.part,
             });
           }
         } catch {
@@ -585,21 +616,23 @@ class PalletTrackRealtimeClient {
 
       case 'ping': {
         this.sendJson({ type: 'pong', timestamp: nowIso });
-        if (
-          typeof data.latestSeq === 'number' &&
-          data.latestSeq > this.lastSequenceNumber
-        ) {
-          this.requestCatchUpSync();
+        if (typeof data.latestSeq === 'number') {
+          if (this.lastSequenceNumber === 0) {
+            this.lastSequenceNumber = data.latestSeq;
+          } else if (data.latestSeq > this.lastSequenceNumber) {
+            this.requestCatchUpSync();
+          }
         }
         break;
       }
 
       case 'pong': {
-        if (
-          typeof data.latestSeq === 'number' &&
-          data.latestSeq > this.lastSequenceNumber
-        ) {
-          this.requestCatchUpSync();
+        if (typeof data.latestSeq === 'number') {
+          if (this.lastSequenceNumber === 0) {
+            this.lastSequenceNumber = data.latestSeq;
+          } else if (data.latestSeq > this.lastSequenceNumber) {
+            this.requestCatchUpSync();
+          }
         }
         break;
       }

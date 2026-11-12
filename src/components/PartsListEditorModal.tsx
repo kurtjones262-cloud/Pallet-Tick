@@ -434,11 +434,11 @@ export const PartsListEditorModal: React.FC<PartsListEditorModalProps> = ({
 
     return (
       <div
-        className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-4"
+        className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
         onClick={onClose}
       >
         <div
-          className="w-full max-w-md bg-white border border-[#E4E3DE] rounded-[8px] shadow-2xl overflow-hidden"
+          className="pt-themed-modal w-full max-w-md bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           <div className="px-4 py-3 bg-red-600 text-white flex items-center justify-between">
@@ -532,12 +532,12 @@ export const PartsListEditorModal: React.FC<PartsListEditorModalProps> = ({
 
     return (
       <div
-        className="fixed inset-0 z-50 bg-black/55 flex items-end sm:items-center justify-center p-0 sm:p-4"
+        className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
         onClick={onClose}
       >
         <form
           onSubmit={handleSaveNewParts}
-          className="w-full max-w-2xl max-h-[92dvh] bg-[#F6F5F2] sm:border border-[#E4E3DE] sm:rounded-[8px] shadow-2xl flex flex-col overflow-hidden"
+          className="pt-themed-modal w-full max-w-2xl max-h-[92dvh] bg-[var(--pt-bg-secondary,#101321)] sm:border border-[var(--pt-border,#29243D)] rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
@@ -756,12 +756,12 @@ export const PartsListEditorModal: React.FC<PartsListEditorModalProps> = ({
 
     return (
       <div
-        className="fixed inset-0 z-50 bg-black/55 flex items-end sm:items-center justify-center p-0 sm:p-4"
+        className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
         onClick={onClose}
       >
         <form
           onSubmit={handleSaveSinglePart}
-          className="w-full max-w-lg max-h-[92dvh] bg-[#F6F5F2] sm:border border-[#E4E3DE] sm:rounded-[8px] shadow-2xl flex flex-col overflow-hidden"
+          className="pt-themed-modal w-full max-w-lg max-h-[92dvh] bg-[var(--pt-bg-secondary,#101321)] sm:border border-[var(--pt-border,#29243D)] rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
@@ -1003,11 +1003,11 @@ export const PartsListEditorModal: React.FC<PartsListEditorModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-0 sm:p-4"
+      className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-0 sm:p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-6xl h-[100dvh] sm:h-[90vh] bg-[#F6F5F2] sm:border border-[#E4E3DE] sm:rounded-[8px] shadow-2xl flex flex-col overflow-hidden"
+        className="pt-themed-modal w-full max-w-6xl h-[100dvh] sm:h-[90vh] bg-[var(--pt-bg-secondary,#101321)] sm:border border-[var(--pt-border,#29243D)] sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

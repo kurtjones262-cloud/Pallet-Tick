@@ -15,6 +15,8 @@ import {
   Info,
   Check,
   RefreshCw,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import { AppSettings, SupplierRuleId, UserAccount } from '../types/delivery';
 import {
@@ -29,8 +31,11 @@ import { exportAllDeliveriesBackupZip } from '../utils/zipExport';
 import {
   APP_THEMES,
   AppThemeId,
+  AppThemeMode,
   getStoredTheme,
+  getStoredThemeMode,
   setStoredTheme,
+  setStoredThemeMode,
 } from '../config/theme';
 import { BRANDING } from '../config/branding';
 import { PartTrackLogo } from './PartTrackLogo';
@@ -53,8 +58,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   currentUser,
 }) => {
   const userKey = currentUser?.id || currentUser?.employeeCode || null;
+  const extraUserKey =
+    currentUser?.id && currentUser?.employeeCode && currentUser.id !== currentUser.employeeCode
+      ? [currentUser.employeeCode]
+      : undefined;
+
   const [settings, setSettings] = useState<AppSettings>(getStoredSettings());
   const [activeTheme, setActiveTheme] = useState<AppThemeId>(() => getStoredTheme(userKey));
+  const [activeMode, setActiveMode] = useState<AppThemeMode>(() => getStoredThemeMode(userKey));
   const [preferredRule, setPreferredRule] = useState<SupplierRuleId>(() =>
     getPreferredSupplierRuleId()
   );
@@ -77,7 +88,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleThemeSelect = (themeId: AppThemeId) => {
     setActiveTheme(themeId);
-    setStoredTheme(themeId, userKey);
+    setStoredTheme(themeId, userKey, extraUserKey);
+    onSettingsSaved();
+  };
+
+  const handleModeSelect = (mode: AppThemeMode) => {
+    setActiveMode(mode);
+    setStoredThemeMode(mode, userKey, extraUserKey);
     onSettingsSaved();
   };
 
@@ -124,7 +141,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl max-h-[92dvh] bg-[var(--pt-bg-secondary,#101321)] border-t sm:border border-[var(--pt-border,#29243D)] rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden text-white"
+        className="w-full max-w-2xl max-h-[92dvh] bg-[var(--pt-bg-secondary,#101321)] border-t sm:border border-[var(--pt-border,#29243D)] rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden text-[var(--pt-text,#FFFFFF)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -132,13 +149,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="flex items-center gap-3">
             <PartTrackLogo size="xs" />
             <span className="text-[var(--pt-text-muted,#737B94)]">/</span>
-            <h2 className="font-mono font-bold text-sm uppercase tracking-wider text-white">
+            <h2 className="font-mono font-bold text-sm uppercase tracking-wider text-[var(--pt-text,#FFFFFF)]">
               SYSTEM SETTINGS
             </h2>
           </div>
           <button
             onClick={onClose}
-            className="w-8 h-8 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white flex items-center justify-center cursor-pointer transition-colors"
+            className="w-8 h-8 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] flex items-center justify-center cursor-pointer transition-colors"
             aria-label="Close Settings"
           >
             <X className="w-4 h-4" />
@@ -148,76 +165,158 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {/* Scrollable 8-Section Settings Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-5 text-xs">
           {/* =================================================================
-           * SECTION 1: APP THEME (3 Complete Industrial Themes)
+           * SECTION 1: THEMES & APPEARANCE (Dark/Light Mode + 4 Colour Themes)
            * ================================================================= */}
-          <section className="p-4 rounded-2xl bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 font-mono font-bold uppercase tracking-wider text-white">
+          <section className="p-4 rounded-2xl bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] space-y-4">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2 font-mono font-bold uppercase tracking-wider text-[var(--pt-text,#FFFFFF)]">
                 <Palette className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)]" />
-                <span>1. App Theme</span>
+                <span>1. Themes &amp; Appearance</span>
               </div>
-              <span className="text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)]">
-                Instant Global Switch
+              <span className="text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)] font-semibold">
+                {APP_THEMES[activeTheme]?.name} · {activeMode === 'dark' ? 'Dark Mode' : 'Light Mode'}
               </span>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              {(Object.keys(APP_THEMES) as AppThemeId[]).map((themeKey) => {
-                const theme = APP_THEMES[themeKey];
-                const isSelected = activeTheme === theme.id;
-                return (
-                  <button
-                    key={theme.id}
-                    type="button"
-                    onClick={() => handleThemeSelect(theme.id)}
-                    className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex flex-col justify-between gap-2.5 ${
-                      isSelected
-                        ? 'bg-[var(--pt-bg,#080B12)] border-2 shadow-lg'
-                        : 'bg-[var(--pt-bg-secondary,#101321)]/70 border-[var(--pt-border,#29243D)] hover:border-white/30'
-                    }`}
-                    style={
-                      isSelected
-                        ? {
-                            borderColor: theme.colors.primary,
-                            boxShadow: `0 0 18px ${theme.colors.glowRgba}`,
-                          }
-                        : undefined
-                    }
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className="w-4 h-4 rounded-full border border-white/20 shrink-0"
-                          style={{ backgroundColor: theme.colors.primary }}
-                        />
-                        <span
-                          className="w-3 h-3 rounded-full border border-white/10 shrink-0"
-                          style={{ backgroundColor: theme.colors.bgCard }}
-                        />
+            {/* 1A: Prominent Appearance Mode Toggle (Dark Mode / Light Mode) */}
+            <div className="p-3 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="font-mono font-bold uppercase tracking-wider text-[11px] text-[var(--pt-text,#FFFFFF)]">
+                  Appearance
+                </div>
+                <div className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
+                  Switch globally between Dark Mode and Light Mode while preserving your colour theme
+                </div>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Appearance mode toggle"
+                className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] shrink-0"
+              >
+                <button
+                  type="button"
+                  onClick={() => handleModeSelect('dark')}
+                  aria-pressed={activeMode === 'dark'}
+                  className={`h-9 px-3.5 rounded-lg font-mono font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                    activeMode === 'dark'
+                      ? 'pt-btn-primary shadow-md'
+                      : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] hover:bg-[var(--pt-hover-bg)]'
+                  }`}
+                >
+                  <Moon className="w-3.5 h-3.5" />
+                  <span>Dark Mode</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleModeSelect('light')}
+                  aria-pressed={activeMode === 'light'}
+                  className={`h-9 px-3.5 rounded-lg font-mono font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                    activeMode === 'light'
+                      ? 'pt-btn-primary shadow-md'
+                      : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] hover:bg-[var(--pt-hover-bg)]'
+                  }`}
+                >
+                  <Sun className="w-3.5 h-3.5" />
+                  <span>Light Mode</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 1B: Colour Themes Grid (4 Complete Themes with Swatch Previews) */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-mono font-bold uppercase tracking-wider text-[11px] text-[var(--pt-text-secondary,#A3A8BD)]">
+                  Colour Themes
+                </span>
+                <span className="text-[10px] font-mono text-[var(--pt-text-muted,#737B94)]">
+                  Saved per user profile
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {(Object.keys(APP_THEMES) as AppThemeId[]).map((themeKey) => {
+                  const theme = APP_THEMES[themeKey];
+                  const palette = theme.palettes[activeMode] || theme.palettes.dark;
+                  const isSelected = activeTheme === theme.id;
+                  return (
+                    <button
+                      key={theme.id}
+                      type="button"
+                      onClick={() => handleThemeSelect(theme.id)}
+                      aria-pressed={isSelected}
+                      className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer flex flex-col justify-between gap-2.5 ${
+                        isSelected
+                          ? 'bg-[var(--pt-bg,#080B12)] border-2 shadow-lg'
+                          : 'bg-[var(--pt-bg-secondary,#101321)]/80 border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary)]/50'
+                      }`}
+                      style={
+                        isSelected
+                          ? {
+                              borderColor: palette.primary,
+                              boxShadow: `0 0 18px ${palette.glowRgba}`,
+                            }
+                          : undefined
+                      }
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        {/* Colour Preview Swatches: Primary Accent, Secondary Accent, Surface, Card */}
+                        <div className="flex items-center gap-1.5" title={`${theme.name} swatch preview`}>
+                          <span
+                            className="w-5 h-5 rounded-full border border-black/20 shadow-xs shrink-0"
+                            style={{ backgroundColor: palette.primary }}
+                          />
+                          <span
+                            className="w-4 h-4 rounded-full border border-black/20 shrink-0"
+                            style={{ backgroundColor: palette.accentSecondary }}
+                          />
+                          <span
+                            className="w-4 h-4 rounded-md border shrink-0"
+                            style={{
+                              backgroundColor: palette.bgPrimary,
+                              borderColor: palette.border,
+                            }}
+                          />
+                          <span
+                            className="w-4 h-4 rounded-md border shrink-0"
+                            style={{
+                              backgroundColor: palette.bgCard,
+                              borderColor: palette.border,
+                            }}
+                          />
+                        </div>
+
+                        {isSelected ? (
+                          <span
+                            className="px-2 py-0.5 rounded-md text-[9px] font-mono font-extrabold uppercase inline-flex items-center gap-1 shadow-xs"
+                            style={{
+                              backgroundColor: palette.primary,
+                              color: palette.primaryContrast,
+                            }}
+                          >
+                            <Check className="w-2.5 h-2.5 stroke-[3]" />
+                            Active
+                          </span>
+                        ) : (
+                          <span className="text-[9px] font-mono text-[var(--pt-text-muted,#737B94)] uppercase font-semibold">
+                            {theme.badge}
+                          </span>
+                        )}
                       </div>
-                      {isSelected ? (
-                        <span
-                          className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase text-white inline-flex items-center gap-1"
-                          style={{ backgroundColor: theme.colors.primary }}
-                        >
-                          <Check className="w-2.5 h-2.5 stroke-[3]" />
-                          Active
-                        </span>
-                      ) : (
-                        <span className="text-[9px] font-mono text-[var(--pt-text-muted,#737B94)] uppercase">
-                          {theme.badge}
-                        </span>
-                      )}
-                    </div>
-                    <div>
-                      <div className="font-bold text-white text-xs">{theme.name}</div>
-                      <div className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] leading-snug mt-0.5">
-                        {theme.subtitle}
+
+                      <div>
+                        <div className="font-bold text-[var(--pt-text,#FFFFFF)] text-xs flex items-center gap-1.5">
+                          <span>{theme.name}</span>
+                        </div>
+                        <div className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] leading-snug mt-0.5">
+                          {theme.subtitle}
+                        </div>
                       </div>
-                    </div>
-                  </button>
-                );
-              })}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </section>
 

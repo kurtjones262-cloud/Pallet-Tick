@@ -234,6 +234,9 @@ export class PalletTrackDbService {
       createdBy: row.created_by || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      totalParts: stats?.totalParts ?? parts.length,
+      receivedParts: stats?.receivedParts ?? parts.filter((p) => p.status === 'received').length,
+      verifiedParts: stats?.verifiedParts ?? parts.filter((p) => p.verificationStatus === 'verified').length,
       stats: stats || { totalParts: parts.length, receivedParts: 0, verifiedParts: 0 },
       parts,
       scanHistory: [] as any[],
@@ -429,7 +432,7 @@ export class PalletTrackDbService {
             p.weight || null,
             p.palletNumber ? String(p.palletNumber) : null,
             p.scannedAt || null,
-            p.scannedVia || null,
+            p.scannedVia ? this.normalizeScanType(p.scannedVia) : null,
             p.scannedCode || null,
             p.notes || null,
             p.flaggedForReview ? 1 : 0,
@@ -464,7 +467,7 @@ export class PalletTrackDbService {
               createdBy,
               s.timestamp || now,
               s.code,
-              s.codeType || 'barcode',
+              this.normalizeScanType(s.codeType || 'barcode'),
               s.status || 'match_success',
               s.quantityAdded ?? 0,
               s.receivedQuantity ?? null,
@@ -551,6 +554,16 @@ export class PalletTrackDbService {
   private isSupervisorOrAdmin(role?: string): boolean {
     const r = (role || '').trim().toLowerCase();
     return r === 'super_admin' || r === 'admin' || r === 'supervisor';
+  }
+
+  private normalizeScanType(
+    raw?: string | null
+  ): 'qr' | 'barcode' | 'ocr_label' | 'manual' {
+    const val = (raw || '').trim().toLowerCase();
+    if (val === 'qr') return 'qr';
+    if (val === 'barcode') return 'barcode';
+    if (val === 'label' || val === 'ocr_label') return 'ocr_label';
+    return 'manual';
   }
 
   /**
@@ -1562,6 +1575,30 @@ export class PalletTrackDbService {
     }
   }
 
+  /**
+   * Delete a delivery and its associated parts/scans atomically
+   */
+  async deleteDelivery(id: string) {
+    await this.ensureSchemaReady();
+    const existing = await this.db
+      .prepare('SELECT id, docket_number FROM deliveries WHERE id = ?')
+      .bind(id)
+      .first<{ id: string; docket_number: string }>();
+
+    if (!existing) {
+      return { deleted: false, id };
+    }
+
+    await this.db.batch([
+      this.db.prepare('DELETE FROM scan_events WHERE delivery_id = ?').bind(id),
+      this.db.prepare('DELETE FROM delivery_parts WHERE delivery_id = ?').bind(id),
+      this.db.prepare('DELETE FROM m1_synchronisations WHERE delivery_id = ?').bind(id),
+      this.db.prepare('DELETE FROM deliveries WHERE id = ?').bind(id),
+    ]);
+
+    return { deleted: true, id, docketNumber: existing.docket_number };
+  }
+
   private async executeUpdatePartReceivedQuantityAtomic(
     deliveryId: string,
     partId: string,
@@ -1574,299 +1611,317 @@ export class PalletTrackDbService {
         ? input.idempotencyKey.trim().slice(0, 128)
         : null;
 
-    // 1. Idempotency check: If this exact scan request was already processed (e.g. network retry or offline queue replay),
-    // return the previously committed state without double-counting or raising a false duplicate conflict.
-    if (cleanIdempotencyKey) {
-      const existingScan = await this.db
-        .prepare('SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1')
-        .bind(cleanIdempotencyKey)
-        .first<ScanEventRow>();
-
-      if (existingScan) {
-        const currentPart = await this.db
-          .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
-          .bind(deliveryId, partId)
-          .first<DeliveryPartRow>();
-        const currentDelivery = await this.db
-          .prepare('SELECT version FROM deliveries WHERE id = ?')
-          .bind(deliveryId)
-          .first<{ version: number }>();
-
-        return {
-          duplicate: false,
-          idempotentReplay: true,
-          status: 'updated',
-          deliveryVersion: Number(currentDelivery?.version || 1),
-          part: currentPart ? this.mapPartRow(currentPart) : null,
-          scanEvent: this.mapScanRow(existingScan),
-        };
-      }
-    }
-
-    const part = await this.db
-      .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
-      .bind(deliveryId, partId)
-      .first<DeliveryPartRow>();
-
-    if (!part) {
-      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
-    }
-
     // Server-side validation: Quantities cannot be negative
     const enteredQty = Number(input.receivedQuantity);
     if (Number.isNaN(enteredQty) || enteredQty < 0) {
       throw new Error('Received quantity cannot be negative or invalid');
     }
 
-    const now = new Date().toISOString();
-    const reqQty = Math.max(0, part.required_quantity);
-    const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
-    const currentVersion = Number(part.version || 1);
-    const isIncrementMode = input.mode === 'increment';
-    const isScanAttempt = input.scannedVia !== 'manual';
+    const MAX_CAS_ATTEMPTS = 5;
 
-    const recQty = isIncrementMode
-      ? currentRecQty + Math.round(enteredQty)
-      : Math.round(enteredQty);
+    for (let attempt = 1; attempt <= MAX_CAS_ATTEMPTS; attempt++) {
+      // 1. Idempotency check: If this exact scan request was already processed (e.g. network retry, offline queue replay, or cross-isolate retry),
+      // return the previously committed state without double-counting or raising a false duplicate conflict.
+      if (cleanIdempotencyKey) {
+        const existingScan = await this.db
+          .prepare('SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1')
+          .bind(cleanIdempotencyKey)
+          .first<ScanEventRow>();
 
-    const targetStatus =
-      input.status || (recQty > 0 ? 'received' : 'outstanding');
+        if (existingScan) {
+          const currentPart = await this.db
+            .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+            .bind(deliveryId, partId)
+            .first<DeliveryPartRow>();
+          const currentDelivery = await this.db
+            .prepare('SELECT version FROM deliveries WHERE id = ?')
+            .bind(deliveryId)
+            .first<{ version: number }>();
 
-    // DUPLICATE & CONCURRENT RACE PROTECTION:
-    // A scan attempt is rejected as a duplicate if:
-    // 1. The part is already marked 'received' AND its required quantity is already fulfilled (currentRecQty >= reqQty), OR
-    // 2. It is a standard non-increment scan attempt on a part that has already been scanned (currentRecQty > 0) and is not increasing partial quantity toward reqQty.
-    const isAlreadyFulfilled =
-      part.status === 'received' && currentRecQty >= reqQty && reqQty > 0;
-    const isRedundantSameScan =
-      isScanAttempt &&
-      part.status === 'received' &&
-      targetStatus === 'received' &&
-      currentRecQty > 0 &&
-      (!isIncrementMode && recQty <= currentRecQty);
-
-    if (isScanAttempt && targetStatus === 'received' && (isAlreadyFulfilled || isRedundantSameScan)) {
-      const alreadyScannedBy = part.last_scanned_by_name || 'Another worker';
-      const alreadyScannedAt = part.scanned_at || part.updated_at;
-      const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const dupMsg = `Duplicate scan – part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
-
-      try {
-        await this.db
-          .prepare(
-            `INSERT INTO scan_events (
-              id, delivery_id, part_id, user_id, timestamp, code,
-              scan_type, scan_status, quantity_added, received_quantity_after,
-              scan_result, employee_name, employee_role, event_action
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
-          )
-          .bind(
-            dupScanId,
-            deliveryId,
-            partId,
-            input.userId || null,
-            now,
-            input.scannedCode || part.part_number,
-            input.scannedVia || 'qr',
-            currentRecQty,
-            dupMsg,
-            input.employeeName || null,
-            input.employeeRole || null
-          )
-          .run();
-      } catch {
-        // Ignore audit insert error on duplicate
+          return {
+            duplicate: false,
+            idempotentReplay: true,
+            status: 'updated',
+            deliveryVersion: Number(currentDelivery?.version || 1),
+            part: currentPart ? this.mapPartRow(currentPart) : null,
+            scanEvent: this.mapScanRow(existingScan),
+          };
+        }
       }
 
-      return {
-        duplicate: true,
-        status: 'duplicate',
-        message: 'Duplicate scan – this part has already been received by another worker',
-        error: 'Duplicate scan – this part has already been received by another worker',
-        detailMessage: dupMsg,
-        alreadyScannedBy,
-        alreadyScannedAt,
-        part: this.mapPartRow(part),
-      };
-    }
-
-    const isQtyMatch = targetStatus === 'received' && recQty === reqQty;
-    const verificationStatus =
-      targetStatus === 'received'
-        ? isQtyMatch
-          ? 'verified'
-          : 'quantity_mismatch'
-        : 'unscanned';
-
-    const scannedVia = targetStatus === 'received' ? input.scannedVia || 'manual' : null;
-    const scannedCode =
-      targetStatus === 'received'
-        ? input.scannedCode || part.scanned_code || (scannedVia === 'qr' ? part.part_number : part.item_number)
-        : null;
-    const scannedAt = targetStatus === 'received' ? now : null;
-    const lastScannedById =
-      targetStatus === 'received' ? input.userId || part.last_scanned_by_id || null : null;
-    const lastScannedByName =
-      targetStatus === 'received'
-        ? input.employeeName || part.last_scanned_by_name || 'Worker'
-        : null;
-
-    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const addedQty = Math.max(0, recQty - currentRecQty);
-    const scanStatus =
-      targetStatus === 'received'
-        ? isQtyMatch
-          ? 'match_success'
-          : 'quantity_mismatch'
-        : 'undo_performed';
-
-    const scanResultMsg =
-      targetStatus === 'received'
-        ? isQtyMatch
-          ? `Verified ${part.part_number} (No. ${part.item_number}) - Qty ${recQty}/${reqQty} matched`
-          : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required`
-        : `Unticked ${part.part_number} (${part.item_number})`;
-
-    // Conditional optimistic-concurrency SQL UPDATE guard:
-    // Ensures that if another worker modified this part row concurrently (version changed),
-    // this UPDATE affects 0 rows and we immediately re-check and reject duplicate scans.
-    const updateRes = await this.db
-      .prepare(
-        `UPDATE delivery_parts
-         SET received_quantity = ?, verification_status = ?, status = ?,
-             scanned_via = ?, scanned_code = ?, scanned_at = ?,
-             last_scanned_by_id = ?, last_scanned_by_name = ?,
-             notes = COALESCE(?, notes),
-             version = COALESCE(version, 1) + 1,
-             updated_at = ?
-         WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
-      )
-      .bind(
-        recQty,
-        verificationStatus,
-        targetStatus,
-        scannedVia,
-        scannedCode,
-        scannedAt,
-        lastScannedById,
-        lastScannedByName,
-        input.notes || null,
-        now,
-        deliveryId,
-        partId,
-        currentVersion
-      )
-      .run();
-
-    const rowsChanged = Number(updateRes.meta?.changes ?? 1);
-    if (rowsChanged === 0) {
-      // Another worker's concurrent update won the race! Re-read and return duplicate conflict if received
-      const latestPart = await this.db
+      const part = await this.db
         .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
         .bind(deliveryId, partId)
         .first<DeliveryPartRow>();
 
-      if (latestPart && latestPart.status === 'received') {
+      if (!part) {
+        throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+      }
+
+      const now = new Date().toISOString();
+      const reqQty = Math.max(0, part.required_quantity);
+      const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
+      const currentVersion = Number(part.version || 1);
+      const isIncrementMode = input.mode === 'increment';
+      const isScanAttempt = input.scannedVia !== 'manual';
+
+      const recQty = isIncrementMode
+        ? currentRecQty + Math.round(enteredQty)
+        : Math.round(enteredQty);
+
+      const targetStatus =
+        input.status || (recQty > 0 ? 'received' : 'outstanding');
+
+      // DUPLICATE & CONCURRENT RACE PROTECTION:
+      // A scan attempt is rejected as a duplicate if:
+      // 1. The part is already marked 'received' AND its required quantity is already fulfilled (currentRecQty >= reqQty), OR
+      // 2. It is a standard non-increment scan attempt on a part that has already been scanned (currentRecQty > 0) and is not increasing partial quantity toward reqQty.
+      const isAlreadyFulfilled =
+        part.status === 'received' && currentRecQty >= reqQty && reqQty > 0;
+      const isRedundantSameScan =
+        isScanAttempt &&
+        part.status === 'received' &&
+        targetStatus === 'received' &&
+        currentRecQty > 0 &&
+        (!isIncrementMode && recQty <= currentRecQty);
+
+      if (isScanAttempt && targetStatus === 'received' && (isAlreadyFulfilled || isRedundantSameScan)) {
+        const alreadyScannedBy = part.last_scanned_by_name || 'Another worker';
+        const alreadyScannedAt = part.scanned_at || part.updated_at;
+        const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const dupMsg = `Duplicate scan – part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
+
+        try {
+          await this.db
+            .prepare(
+              `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
+            )
+            .bind(
+              dupScanId,
+              deliveryId,
+              partId,
+              input.userId || null,
+              now,
+              input.scannedCode || part.part_number,
+              this.normalizeScanType(input.scannedVia || 'qr'),
+              currentRecQty,
+              dupMsg,
+              input.employeeName || null,
+              input.employeeRole || null
+            )
+            .run();
+        } catch {
+          // Ignore audit insert error on duplicate
+        }
+
         return {
           duplicate: true,
           status: 'duplicate',
           message: 'Duplicate scan – this part has already been received by another worker',
           error: 'Duplicate scan – this part has already been received by another worker',
-          alreadyScannedBy: latestPart.last_scanned_by_name || 'Another worker',
-          alreadyScannedAt: latestPart.scanned_at || latestPart.updated_at,
-          part: this.mapPartRow(latestPart),
+          detailMessage: dupMsg,
+          alreadyScannedBy,
+          alreadyScannedAt,
+          part: this.mapPartRow(part),
         };
       }
-    }
 
-    // Record audit scan event and increment delivery version atomically
-    await this.db.batch([
-      this.db
+      const isQtyMatch = targetStatus === 'received' && recQty === reqQty;
+      const verificationStatus =
+        targetStatus === 'received'
+          ? isQtyMatch
+            ? 'verified'
+            : 'quantity_mismatch'
+          : 'unscanned';
+
+      const scannedVia =
+        targetStatus === 'received'
+          ? this.normalizeScanType(input.scannedVia || 'manual')
+          : null;
+      const scannedCode =
+        targetStatus === 'received'
+          ? input.scannedCode || part.scanned_code || (scannedVia === 'qr' ? part.part_number : part.item_number)
+          : null;
+      const scannedAt = targetStatus === 'received' ? now : null;
+      const lastScannedById =
+        targetStatus === 'received' ? input.userId || part.last_scanned_by_id || null : null;
+      const lastScannedByName =
+        targetStatus === 'received'
+          ? input.employeeName || part.last_scanned_by_name || 'Worker'
+          : null;
+
+      const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const addedQty = Math.max(0, recQty - currentRecQty);
+      const scanStatus =
+        targetStatus === 'received'
+          ? isQtyMatch
+            ? 'match_success'
+            : 'quantity_mismatch'
+          : 'undo_performed';
+
+      const scanResultMsg =
+        targetStatus === 'received'
+          ? isQtyMatch
+            ? `Verified ${part.part_number} (No. ${part.item_number}) - Qty ${recQty}/${reqQty} matched`
+            : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required`
+          : `Unticked ${part.part_number} (${part.item_number})`;
+
+      // Conditional optimistic-concurrency SQL UPDATE guard:
+      // Ensures that if another Worker isolate modified this part row concurrently (version changed),
+      // this UPDATE affects 0 rows and we immediately loop to re-read the fresh row and re-evaluate!
+      const updateRes = await this.db
         .prepare(
-          `INSERT INTO scan_events (
-            id, delivery_id, part_id, user_id, timestamp, code,
-            scan_type, scan_status, quantity_added, received_quantity_after,
-            scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `UPDATE delivery_parts
+           SET received_quantity = ?, verification_status = ?, status = ?,
+               scanned_via = ?, scanned_code = ?, scanned_at = ?,
+               last_scanned_by_id = ?, last_scanned_by_name = ?,
+               notes = COALESCE(?, notes),
+               version = COALESCE(version, 1) + 1,
+               updated_at = ?
+           WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
         )
         .bind(
-          scanId,
+          recQty,
+          verificationStatus,
+          targetStatus,
+          scannedVia,
+          scannedCode,
+          scannedAt,
+          lastScannedById,
+          lastScannedByName,
+          input.notes || null,
+          now,
           deliveryId,
           partId,
-          input.userId || null,
-          now,
-          scannedCode || part.part_number,
-          scannedVia || 'manual',
-          scanStatus,
-          addedQty,
-          recQty,
-          scanResultMsg,
-          input.rawOcrText || null,
-          input.employeeName || null,
-          input.employeeRole || null,
-          input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick'),
-          cleanIdempotencyKey
-        ),
-      this.db
-        .prepare(
-          'UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?'
+          currentVersion
         )
-        .bind(now, deliveryId),
-    ]);
+        .run();
 
-    const updatedPart = await this.db
-      .prepare('SELECT * FROM delivery_parts WHERE id = ?')
-      .bind(partId)
-      .first<DeliveryPartRow>();
+      const rowsChanged = Number(updateRes.meta?.changes ?? 1);
+      if (rowsChanged === 0) {
+        // Concurrent update occurred on another isolate; retry CAS loop to re-read latest state
+        if (attempt < MAX_CAS_ATTEMPTS) {
+          continue;
+        }
+        const latestPart = await this.db
+          .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+          .bind(deliveryId, partId)
+          .first<DeliveryPartRow>();
 
-    const updatedDeliveryRow = await this.db
-      .prepare('SELECT version, delivery_status FROM deliveries WHERE id = ?')
-      .bind(deliveryId)
-      .first<{ version: number; delivery_status: string }>();
+        return {
+          duplicate: true,
+          status: 'duplicate',
+          message: 'Duplicate scan – this part has already been received by another worker',
+          error: 'Duplicate scan – this part has already been received by another worker',
+          alreadyScannedBy: latestPart?.last_scanned_by_name || 'Another worker',
+          alreadyScannedAt: latestPart?.scanned_at || latestPart?.updated_at,
+          part: latestPart ? this.mapPartRow(latestPart) : this.mapPartRow(part),
+        };
+      }
 
-    const statsRow = await this.db
-      .prepare(
-        `SELECT
-           COUNT(*) as total_count,
-           SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
-         FROM delivery_parts
-         WHERE delivery_id = ?`
-      )
-      .bind(deliveryId)
-      .first<{ total_count: number; received_count: number }>();
+      // Record audit scan event and increment delivery version atomically
+      try {
+        await this.db.batch([
+          this.db
+            .prepare(
+              `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .bind(
+              scanId,
+              deliveryId,
+              partId,
+              input.userId || null,
+              now,
+              scannedCode || part.part_number,
+              scannedVia || 'manual',
+              scanStatus,
+              addedQty,
+              recQty,
+              scanResultMsg,
+              input.rawOcrText || null,
+              input.employeeName || null,
+              input.employeeRole || null,
+              input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick'),
+              cleanIdempotencyKey
+            ),
+          this.db
+            .prepare(
+              'UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?'
+            )
+            .bind(now, deliveryId),
+        ]);
+      } catch (batchErr: any) {
+        // If a concurrent request with the same idempotency_key hit the UNIQUE index, loop to return idempotentReplay
+        if (cleanIdempotencyKey && String(batchErr?.message || '').includes('UNIQUE')) {
+          continue;
+        }
+        throw batchErr;
+      }
 
-    const totalCount = Number(statsRow?.total_count || 0);
-    const receivedCount = Number(statsRow?.received_count || 0);
-    const outstandingCount = Math.max(0, totalCount - receivedCount);
+      const updatedPart = await this.db
+        .prepare('SELECT * FROM delivery_parts WHERE id = ?')
+        .bind(partId)
+        .first<DeliveryPartRow>();
 
-    return {
-      duplicate: false,
-      status: 'updated',
-      deliveryVersion: Number(updatedDeliveryRow?.version || 1),
-      deliveryStats: {
-        totalCount,
-        receivedCount,
-        outstandingCount,
-      },
-      part: updatedPart ? this.mapPartRow(updatedPart) : null,
-      scanEvent: {
-        id: scanId,
-        deliveryId,
-        partId,
-        userId: input.userId,
-        employeeName: input.employeeName,
-        employeeRole: input.employeeRole,
-        eventAction: input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick'),
-        timestamp: now,
-        code: scannedCode || part.part_number,
-        codeType: scannedVia || 'manual',
-        status: scanStatus,
-        quantityAdded: addedQty,
-        receivedQuantity: recQty,
-        message: scanResultMsg,
-        idempotencyKey: cleanIdempotencyKey || undefined,
-      },
-    };
+      const updatedDeliveryRow = await this.db
+        .prepare('SELECT version, delivery_status FROM deliveries WHERE id = ?')
+        .bind(deliveryId)
+        .first<{ version: number; delivery_status: string }>();
+
+      const statsRow = await this.db
+        .prepare(
+          `SELECT
+             COUNT(*) as total_count,
+             SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
+           FROM delivery_parts
+           WHERE delivery_id = ?`
+        )
+        .bind(deliveryId)
+        .first<{ total_count: number; received_count: number }>();
+
+      const totalCount = Number(statsRow?.total_count || 0);
+      const receivedCount = Number(statsRow?.received_count || 0);
+      const outstandingCount = Math.max(0, totalCount - receivedCount);
+
+      return {
+        duplicate: false,
+        status: 'updated',
+        deliveryVersion: Number(updatedDeliveryRow?.version || 1),
+        deliveryStats: {
+          totalCount,
+          receivedCount,
+          outstandingCount,
+        },
+        part: updatedPart ? this.mapPartRow(updatedPart) : null,
+        scanEvent: {
+          id: scanId,
+          deliveryId,
+          partId,
+          userId: input.userId,
+          employeeName: input.employeeName,
+          employeeRole: input.employeeRole,
+          eventAction: input.eventAction || (recQty > 0 ? 'part_scan' : 'part_untick'),
+          timestamp: now,
+          code: scannedCode || part.part_number,
+          codeType: scannedVia || 'manual',
+          status: scanStatus,
+          quantityAdded: addedQty,
+          receivedQuantity: recQty,
+          message: scanResultMsg,
+          idempotencyKey: cleanIdempotencyKey || undefined,
+        },
+      };
+    }
+
+    throw new Error('Failed to commit part quantity after concurrent retries');
   }
 
   /**
@@ -1886,6 +1941,8 @@ export class PalletTrackDbService {
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const qtyAdded = Math.max(0, Math.round(Number(input.quantityAdded || 0)));
 
+    const normScanType = this.normalizeScanType(input.scanType);
+
     await this.db
       .prepare(
         `INSERT INTO scan_events (
@@ -1901,7 +1958,7 @@ export class PalletTrackDbService {
         input.userId || null,
         now,
         input.code,
-        input.scanType,
+        normScanType,
         input.scanStatus,
         qtyAdded,
         input.receivedQuantityAfter ?? null,
@@ -1923,7 +1980,7 @@ export class PalletTrackDbService {
       eventAction: input.eventAction || 'scan_logged',
       timestamp: now,
       code: input.code,
-      codeType: input.scanType,
+      codeType: normScanType,
       status: input.scanStatus,
       quantityAdded: qtyAdded,
       receivedQuantity: input.receivedQuantityAfter,
@@ -1945,7 +2002,7 @@ export class PalletTrackDbService {
 
   /**
    * Safe migration helper for existing localStorage / IndexedDB deliveries.
-   * Checks for existing deliveries by ID and Docket Number to prevent conflicting duplicates.
+   * Checks for existing deliveries by ID and case-insensitive Docket Number to prevent conflicting duplicates.
    */
   async migrateLocalDeliveries(deliveries: CreateDeliveryInput[]) {
     if (!Array.isArray(deliveries) || deliveries.length === 0) {
@@ -1954,23 +2011,40 @@ export class PalletTrackDbService {
 
     const importedIds: string[] = [];
     const existingIds: string[] = [];
+    const seenIdsInBatch = new Set<string>();
+    const seenDocketsInBatch = new Set<string>();
 
     for (const del of deliveries) {
       if (!del || !del.docketNumber) continue;
+      const cleanId = (del.id || '').trim();
+      const normDocket = del.docketNumber.trim().toLowerCase();
+      if (!normDocket) continue;
 
-      // Check if ID or Docket Number already exists in the central database
-      const existing = await this.db
-        .prepare('SELECT id FROM deliveries WHERE id = ? OR docket_number = ?')
-        .bind(del.id || '', del.docketNumber)
-        .first();
-
-      if (existing) {
-        existingIds.push(del.id || del.docketNumber);
+      if ((cleanId && seenIdsInBatch.has(cleanId)) || seenDocketsInBatch.has(normDocket)) {
+        existingIds.push(cleanId || del.docketNumber);
         continue;
       }
 
-      await this.createDelivery(del);
-      importedIds.push(del.id || del.docketNumber);
+      // Check if ID or case-insensitive Docket Number already exists in the central database
+      const existing = await this.db
+        .prepare(
+          'SELECT id FROM deliveries WHERE id = ? OR LOWER(TRIM(docket_number)) = LOWER(TRIM(?))'
+        )
+        .bind(cleanId, del.docketNumber.trim())
+        .first();
+
+      if (existing) {
+        existingIds.push(cleanId || del.docketNumber);
+        if (cleanId) seenIdsInBatch.add(cleanId);
+        seenDocketsInBatch.add(normDocket);
+        continue;
+      }
+
+      const created = await this.createDelivery(del);
+      if (cleanId) seenIdsInBatch.add(cleanId);
+      if (created?.id) seenIdsInBatch.add(created.id);
+      seenDocketsInBatch.add(normDocket);
+      importedIds.push(created?.id || cleanId || del.docketNumber);
     }
 
     return {
@@ -2008,7 +2082,7 @@ export class PalletTrackDbService {
     return initPromise;
   }
 
-  private async runSchemaBootstrap(): Promise<void> {
+  private async probeSchemaColumns(): Promise<boolean> {
     try {
       await this.db
         .prepare(
@@ -2021,10 +2095,16 @@ export class PalletTrackDbService {
             (SELECT COUNT(*) FROM (SELECT seq, id FROM realtime_events LIMIT 1)) AS schema_ready`
         )
         .first();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async runSchemaBootstrap(): Promise<void> {
+    if (await this.probeSchemaColumns()) {
       PalletTrackDbService.verifiedDbs.add(this.db);
       return;
-    } catch {
-      // Tables or columns missing on a newly created or upgraded D1 instance; initialize non-destructively
     }
 
     const createStatements = [
@@ -2147,78 +2227,8 @@ export class PalletTrackDbService {
       )`,
     ];
 
-    try {
-      await this.db.batch(createStatements.map((sql) => this.db.prepare(sql)));
-    } catch {
-      for (const sql of createStatements) {
-        try {
-          await this.db.prepare(sql).run();
-        } catch (e) {
-          console.warn('Schema bootstrap table notice:', e);
-        }
-      }
-    }
-
-    const alterCols: Array<{ table: string; col: string; sql: string }> = [
-      { table: 'users', col: 'employee_code', sql: 'ALTER TABLE users ADD COLUMN employee_code TEXT' },
-      { table: 'users', col: 'pin_salt', sql: 'ALTER TABLE users ADD COLUMN pin_salt TEXT' },
-      { table: 'users', col: 'last_login_at', sql: 'ALTER TABLE users ADD COLUMN last_login_at TEXT' },
-      { table: 'users', col: 'failed_login_attempts', sql: 'ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0' },
-      { table: 'users', col: 'locked_until', sql: 'ALTER TABLE users ADD COLUMN locked_until TEXT' },
-      { table: 'users', col: 'created_by', sql: 'ALTER TABLE users ADD COLUMN created_by TEXT' },
-      { table: 'scan_events', col: 'employee_name', sql: 'ALTER TABLE scan_events ADD COLUMN employee_name TEXT' },
-      { table: 'scan_events', col: 'employee_role', sql: 'ALTER TABLE scan_events ADD COLUMN employee_role TEXT' },
-      { table: 'scan_events', col: 'event_action', sql: "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'" },
-      { table: 'scan_events', col: 'idempotency_key', sql: 'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT' },
-      { table: 'scan_events', col: 'sequence_number', sql: 'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER' },
-      { table: 'deliveries', col: 'version', sql: 'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
-      { table: 'delivery_parts', col: 'revision', sql: 'ALTER TABLE delivery_parts ADD COLUMN revision TEXT' },
-      { table: 'delivery_parts', col: 'manually_edited', sql: 'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0' },
-      { table: 'delivery_parts', col: 'original_ocr_values', sql: 'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT' },
-      { table: 'delivery_parts', col: 'last_edited_by', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT' },
-      { table: 'delivery_parts', col: 'last_edited_at', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT' },
-      { table: 'delivery_parts', col: 'version', sql: 'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
-      { table: 'delivery_parts', col: 'last_scanned_by_id', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT' },
-      { table: 'delivery_parts', col: 'last_scanned_by_name', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT' },
-    ];
-
-    try {
-      const pragmaBatch = await this.db.batch<{ name: string }>([
-        this.db.prepare('PRAGMA table_info(users)'),
-        this.db.prepare('PRAGMA table_info(scan_events)'),
-        this.db.prepare('PRAGMA table_info(deliveries)'),
-        this.db.prepare('PRAGMA table_info(delivery_parts)'),
-      ]);
-      const existingByTable: Record<string, Set<string>> = {
-        users: new Set((pragmaBatch[0]?.results || []).map((r) => r.name)),
-        scan_events: new Set((pragmaBatch[1]?.results || []).map((r) => r.name)),
-        deliveries: new Set((pragmaBatch[2]?.results || []).map((r) => r.name)),
-        delivery_parts: new Set((pragmaBatch[3]?.results || []).map((r) => r.name)),
-      };
-      const missingAlters = alterCols.filter(
-        (item) =>
-          existingByTable[item.table] &&
-          existingByTable[item.table].size > 0 &&
-          !existingByTable[item.table].has(item.col)
-      );
-      for (const item of missingAlters) {
-        try {
-          await this.db.prepare(item.sql).run();
-        } catch {
-          // Column already exists
-        }
-      }
-    } catch {
-      for (const item of alterCols) {
-        try {
-          await this.db.prepare(item.sql).run();
-        } catch {
-          // Column already exists
-        }
-      }
-    }
-
-    const indexStatements = [
+    const schemaBootstrapStatements = [
+      ...createStatements,
       'CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)',
       'CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)',
@@ -2241,13 +2251,72 @@ export class PalletTrackDbService {
     ];
 
     try {
-      await this.db.batch(indexStatements.map((sql) => this.db.prepare(sql)));
+      await this.db.batch(schemaBootstrapStatements.map((sql) => this.db.prepare(sql)));
     } catch {
-      for (const sql of indexStatements) {
+      for (const sql of schemaBootstrapStatements) {
         try {
           await this.db.prepare(sql).run();
-        } catch {
-          // Ignore index notice
+        } catch (e) {
+          console.warn('Schema bootstrap notice:', e);
+        }
+      }
+    }
+
+    // Only inspect PRAGMA table_info and run ALTER TABLE if an existing legacy table is still missing a column
+    const allColumnsPresentAfterCreate = await this.probeSchemaColumns();
+    if (!allColumnsPresentAfterCreate) {
+      const alterCols: Array<{ table: string; col: string; sql: string }> = [
+        { table: 'users', col: 'employee_code', sql: 'ALTER TABLE users ADD COLUMN employee_code TEXT' },
+        { table: 'users', col: 'pin_salt', sql: 'ALTER TABLE users ADD COLUMN pin_salt TEXT' },
+        { table: 'users', col: 'last_login_at', sql: 'ALTER TABLE users ADD COLUMN last_login_at TEXT' },
+        { table: 'users', col: 'failed_login_attempts', sql: 'ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0' },
+        { table: 'users', col: 'locked_until', sql: 'ALTER TABLE users ADD COLUMN locked_until TEXT' },
+        { table: 'users', col: 'created_by', sql: 'ALTER TABLE users ADD COLUMN created_by TEXT' },
+        { table: 'scan_events', col: 'employee_name', sql: 'ALTER TABLE scan_events ADD COLUMN employee_name TEXT' },
+        { table: 'scan_events', col: 'employee_role', sql: 'ALTER TABLE scan_events ADD COLUMN employee_role TEXT' },
+        { table: 'scan_events', col: 'event_action', sql: "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'" },
+        { table: 'scan_events', col: 'idempotency_key', sql: 'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT' },
+        { table: 'scan_events', col: 'sequence_number', sql: 'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER' },
+        { table: 'deliveries', col: 'version', sql: 'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+        { table: 'delivery_parts', col: 'revision', sql: 'ALTER TABLE delivery_parts ADD COLUMN revision TEXT' },
+        { table: 'delivery_parts', col: 'manually_edited', sql: 'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0' },
+        { table: 'delivery_parts', col: 'original_ocr_values', sql: 'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT' },
+        { table: 'delivery_parts', col: 'last_edited_by', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT' },
+        { table: 'delivery_parts', col: 'last_edited_at', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT' },
+        { table: 'delivery_parts', col: 'version', sql: 'ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+        { table: 'delivery_parts', col: 'last_scanned_by_id', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT' },
+        { table: 'delivery_parts', col: 'last_scanned_by_name', sql: 'ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT' },
+      ];
+
+      try {
+        const pragmaBatch = await this.db.batch<{ name: string }>([
+          this.db.prepare('PRAGMA table_info(users)'),
+          this.db.prepare('PRAGMA table_info(scan_events)'),
+          this.db.prepare('PRAGMA table_info(deliveries)'),
+          this.db.prepare('PRAGMA table_info(delivery_parts)'),
+        ]);
+        const existingByTable: Record<string, Set<string>> = {
+          users: new Set((pragmaBatch[0]?.results || []).map((r) => r.name)),
+          scan_events: new Set((pragmaBatch[1]?.results || []).map((r) => r.name)),
+          deliveries: new Set((pragmaBatch[2]?.results || []).map((r) => r.name)),
+          delivery_parts: new Set((pragmaBatch[3]?.results || []).map((r) => r.name)),
+        };
+        const missingAlters = alterCols.filter(
+          (item) =>
+            existingByTable[item.table] &&
+            existingByTable[item.table].size > 0 &&
+            !existingByTable[item.table].has(item.col)
+        );
+        if (missingAlters.length > 0) {
+          await this.db.batch(missingAlters.map((item) => this.db.prepare(item.sql)));
+        }
+      } catch {
+        for (const item of alterCols) {
+          try {
+            await this.db.prepare(item.sql).run();
+          } catch {
+            // Column already exists
+          }
         }
       }
     }

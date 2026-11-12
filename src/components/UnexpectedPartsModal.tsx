@@ -54,17 +54,19 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
-      <div className="w-full max-w-lg bg-white border border-gray-200 rounded-2xl shadow-xl flex flex-col max-h-[85vh] overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
+      <div className="w-full max-w-lg bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden animate-in fade-in zoom-in-95 duration-150 text-[var(--pt-text,#FFFFFF)]">
         {/* Header */}
-        <div className="p-4 border-b border-gray-100 flex items-center justify-between gap-3 bg-white">
+        <div className="p-4 border-b border-[var(--pt-border,#29243D)] flex items-center justify-between gap-3 bg-[var(--pt-bg-secondary,#101321)]">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-red-50 text-red-600 border border-red-200 flex items-center justify-center">
+            <div className="w-8 h-8 rounded-lg bg-[#EF4444]/15 text-[#EF4444] border border-[#EF4444]/40 flex items-center justify-center">
               <AlertTriangle className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="font-bold text-sm text-gray-900">Unexpected Parts Discrepancies</h3>
-              <p className="text-xs text-gray-500">
+              <h3 className="font-bold text-sm text-[var(--pt-text,#FFFFFF)]">
+                Unexpected Parts Discrepancies
+              </h3>
+              <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)]">
                 Parts scanned that do not match docket {delivery.docketNumber}
               </p>
             </div>
@@ -72,7 +74,7 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1 rounded-lg text-gray-400 hover:text-gray-700 cursor-pointer"
+            className="p-1 rounded-lg text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -81,10 +83,10 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
           {unexpectedList.length === 0 ? (
-            <div className="py-10 text-center text-gray-500">
-              <CheckCircle2 className="w-8 h-8 text-emerald-600 mx-auto mb-2" />
-              <p className="text-sm font-semibold text-gray-900">No Unexpected Parts</p>
-              <p className="text-xs text-gray-500 mt-0.5">
+            <div className="py-10 text-center text-[var(--pt-text-secondary,#A3A8BD)]">
+              <CheckCircle2 className="w-8 h-8 text-[#00D979] mx-auto mb-2" />
+              <p className="text-sm font-semibold text-[var(--pt-text,#FFFFFF)]">No Unexpected Parts</p>
+              <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
                 All scanned parts correspond to valid lines on this docket.
               </p>
             </div>
@@ -94,13 +96,13 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
                 key={item.id}
                 className={`p-3.5 rounded-xl border transition-all ${
                   item.resolved
-                    ? 'bg-gray-50 border-gray-200 opacity-70'
-                    : 'bg-white border-red-200/90 shadow-xs'
+                    ? 'bg-[var(--pt-bg,#080B12)]/60 border-[var(--pt-border,#29243D)] opacity-75'
+                    : 'bg-[var(--pt-bg-secondary,#101321)] border-[#EF4444]/40 shadow-xs'
                 }`}
               >
                 <div className="flex items-start justify-between gap-3 mb-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="w-6 h-6 rounded bg-red-50 text-red-700 border border-red-200 flex items-center justify-center text-xs font-mono flex-shrink-0">
+                    <span className="w-6 h-6 rounded bg-[#EF4444]/15 text-[#EF4444] border border-[#EF4444]/40 flex items-center justify-center text-xs font-mono flex-shrink-0">
                       {item.codeType === 'qr' ? (
                         <QrCode className="w-3.5 h-3.5" />
                       ) : (
@@ -108,10 +110,10 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
                       )}
                     </span>
                     <div className="min-w-0">
-                      <span className="font-mono font-bold text-sm text-gray-900 block truncate">
+                      <span className="font-mono font-bold text-sm text-[var(--pt-text,#FFFFFF)] block truncate">
                         {item.code}
                       </span>
-                      <span className="text-[10px] text-gray-500 font-mono">
+                      <span className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] font-mono">
                         Scanned at {new Date(item.scannedAt).toLocaleTimeString()} ({item.codeType.toUpperCase()})
                       </span>
                     </div>
@@ -120,17 +122,17 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
                   <div className="flex items-center gap-1.5 flex-shrink-0">
                     <button
                       onClick={() => handleResolve(item.id)}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                      className={`px-2.5 py-1 rounded-lg text-xs font-mono font-semibold transition-all cursor-pointer ${
                         item.resolved
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                          ? 'bg-[#00D979]/15 text-[#00D979] border border-[#00D979]/40'
+                          : 'bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)]'
                       }`}
                     >
                       {item.resolved ? 'Resolved' : 'Mark Resolved'}
                     </button>
                     <button
                       onClick={() => handleRemove(item.id)}
-                      className="p-1 rounded text-gray-400 hover:text-red-600 cursor-pointer"
+                      className="p-1 rounded text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[#EF4444] cursor-pointer"
                       title="Delete"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -143,7 +145,7 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
                   value={item.notes || ''}
                   placeholder="Notes (e.g. Quarantined on Pallet 2, extra supplier spare)..."
                   onChange={(e) => handleUpdateNotes(item.id, e.target.value)}
-                  className="w-full px-2.5 py-1.5 rounded-lg bg-gray-50 border border-gray-200 text-xs text-gray-800 placeholder:text-gray-400 focus:border-red-500 focus:bg-white outline-none"
+                  className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--pt-input-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-xs text-[var(--pt-text,#FFFFFF)] placeholder:text-[var(--pt-text-muted,#737B94)] focus:border-[var(--pt-primary,#A020F0)] outline-none"
                 />
               </div>
             ))
@@ -151,11 +153,11 @@ export const UnexpectedPartsModal: React.FC<UnexpectedPartsModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-3 border-t border-gray-100 bg-gray-50 flex items-center justify-between text-xs text-gray-500">
+        <div className="p-3 border-t border-[var(--pt-border,#29243D)] bg-[var(--pt-bg-secondary,#101321)] flex items-center justify-between text-xs text-[var(--pt-text-secondary,#A3A8BD)]">
           <span>{unexpectedList.length} recorded unexpected items</span>
           <button
             onClick={onClose}
-            className="px-3.5 py-1.5 rounded-lg bg-gray-900 hover:bg-gray-800 text-white font-medium cursor-pointer"
+            className="px-3.5 py-1.5 rounded-lg pt-btn-primary font-mono font-bold text-xs cursor-pointer"
           >
             Close
           </button>

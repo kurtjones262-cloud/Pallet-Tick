@@ -32,7 +32,6 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
   onClose,
   userRole,
 }) => {
-
   const [deliveries, setDeliveries] = useState<Delivery[]>(getStoredDeliveries());
   const [filter, setFilter] = useState<'all' | 'receiving' | 'completed'>('all');
   const [exportingId, setExportingId] = useState<string | null>(null);
@@ -79,29 +78,31 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center"
+      className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-end sm:items-center justify-center"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg bg-[#F6F5F2] border-t sm:border border-[#E4E3DE] sm:rounded-[6px] shadow-xl flex flex-col max-h-[85dvh] overflow-hidden"
+        className="w-full max-w-lg bg-[var(--pt-bg-secondary,#101321)] border-t sm:border border-[var(--pt-border,#29243D)] rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[85dvh] overflow-hidden text-[var(--pt-text,#FFFFFF)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-4 py-3 border-b border-[#E4E3DE] flex items-center justify-between gap-3">
-          <h3 className="font-semibold text-sm text-[#18181B]">Deliveries</h3>
+        <div className="px-4 py-3 bg-[var(--pt-card,#15182A)] border-b border-[var(--pt-border,#29243D)] flex items-center justify-between gap-3">
+          <h3 className="font-mono font-bold text-sm uppercase tracking-wider text-[var(--pt-text,#FFFFFF)]">
+            Deliveries
+          </h3>
 
           <div className="flex items-center gap-2">
             {deliveries.length > 0 && (
               <button
                 onClick={handleExportAllZip}
                 disabled={exportingId === 'all'}
-                className="h-7 px-2 inline-flex items-center gap-1 rounded-[4px] border border-[#E4E3DE] bg-white hover:bg-zinc-50 text-zinc-700 text-xs font-medium cursor-pointer transition-colors"
+                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-lg border border-[var(--pt-border,#29243D)] bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] text-xs font-mono font-semibold cursor-pointer transition-colors"
                 title="Backup all deliveries as .zip archive"
               >
                 {exportingId === 'all' ? (
-                   <Loader2 className="w-3.5 h-3.5 animate-spin text-[#059669]" />
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--pt-primary,#A020F0)]" />
                 ) : (
-                  <Archive className="w-3.5 h-3.5 text-zinc-500" />
+                  <Archive className="w-3.5 h-3.5 text-[var(--pt-primary-light,#C084FC)]" />
                 )}
                 <span className="hidden xs:inline">Backup .zip</span>
               </button>
@@ -113,14 +114,13 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                   onClose();
                   onOpenMigration();
                 }}
-                className="h-7 px-2 inline-flex items-center gap-1 rounded-[4px] border border-cyan-700/60 bg-cyan-950/40 hover:bg-cyan-900/50 text-cyan-300 text-xs font-medium cursor-pointer transition-colors"
+                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-lg border border-[var(--pt-border,#29243D)] bg-[var(--pt-bg,#080B12)] hover:bg-[var(--pt-hover-bg)] text-[var(--pt-primary-light,#C084FC)] text-xs font-mono font-semibold cursor-pointer transition-colors"
                 title="Migrate or sync local deliveries to central Cloudflare D1 database"
               >
-                <Database className="w-3.5 h-3.5 text-cyan-400" />
+                <Database className="w-3.5 h-3.5 text-[var(--pt-primary,#A020F0)]" />
                 <span className="hidden xs:inline">D1 Sync</span>
               </button>
             )}
-
 
             {userRole !== 'employee' && userRole !== 'operator' && (
               <button
@@ -128,7 +128,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                   onClose();
                   onOpenNewDelivery();
                 }}
-                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[4px] bg-[#059669] hover:bg-[#047857] text-white text-xs font-semibold cursor-pointer"
+                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-lg pt-btn-primary text-xs font-mono font-bold cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>New docket</span>
@@ -137,7 +137,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
 
             <button
               onClick={onClose}
-              className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"
+              className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] cursor-pointer"
             >
               <X className="w-4 h-4" />
             </button>
@@ -145,23 +145,23 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
         </div>
 
         {/* Underline Filter Tabs */}
-        <div className="px-4 pt-2 border-b border-[#E4E3DE] flex items-center gap-5 text-xs">
+        <div className="px-4 pt-2 bg-[var(--pt-bg-secondary,#101321)] border-b border-[var(--pt-border,#29243D)] flex items-center gap-5 text-xs font-mono">
           <button
             onClick={() => setFilter('all')}
             className={`pb-2 border-b-2 transition-colors cursor-pointer ${
               filter === 'all'
-                ? 'border-[#18181B] text-[#18181B] font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-[#18181B]'
+                ? 'border-[var(--pt-primary,#A020F0)] text-[var(--pt-text,#FFFFFF)] font-bold'
+                : 'border-transparent text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)]'
             }`}
           >
-            All <span className="font-mono text-[11px] text-zinc-400 ml-0.5">{deliveries.length}</span>
+            All <span className="font-mono text-[11px] text-[var(--pt-text-muted,#737B94)] ml-0.5">{deliveries.length}</span>
           </button>
           <button
             onClick={() => setFilter('receiving')}
             className={`pb-2 border-b-2 transition-colors cursor-pointer ${
               filter === 'receiving'
-                ? 'border-[#18181B] text-[#18181B] font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-[#18181B]'
+                ? 'border-[var(--pt-primary,#A020F0)] text-[var(--pt-text,#FFFFFF)] font-bold'
+                : 'border-transparent text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)]'
             }`}
           >
             Receiving
@@ -170,8 +170,8 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
             onClick={() => setFilter('completed')}
             className={`pb-2 border-b-2 transition-colors cursor-pointer ${
               filter === 'completed'
-                ? 'border-[#18181B] text-[#18181B] font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-[#18181B]'
+                ? 'border-[var(--pt-primary,#A020F0)] text-[var(--pt-text,#FFFFFF)] font-bold'
+                : 'border-transparent text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)]'
             }`}
           >
             Completed
@@ -179,12 +179,12 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
         </div>
 
         {/* Hairline List */}
-        <div className="flex-1 overflow-y-auto bg-white divide-y divide-[#E4E3DE]">
+        <div className="flex-1 overflow-y-auto bg-[var(--pt-card,#15182A)] divide-y divide-[var(--pt-border,#29243D)]">
           {filtered.length === 0 ? (
             <div className="py-14 px-6 text-center">
-              <p className="text-xs font-semibold text-[#18181B]">No deliveries on file</p>
-              <p className="text-[11px] text-zinc-400 mt-1 max-w-xs mx-auto leading-relaxed">
-                Tap "New docket" above to photograph a paper packing slip, or upload an image or PDF.
+              <p className="text-xs font-semibold text-[var(--pt-text,#FFFFFF)]">No deliveries on file</p>
+              <p className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] mt-1 max-w-xs mx-auto leading-relaxed">
+                Tap &quot;New docket&quot; above to photograph a paper packing slip, or upload an image or PDF.
               </p>
             </div>
           ) : (
@@ -197,7 +197,6 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
               const percent = total > 0 ? Math.round((received / total) * 100) : 0;
               const isActive = d.id === activeDeliveryId;
 
-
               return (
                 <div
                   key={d.id}
@@ -207,38 +206,40 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                     onClose();
                   }}
                   className={`px-4 py-3 cursor-pointer transition-colors ${
-                    isActive ? 'bg-emerald-950/[0.03]' : 'hover:bg-zinc-50'
+                    isActive
+                      ? 'bg-[var(--pt-bg,#080B12)]/80 border-l-2 border-l-[var(--pt-primary,#A020F0)]'
+                      : 'hover:bg-[var(--pt-hover-bg)]'
                   }`}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex items-baseline gap-2">
-                        <span className="font-mono text-xs font-bold text-[#18181B]">
+                        <span className="font-mono text-xs font-bold text-[var(--pt-text,#FFFFFF)]">
                           {d.docketNumber}
                         </span>
                         {isActive && (
-                          <span className="font-mono text-[10px] text-[#059669] font-semibold">
+                          <span className="font-mono text-[10px] text-[var(--pt-primary-light,#C084FC)] font-semibold">
                             · Active
                           </span>
                         )}
                       </div>
-                      <p className="text-xs font-medium text-zinc-700 mt-0.5 truncate">
+                      <p className="text-xs font-medium text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5 truncate">
                         {d.supplier}
                       </p>
                     </div>
 
                     <div className="flex items-center gap-2.5 shrink-0">
-                      <span className="font-mono text-xs text-[#18181B] tabular-nums">
+                      <span className="font-mono text-xs text-[var(--pt-text,#FFFFFF)] tabular-nums">
                         {received}/{total} ({percent}%)
                       </span>
                       <button
                         onClick={(e) => handleExportZip(d, e)}
                         disabled={exportingId === d.id}
-                        className="p-1 text-zinc-400 hover:text-[#18181B] transition-colors cursor-pointer"
+                        className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] transition-colors cursor-pointer"
                         title="Export delivery package (.zip)"
                       >
                         {exportingId === d.id ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin text-[#059669]" />
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--pt-primary,#A020F0)]" />
                         ) : (
                           <Archive className="w-3.5 h-3.5" />
                         )}
@@ -246,7 +247,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                       {userRole !== 'employee' && userRole !== 'operator' && (
                         <button
                           onClick={(e) => handleDelete(d.id, e)}
-                          className="p-1 text-zinc-400 hover:text-red-600 transition-colors cursor-pointer"
+                          className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[#EF4444] transition-colors cursor-pointer"
                           title="Delete delivery"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -255,9 +256,9 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                     </div>
                   </div>
 
-                  <div className="w-full h-[3px] bg-zinc-100 mt-2 overflow-hidden">
+                  <div className="w-full h-[3px] bg-[var(--pt-bg,#080B12)] mt-2 overflow-hidden rounded-full">
                     <div
-                      className="h-full bg-[#059669]"
+                      className="h-full bg-[var(--pt-primary,#A020F0)]"
                       style={{ width: `${percent}%` }}
                     />
                   </div>

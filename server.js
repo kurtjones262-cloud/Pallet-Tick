@@ -1250,6 +1250,9 @@ var PalletTrackDbService = class _PalletTrackDbService {
       createdBy: row.created_by || void 0,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      totalParts: stats?.totalParts ?? parts.length,
+      receivedParts: stats?.receivedParts ?? parts.filter((p) => p.status === "received").length,
+      verifiedParts: stats?.verifiedParts ?? parts.filter((p) => p.verificationStatus === "verified").length,
       stats: stats || { totalParts: parts.length, receivedParts: 0, verifiedParts: 0 },
       parts,
       scanHistory: [],
@@ -1398,7 +1401,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
           p.weight || null,
           p.palletNumber ? String(p.palletNumber) : null,
           p.scannedAt || null,
-          p.scannedVia || null,
+          p.scannedVia ? this.normalizeScanType(p.scannedVia) : null,
           p.scannedCode || null,
           p.notes || null,
           p.flaggedForReview ? 1 : 0,
@@ -1429,7 +1432,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
             createdBy,
             s.timestamp || now,
             s.code,
-            s.codeType || "barcode",
+            this.normalizeScanType(s.codeType || "barcode"),
             s.status || "match_success",
             s.quantityAdded ?? 0,
             s.receivedQuantity ?? null,
@@ -1492,6 +1495,13 @@ var PalletTrackDbService = class _PalletTrackDbService {
   isSupervisorOrAdmin(role) {
     const r = (role || "").trim().toLowerCase();
     return r === "super_admin" || r === "admin" || r === "supervisor";
+  }
+  normalizeScanType(raw) {
+    const val = (raw || "").trim().toLowerCase();
+    if (val === "qr") return "qr";
+    if (val === "barcode") return "barcode";
+    if (val === "label" || val === "ocr_label") return "ocr_label";
+    return "manual";
   }
   /**
    * Determines whether two part entries with the same normalized partNumber represent an
@@ -2155,199 +2165,228 @@ var PalletTrackDbService = class _PalletTrackDbService {
       }
     }
   }
+  /**
+   * Delete a delivery and its associated parts/scans atomically
+   */
+  async deleteDelivery(id) {
+    await this.ensureSchemaReady();
+    const existing = await this.db.prepare("SELECT id, docket_number FROM deliveries WHERE id = ?").bind(id).first();
+    if (!existing) {
+      return { deleted: false, id };
+    }
+    await this.db.batch([
+      this.db.prepare("DELETE FROM scan_events WHERE delivery_id = ?").bind(id),
+      this.db.prepare("DELETE FROM delivery_parts WHERE delivery_id = ?").bind(id),
+      this.db.prepare("DELETE FROM m1_synchronisations WHERE delivery_id = ?").bind(id),
+      this.db.prepare("DELETE FROM deliveries WHERE id = ?").bind(id)
+    ]);
+    return { deleted: true, id, docketNumber: existing.docket_number };
+  }
   async executeUpdatePartReceivedQuantityAtomic(deliveryId, partId, input) {
     await this.ensureSchemaReady();
     const cleanIdempotencyKey = typeof input.idempotencyKey === "string" && input.idempotencyKey.trim() ? input.idempotencyKey.trim().slice(0, 128) : null;
-    if (cleanIdempotencyKey) {
-      const existingScan = await this.db.prepare("SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1").bind(cleanIdempotencyKey).first();
-      if (existingScan) {
-        const currentPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
-        const currentDelivery = await this.db.prepare("SELECT version FROM deliveries WHERE id = ?").bind(deliveryId).first();
-        return {
-          duplicate: false,
-          idempotentReplay: true,
-          status: "updated",
-          deliveryVersion: Number(currentDelivery?.version || 1),
-          part: currentPart ? this.mapPartRow(currentPart) : null,
-          scanEvent: this.mapScanRow(existingScan)
-        };
-      }
-    }
-    const part = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
-    if (!part) {
-      throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
-    }
     const enteredQty = Number(input.receivedQuantity);
     if (Number.isNaN(enteredQty) || enteredQty < 0) {
       throw new Error("Received quantity cannot be negative or invalid");
     }
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const reqQty = Math.max(0, part.required_quantity);
-    const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
-    const currentVersion = Number(part.version || 1);
-    const isIncrementMode = input.mode === "increment";
-    const isScanAttempt = input.scannedVia !== "manual";
-    const recQty = isIncrementMode ? currentRecQty + Math.round(enteredQty) : Math.round(enteredQty);
-    const targetStatus = input.status || (recQty > 0 ? "received" : "outstanding");
-    const isAlreadyFulfilled = part.status === "received" && currentRecQty >= reqQty && reqQty > 0;
-    const isRedundantSameScan = isScanAttempt && part.status === "received" && targetStatus === "received" && currentRecQty > 0 && (!isIncrementMode && recQty <= currentRecQty);
-    if (isScanAttempt && targetStatus === "received" && (isAlreadyFulfilled || isRedundantSameScan)) {
-      const alreadyScannedBy = part.last_scanned_by_name || "Another worker";
-      const alreadyScannedAt = part.scanned_at || part.updated_at;
-      const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const dupMsg = `Duplicate scan \u2013 part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
-      try {
-        await this.db.prepare(
-          `INSERT INTO scan_events (
-              id, delivery_id, part_id, user_id, timestamp, code,
-              scan_type, scan_status, quantity_added, received_quantity_after,
-              scan_result, employee_name, employee_role, event_action
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
-        ).bind(
-          dupScanId,
-          deliveryId,
-          partId,
-          input.userId || null,
-          now,
-          input.scannedCode || part.part_number,
-          input.scannedVia || "qr",
-          currentRecQty,
-          dupMsg,
-          input.employeeName || null,
-          input.employeeRole || null
-        ).run();
-      } catch {
+    const MAX_CAS_ATTEMPTS = 5;
+    for (let attempt = 1; attempt <= MAX_CAS_ATTEMPTS; attempt++) {
+      if (cleanIdempotencyKey) {
+        const existingScan = await this.db.prepare("SELECT * FROM scan_events WHERE idempotency_key = ? LIMIT 1").bind(cleanIdempotencyKey).first();
+        if (existingScan) {
+          const currentPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+          const currentDelivery = await this.db.prepare("SELECT version FROM deliveries WHERE id = ?").bind(deliveryId).first();
+          return {
+            duplicate: false,
+            idempotentReplay: true,
+            status: "updated",
+            deliveryVersion: Number(currentDelivery?.version || 1),
+            part: currentPart ? this.mapPartRow(currentPart) : null,
+            scanEvent: this.mapScanRow(existingScan)
+          };
+        }
       }
-      return {
-        duplicate: true,
-        status: "duplicate",
-        message: "Duplicate scan \u2013 this part has already been received by another worker",
-        error: "Duplicate scan \u2013 this part has already been received by another worker",
-        detailMessage: dupMsg,
-        alreadyScannedBy,
-        alreadyScannedAt,
-        part: this.mapPartRow(part)
-      };
-    }
-    const isQtyMatch = targetStatus === "received" && recQty === reqQty;
-    const verificationStatus = targetStatus === "received" ? isQtyMatch ? "verified" : "quantity_mismatch" : "unscanned";
-    const scannedVia = targetStatus === "received" ? input.scannedVia || "manual" : null;
-    const scannedCode = targetStatus === "received" ? input.scannedCode || part.scanned_code || (scannedVia === "qr" ? part.part_number : part.item_number) : null;
-    const scannedAt = targetStatus === "received" ? now : null;
-    const lastScannedById = targetStatus === "received" ? input.userId || part.last_scanned_by_id || null : null;
-    const lastScannedByName = targetStatus === "received" ? input.employeeName || part.last_scanned_by_name || "Worker" : null;
-    const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const addedQty = Math.max(0, recQty - currentRecQty);
-    const scanStatus = targetStatus === "received" ? isQtyMatch ? "match_success" : "quantity_mismatch" : "undo_performed";
-    const scanResultMsg = targetStatus === "received" ? isQtyMatch ? `Verified ${part.part_number} (No. ${part.item_number}) - Qty ${recQty}/${reqQty} matched` : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required` : `Unticked ${part.part_number} (${part.item_number})`;
-    const updateRes = await this.db.prepare(
-      `UPDATE delivery_parts
-         SET received_quantity = ?, verification_status = ?, status = ?,
-             scanned_via = ?, scanned_code = ?, scanned_at = ?,
-             last_scanned_by_id = ?, last_scanned_by_name = ?,
-             notes = COALESCE(?, notes),
-             version = COALESCE(version, 1) + 1,
-             updated_at = ?
-         WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
-    ).bind(
-      recQty,
-      verificationStatus,
-      targetStatus,
-      scannedVia,
-      scannedCode,
-      scannedAt,
-      lastScannedById,
-      lastScannedByName,
-      input.notes || null,
-      now,
-      deliveryId,
-      partId,
-      currentVersion
-    ).run();
-    const rowsChanged = Number(updateRes.meta?.changes ?? 1);
-    if (rowsChanged === 0) {
-      const latestPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
-      if (latestPart && latestPart.status === "received") {
+      const part = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+      if (!part) {
+        throw new Error(`Part ${partId} not found in delivery ${deliveryId}`);
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const reqQty = Math.max(0, part.required_quantity);
+      const currentRecQty = Math.max(0, Number(part.received_quantity) || 0);
+      const currentVersion = Number(part.version || 1);
+      const isIncrementMode = input.mode === "increment";
+      const isScanAttempt = input.scannedVia !== "manual";
+      const recQty = isIncrementMode ? currentRecQty + Math.round(enteredQty) : Math.round(enteredQty);
+      const targetStatus = input.status || (recQty > 0 ? "received" : "outstanding");
+      const isAlreadyFulfilled = part.status === "received" && currentRecQty >= reqQty && reqQty > 0;
+      const isRedundantSameScan = isScanAttempt && part.status === "received" && targetStatus === "received" && currentRecQty > 0 && (!isIncrementMode && recQty <= currentRecQty);
+      if (isScanAttempt && targetStatus === "received" && (isAlreadyFulfilled || isRedundantSameScan)) {
+        const alreadyScannedBy = part.last_scanned_by_name || "Another worker";
+        const alreadyScannedAt = part.scanned_at || part.updated_at;
+        const dupScanId = `ev_dup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const dupMsg = `Duplicate scan \u2013 part ${part.part_number} (No. ${part.item_number}) has already been received by ${alreadyScannedBy}`;
+        try {
+          await this.db.prepare(
+            `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, employee_name, employee_role, event_action
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'duplicate_blocked', 0, ?, ?, ?, ?, 'duplicate_blocked')`
+          ).bind(
+            dupScanId,
+            deliveryId,
+            partId,
+            input.userId || null,
+            now,
+            input.scannedCode || part.part_number,
+            this.normalizeScanType(input.scannedVia || "qr"),
+            currentRecQty,
+            dupMsg,
+            input.employeeName || null,
+            input.employeeRole || null
+          ).run();
+        } catch {
+        }
         return {
           duplicate: true,
           status: "duplicate",
           message: "Duplicate scan \u2013 this part has already been received by another worker",
           error: "Duplicate scan \u2013 this part has already been received by another worker",
-          alreadyScannedBy: latestPart.last_scanned_by_name || "Another worker",
-          alreadyScannedAt: latestPart.scanned_at || latestPart.updated_at,
-          part: this.mapPartRow(latestPart)
+          detailMessage: dupMsg,
+          alreadyScannedBy,
+          alreadyScannedAt,
+          part: this.mapPartRow(part)
         };
       }
-    }
-    await this.db.batch([
-      this.db.prepare(
-        `INSERT INTO scan_events (
-            id, delivery_id, part_id, user_id, timestamp, code,
-            scan_type, scan_status, quantity_added, received_quantity_after,
-            scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      const isQtyMatch = targetStatus === "received" && recQty === reqQty;
+      const verificationStatus = targetStatus === "received" ? isQtyMatch ? "verified" : "quantity_mismatch" : "unscanned";
+      const scannedVia = targetStatus === "received" ? this.normalizeScanType(input.scannedVia || "manual") : null;
+      const scannedCode = targetStatus === "received" ? input.scannedCode || part.scanned_code || (scannedVia === "qr" ? part.part_number : part.item_number) : null;
+      const scannedAt = targetStatus === "received" ? now : null;
+      const lastScannedById = targetStatus === "received" ? input.userId || part.last_scanned_by_id || null : null;
+      const lastScannedByName = targetStatus === "received" ? input.employeeName || part.last_scanned_by_name || "Worker" : null;
+      const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const addedQty = Math.max(0, recQty - currentRecQty);
+      const scanStatus = targetStatus === "received" ? isQtyMatch ? "match_success" : "quantity_mismatch" : "undo_performed";
+      const scanResultMsg = targetStatus === "received" ? isQtyMatch ? `Verified ${part.part_number} (No. ${part.item_number}) - Qty ${recQty}/${reqQty} matched` : `Quantity mismatch for ${part.part_number}: Received ${recQty} of ${reqQty} required` : `Unticked ${part.part_number} (${part.item_number})`;
+      const updateRes = await this.db.prepare(
+        `UPDATE delivery_parts
+           SET received_quantity = ?, verification_status = ?, status = ?,
+               scanned_via = ?, scanned_code = ?, scanned_at = ?,
+               last_scanned_by_id = ?, last_scanned_by_name = ?,
+               notes = COALESCE(?, notes),
+               version = COALESCE(version, 1) + 1,
+               updated_at = ?
+           WHERE delivery_id = ? AND id = ? AND COALESCE(version, 1) = ?`
       ).bind(
-        scanId,
-        deliveryId,
-        partId,
-        input.userId || null,
-        now,
-        scannedCode || part.part_number,
-        scannedVia || "manual",
-        scanStatus,
-        addedQty,
         recQty,
-        scanResultMsg,
-        input.rawOcrText || null,
-        input.employeeName || null,
-        input.employeeRole || null,
-        input.eventAction || (recQty > 0 ? "part_scan" : "part_untick"),
-        cleanIdempotencyKey
-      ),
-      this.db.prepare(
-        "UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?"
-      ).bind(now, deliveryId)
-    ]);
-    const updatedPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
-    const updatedDeliveryRow = await this.db.prepare("SELECT version, delivery_status FROM deliveries WHERE id = ?").bind(deliveryId).first();
-    const statsRow = await this.db.prepare(
-      `SELECT
-           COUNT(*) as total_count,
-           SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
-         FROM delivery_parts
-         WHERE delivery_id = ?`
-    ).bind(deliveryId).first();
-    const totalCount = Number(statsRow?.total_count || 0);
-    const receivedCount = Number(statsRow?.received_count || 0);
-    const outstandingCount = Math.max(0, totalCount - receivedCount);
-    return {
-      duplicate: false,
-      status: "updated",
-      deliveryVersion: Number(updatedDeliveryRow?.version || 1),
-      deliveryStats: {
-        totalCount,
-        receivedCount,
-        outstandingCount
-      },
-      part: updatedPart ? this.mapPartRow(updatedPart) : null,
-      scanEvent: {
-        id: scanId,
+        verificationStatus,
+        targetStatus,
+        scannedVia,
+        scannedCode,
+        scannedAt,
+        lastScannedById,
+        lastScannedByName,
+        input.notes || null,
+        now,
         deliveryId,
         partId,
-        userId: input.userId,
-        employeeName: input.employeeName,
-        employeeRole: input.employeeRole,
-        eventAction: input.eventAction || (recQty > 0 ? "part_scan" : "part_untick"),
-        timestamp: now,
-        code: scannedCode || part.part_number,
-        codeType: scannedVia || "manual",
-        status: scanStatus,
-        quantityAdded: addedQty,
-        receivedQuantity: recQty,
-        message: scanResultMsg,
-        idempotencyKey: cleanIdempotencyKey || void 0
+        currentVersion
+      ).run();
+      const rowsChanged = Number(updateRes.meta?.changes ?? 1);
+      if (rowsChanged === 0) {
+        if (attempt < MAX_CAS_ATTEMPTS) {
+          continue;
+        }
+        const latestPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
+        return {
+          duplicate: true,
+          status: "duplicate",
+          message: "Duplicate scan \u2013 this part has already been received by another worker",
+          error: "Duplicate scan \u2013 this part has already been received by another worker",
+          alreadyScannedBy: latestPart?.last_scanned_by_name || "Another worker",
+          alreadyScannedAt: latestPart?.scanned_at || latestPart?.updated_at,
+          part: latestPart ? this.mapPartRow(latestPart) : this.mapPartRow(part)
+        };
       }
-    };
+      try {
+        await this.db.batch([
+          this.db.prepare(
+            `INSERT INTO scan_events (
+                id, delivery_id, part_id, user_id, timestamp, code,
+                scan_type, scan_status, quantity_added, received_quantity_after,
+                scan_result, raw_ocr_text, employee_name, employee_role, event_action, idempotency_key
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            scanId,
+            deliveryId,
+            partId,
+            input.userId || null,
+            now,
+            scannedCode || part.part_number,
+            scannedVia || "manual",
+            scanStatus,
+            addedQty,
+            recQty,
+            scanResultMsg,
+            input.rawOcrText || null,
+            input.employeeName || null,
+            input.employeeRole || null,
+            input.eventAction || (recQty > 0 ? "part_scan" : "part_untick"),
+            cleanIdempotencyKey
+          ),
+          this.db.prepare(
+            "UPDATE deliveries SET version = COALESCE(version, 1) + 1, updated_at = ? WHERE id = ?"
+          ).bind(now, deliveryId)
+        ]);
+      } catch (batchErr) {
+        if (cleanIdempotencyKey && String(batchErr?.message || "").includes("UNIQUE")) {
+          continue;
+        }
+        throw batchErr;
+      }
+      const updatedPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE id = ?").bind(partId).first();
+      const updatedDeliveryRow = await this.db.prepare("SELECT version, delivery_status FROM deliveries WHERE id = ?").bind(deliveryId).first();
+      const statsRow = await this.db.prepare(
+        `SELECT
+             COUNT(*) as total_count,
+             SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) as received_count
+           FROM delivery_parts
+           WHERE delivery_id = ?`
+      ).bind(deliveryId).first();
+      const totalCount = Number(statsRow?.total_count || 0);
+      const receivedCount = Number(statsRow?.received_count || 0);
+      const outstandingCount = Math.max(0, totalCount - receivedCount);
+      return {
+        duplicate: false,
+        status: "updated",
+        deliveryVersion: Number(updatedDeliveryRow?.version || 1),
+        deliveryStats: {
+          totalCount,
+          receivedCount,
+          outstandingCount
+        },
+        part: updatedPart ? this.mapPartRow(updatedPart) : null,
+        scanEvent: {
+          id: scanId,
+          deliveryId,
+          partId,
+          userId: input.userId,
+          employeeName: input.employeeName,
+          employeeRole: input.employeeRole,
+          eventAction: input.eventAction || (recQty > 0 ? "part_scan" : "part_untick"),
+          timestamp: now,
+          code: scannedCode || part.part_number,
+          codeType: scannedVia || "manual",
+          status: scanStatus,
+          quantityAdded: addedQty,
+          receivedQuantity: recQty,
+          message: scanResultMsg,
+          idempotencyKey: cleanIdempotencyKey || void 0
+        }
+      };
+    }
+    throw new Error("Failed to commit part quantity after concurrent retries");
   }
   /**
    * Record a scan event directly into the audit log
@@ -2360,6 +2399,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
     const now = input.timestamp || (/* @__PURE__ */ new Date()).toISOString();
     const scanId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const qtyAdded = Math.max(0, Math.round(Number(input.quantityAdded || 0)));
+    const normScanType = this.normalizeScanType(input.scanType);
     await this.db.prepare(
       `INSERT INTO scan_events (
           id, delivery_id, part_id, user_id, timestamp, code,
@@ -2373,7 +2413,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       input.userId || null,
       now,
       input.code,
-      input.scanType,
+      normScanType,
       input.scanStatus,
       qtyAdded,
       input.receivedQuantityAfter ?? null,
@@ -2393,7 +2433,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
       eventAction: input.eventAction || "scan_logged",
       timestamp: now,
       code: input.code,
-      codeType: input.scanType,
+      codeType: normScanType,
       status: input.scanStatus,
       quantityAdded: qtyAdded,
       receivedQuantity: input.receivedQuantityAfter,
@@ -2409,7 +2449,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
   }
   /**
    * Safe migration helper for existing localStorage / IndexedDB deliveries.
-   * Checks for existing deliveries by ID and Docket Number to prevent conflicting duplicates.
+   * Checks for existing deliveries by ID and case-insensitive Docket Number to prevent conflicting duplicates.
    */
   async migrateLocalDeliveries(deliveries) {
     if (!Array.isArray(deliveries) || deliveries.length === 0) {
@@ -2417,15 +2457,31 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
     const importedIds = [];
     const existingIds = [];
+    const seenIdsInBatch = /* @__PURE__ */ new Set();
+    const seenDocketsInBatch = /* @__PURE__ */ new Set();
     for (const del of deliveries) {
       if (!del || !del.docketNumber) continue;
-      const existing = await this.db.prepare("SELECT id FROM deliveries WHERE id = ? OR docket_number = ?").bind(del.id || "", del.docketNumber).first();
-      if (existing) {
-        existingIds.push(del.id || del.docketNumber);
+      const cleanId = (del.id || "").trim();
+      const normDocket = del.docketNumber.trim().toLowerCase();
+      if (!normDocket) continue;
+      if (cleanId && seenIdsInBatch.has(cleanId) || seenDocketsInBatch.has(normDocket)) {
+        existingIds.push(cleanId || del.docketNumber);
         continue;
       }
-      await this.createDelivery(del);
-      importedIds.push(del.id || del.docketNumber);
+      const existing = await this.db.prepare(
+        "SELECT id FROM deliveries WHERE id = ? OR LOWER(TRIM(docket_number)) = LOWER(TRIM(?))"
+      ).bind(cleanId, del.docketNumber.trim()).first();
+      if (existing) {
+        existingIds.push(cleanId || del.docketNumber);
+        if (cleanId) seenIdsInBatch.add(cleanId);
+        seenDocketsInBatch.add(normDocket);
+        continue;
+      }
+      const created = await this.createDelivery(del);
+      if (cleanId) seenIdsInBatch.add(cleanId);
+      if (created?.id) seenIdsInBatch.add(created.id);
+      seenDocketsInBatch.add(normDocket);
+      importedIds.push(created?.id || cleanId || del.docketNumber);
     }
     return {
       importedCount: importedIds.length,
@@ -2445,8 +2501,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
   }
   /**
    * Ensures all required D1 tables and columns exist on the connected database.
-   * Uses a per-database in-flight Promise mutex so concurrent requests await the same
-   * initialization and never race or conflict with Wrangler migrations.
+   * Uses a per-database in-flight Promise mutex and a single-query fast probe so
+   * Cloudflare Workers never exceeds subrequest limits or times out on cold starts.
    */
   async ensureSchemaReady() {
     if (_PalletTrackDbService.verifiedDbs.has(this.db)) return;
@@ -2460,17 +2516,26 @@ var PalletTrackDbService = class _PalletTrackDbService {
     _PalletTrackDbService.inFlightSchemaInit.set(this.db, initPromise);
     return initPromise;
   }
-  async runSchemaBootstrap() {
+  async probeSchemaColumns() {
     try {
-      await this.db.prepare("SELECT id, employee_code, role, active FROM users LIMIT 1").first();
-      await this.db.prepare("SELECT id FROM sessions LIMIT 1").first();
-      await this.db.prepare("SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1").first();
-      await this.db.prepare("SELECT id, version FROM deliveries LIMIT 1").first();
-      await this.db.prepare("SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1").first();
-      await this.db.prepare("SELECT seq, id FROM realtime_events LIMIT 1").first();
+      await this.db.prepare(
+        `SELECT
+            (SELECT COUNT(*) FROM (SELECT id, employee_code, role, active FROM users LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id FROM sessions LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, version FROM deliveries LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT seq, id FROM realtime_events LIMIT 1)) AS schema_ready`
+      ).first();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async runSchemaBootstrap() {
+    if (await this.probeSchemaColumns()) {
       _PalletTrackDbService.verifiedDbs.add(this.db);
       return;
-    } catch {
     }
     const createStatements = [
       `CREATE TABLE IF NOT EXISTS users (
@@ -2591,42 +2656,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         created_at TEXT NOT NULL
       )`
     ];
-    for (const sql of createStatements) {
-      try {
-        await this.db.prepare(sql).run();
-      } catch (e) {
-        console.warn("Schema bootstrap table notice:", e);
-      }
-    }
-    const alterCols = [
-      "ALTER TABLE users ADD COLUMN employee_code TEXT",
-      "ALTER TABLE users ADD COLUMN pin_salt TEXT",
-      "ALTER TABLE users ADD COLUMN last_login_at TEXT",
-      "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE users ADD COLUMN locked_until TEXT",
-      "ALTER TABLE users ADD COLUMN created_by TEXT",
-      "ALTER TABLE scan_events ADD COLUMN employee_name TEXT",
-      "ALTER TABLE scan_events ADD COLUMN employee_role TEXT",
-      "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'",
-      "ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT",
-      "ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER",
-      "ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
-      "ALTER TABLE delivery_parts ADD COLUMN revision TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
-      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT",
-      "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT"
-    ];
-    for (const sql of alterCols) {
-      try {
-        await this.db.prepare(sql).run();
-      } catch {
-      }
-    }
-    const indexStatements = [
+    const schemaBootstrapStatements = [
+      ...createStatements,
       "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)",
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)",
       "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
@@ -2647,10 +2678,67 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC)",
       "CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)"
     ];
-    for (const sql of indexStatements) {
+    try {
+      await this.db.batch(schemaBootstrapStatements.map((sql) => this.db.prepare(sql)));
+    } catch {
+      for (const sql of schemaBootstrapStatements) {
+        try {
+          await this.db.prepare(sql).run();
+        } catch (e) {
+          console.warn("Schema bootstrap notice:", e);
+        }
+      }
+    }
+    const allColumnsPresentAfterCreate = await this.probeSchemaColumns();
+    if (!allColumnsPresentAfterCreate) {
+      const alterCols = [
+        { table: "users", col: "employee_code", sql: "ALTER TABLE users ADD COLUMN employee_code TEXT" },
+        { table: "users", col: "pin_salt", sql: "ALTER TABLE users ADD COLUMN pin_salt TEXT" },
+        { table: "users", col: "last_login_at", sql: "ALTER TABLE users ADD COLUMN last_login_at TEXT" },
+        { table: "users", col: "failed_login_attempts", sql: "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0" },
+        { table: "users", col: "locked_until", sql: "ALTER TABLE users ADD COLUMN locked_until TEXT" },
+        { table: "users", col: "created_by", sql: "ALTER TABLE users ADD COLUMN created_by TEXT" },
+        { table: "scan_events", col: "employee_name", sql: "ALTER TABLE scan_events ADD COLUMN employee_name TEXT" },
+        { table: "scan_events", col: "employee_role", sql: "ALTER TABLE scan_events ADD COLUMN employee_role TEXT" },
+        { table: "scan_events", col: "event_action", sql: "ALTER TABLE scan_events ADD COLUMN event_action TEXT DEFAULT 'part_scan'" },
+        { table: "scan_events", col: "idempotency_key", sql: "ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT" },
+        { table: "scan_events", col: "sequence_number", sql: "ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER" },
+        { table: "deliveries", col: "version", sql: "ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1" },
+        { table: "delivery_parts", col: "revision", sql: "ALTER TABLE delivery_parts ADD COLUMN revision TEXT" },
+        { table: "delivery_parts", col: "manually_edited", sql: "ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0" },
+        { table: "delivery_parts", col: "original_ocr_values", sql: "ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT" },
+        { table: "delivery_parts", col: "last_edited_by", sql: "ALTER TABLE delivery_parts ADD COLUMN last_edited_by TEXT" },
+        { table: "delivery_parts", col: "last_edited_at", sql: "ALTER TABLE delivery_parts ADD COLUMN last_edited_at TEXT" },
+        { table: "delivery_parts", col: "version", sql: "ALTER TABLE delivery_parts ADD COLUMN version INTEGER NOT NULL DEFAULT 1" },
+        { table: "delivery_parts", col: "last_scanned_by_id", sql: "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_id TEXT" },
+        { table: "delivery_parts", col: "last_scanned_by_name", sql: "ALTER TABLE delivery_parts ADD COLUMN last_scanned_by_name TEXT" }
+      ];
       try {
-        await this.db.prepare(sql).run();
+        const pragmaBatch = await this.db.batch([
+          this.db.prepare("PRAGMA table_info(users)"),
+          this.db.prepare("PRAGMA table_info(scan_events)"),
+          this.db.prepare("PRAGMA table_info(deliveries)"),
+          this.db.prepare("PRAGMA table_info(delivery_parts)")
+        ]);
+        const existingByTable = {
+          users: new Set((pragmaBatch[0]?.results || []).map((r) => r.name)),
+          scan_events: new Set((pragmaBatch[1]?.results || []).map((r) => r.name)),
+          deliveries: new Set((pragmaBatch[2]?.results || []).map((r) => r.name)),
+          delivery_parts: new Set((pragmaBatch[3]?.results || []).map((r) => r.name))
+        };
+        const missingAlters = alterCols.filter(
+          (item) => existingByTable[item.table] && existingByTable[item.table].size > 0 && !existingByTable[item.table].has(item.col)
+        );
+        if (missingAlters.length > 0) {
+          await this.db.batch(missingAlters.map((item) => this.db.prepare(item.sql)));
+        }
       } catch {
+        for (const item of alterCols) {
+          try {
+            await this.db.prepare(item.sql).run();
+          } catch {
+          }
+        }
       }
     }
     _PalletTrackDbService.verifiedDbs.add(this.db);
@@ -3162,25 +3250,55 @@ var WS_OPEN = 1;
 var HEARTBEAT_INTERVAL_MS = 15e3;
 var STALE_CONNECTION_TIMEOUT_MS = 45e3;
 var PalletTrackRealtimeBroker = class {
-  constructor() {
+  constructor(options) {
     this.clients = /* @__PURE__ */ new Map();
     this.latestSeq = 0;
     this.heartbeatTimer = null;
-    this.startHeartbeat();
+    this.disableIntervalTimer = Boolean(options?.disableIntervalTimer);
   }
   setDurableObjectForwarder(fn) {
     this.durableObjectForwarder = fn;
   }
+  getConnectedClientCount() {
+    return this.clients.size;
+  }
+  isHeartbeatRunning() {
+    return this.heartbeatTimer !== null;
+  }
+  /**
+   * Lazily starts the periodic heartbeat timer inside an active request/connection context.
+   * Safe against duplicate timers and no-ops when no clients are connected or when Durable Object
+   * native alarms are managing the heartbeat schedule.
+   */
   startHeartbeat() {
-    if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => {
-      this.pruneStaleConnectionsAndPing();
-    }, HEARTBEAT_INTERVAL_MS);
-    if (typeof this.heartbeatTimer?.unref === "function") {
-      this.heartbeatTimer.unref();
+    if (this.disableIntervalTimer) return;
+    if (this.heartbeatTimer !== null) return;
+    if (this.clients.size === 0) return;
+    try {
+      this.heartbeatTimer = setInterval(() => {
+        this.pruneStaleConnectionsAndPing();
+      }, HEARTBEAT_INTERVAL_MS);
+      if (typeof this.heartbeatTimer?.unref === "function") {
+        this.heartbeatTimer.unref();
+      }
+    } catch {
+      this.heartbeatTimer = null;
+    }
+  }
+  /**
+   * Stops and clears the active heartbeat interval timer when no clients remain connected.
+   */
+  stopHeartbeat() {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
   pruneStaleConnectionsAndPing() {
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+      return;
+    }
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     let changed = false;
@@ -3210,6 +3328,9 @@ var PalletTrackRealtimeBroker = class {
         changed = true;
       }
     }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
     if (changed) {
       for (const delId of affectedDeliveries) {
         this.broadcastPresenceUpdate(delId);
@@ -3235,6 +3356,7 @@ var PalletTrackRealtimeBroker = class {
       lastPongMs: Date.now()
     };
     this.clients.set(connectionId, client);
+    this.startHeartbeat();
     this.safeSend(socket, {
       type: "connected",
       connectionId,
@@ -3249,15 +3371,30 @@ var PalletTrackRealtimeBroker = class {
       presence: this.getPresenceSummary(initialDeliveryId || null),
       timestamp: nowIso
     });
-    if (db && typeof lastSeq === "number" && lastSeq > 0) {
-      this.getEventsSince(db, lastSeq, initialDeliveryId || void 0).then((missedEvents) => {
-        if (missedEvents.length > 0) {
+    if (db) {
+      this.lastDb = db;
+      this.getLatestSequenceNumber(db).then(async (latestDbSeq) => {
+        if (typeof lastSeq === "number" && lastSeq > 0 && latestDbSeq > lastSeq) {
+          const missedEvents = await this.getEventsSince(
+            db,
+            lastSeq,
+            initialDeliveryId || void 0
+          );
+          if (missedEvents.length > 0) {
+            this.safeSend(socket, {
+              type: "sync_catchup",
+              sinceSeq: lastSeq,
+              latestSeq: latestDbSeq,
+              presence: this.getPresenceSummary(initialDeliveryId || null),
+              events: missedEvents,
+              timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            });
+          }
+        } else if (latestDbSeq > 0) {
           this.safeSend(socket, {
-            type: "sync_catchup",
-            sinceSeq: lastSeq,
-            latestSeq: this.latestSeq,
-            events: missedEvents,
-            timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            type: "pong",
+            timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+            latestSeq: latestDbSeq
           });
         }
       }).catch(() => {
@@ -3274,9 +3411,17 @@ var PalletTrackRealtimeBroker = class {
    */
   unregisterClient(connectionId) {
     const existing = this.clients.get(connectionId);
-    if (!existing) return;
+    if (!existing) {
+      if (this.clients.size === 0) {
+        this.stopHeartbeat();
+      }
+      return;
+    }
     const prevDeliveryId = existing.activeDeliveryId;
     this.clients.delete(connectionId);
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
     this.broadcastPresenceUpdate(prevDeliveryId);
     if (prevDeliveryId !== null) {
       this.broadcastPresenceUpdate(null);
@@ -3302,6 +3447,9 @@ var PalletTrackRealtimeBroker = class {
         this.clients.delete(connId);
       }
     }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
     for (const delId of affectedDeliveries) {
       this.broadcastPresenceUpdate(delId);
     }
@@ -3325,6 +3473,9 @@ var PalletTrackRealtimeBroker = class {
         this.clients.delete(connId);
       }
     }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
     for (const delId of affectedDeliveries) {
       this.broadcastPresenceUpdate(delId);
     }
@@ -3338,6 +3489,7 @@ var PalletTrackRealtimeBroker = class {
   async handleClientMessage(connectionId, rawMessage, db) {
     const client = this.clients.get(connectionId);
     if (!client) return;
+    this.startHeartbeat();
     client.lastPongMs = Date.now();
     client.lastActivityAt = (/* @__PURE__ */ new Date()).toISOString();
     let msg;
@@ -3349,10 +3501,11 @@ var PalletTrackRealtimeBroker = class {
     if (!msg || typeof msg.type !== "string") return;
     switch (msg.type) {
       case "ping": {
+        const latestSeq = db ? await this.getLatestSequenceNumber(db) : this.latestSeq;
         this.safeSend(client.socket, {
           type: "pong",
           timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-          latestSeq: this.latestSeq
+          latestSeq
         });
         break;
       }
@@ -3431,13 +3584,15 @@ var PalletTrackRealtimeBroker = class {
       }
       case "sync_request": {
         if (!db) break;
+        this.lastDb = db;
         const sinceSeq = Math.max(0, Number(msg.sinceSeq) || 0);
         const deliveryId = typeof msg.deliveryId === "string" && msg.deliveryId.trim() ? msg.deliveryId.trim() : void 0;
         const missedEvents = await this.getEventsSince(db, sinceSeq, deliveryId);
+        const latestSeq = await this.getLatestSequenceNumber(db);
         this.safeSend(client.socket, {
           type: "sync_response",
           sinceSeq,
-          latestSeq: this.latestSeq,
+          latestSeq,
           events: missedEvents,
           presence: this.getPresenceSummary(client.activeDeliveryId),
           timestamp: (/* @__PURE__ */ new Date()).toISOString()
@@ -3609,13 +3764,6 @@ var PalletTrackRealtimeBroker = class {
   }
   /**
    * Broadcast a RealtimeEvent to all connected authenticated WebSocket clients.
-   * Room isolation rule:
-   * - `part:duplicate_rejected` and `worker:scanning_activity` are only sent to clients
-   *   actively viewing/scanning the target `deliveryId` (or the triggering user).
-   * - Authoritative delivery/part state transitions (`delivery:*`, `part:*`, `quantity:updated`)
-   *   include `deliveryId` and `deliveryVersion` and are sent to all authenticated clients so both
-   *   open checklists for that delivery AND dashboard progress bars update instantaneously, while
-   *   clients viewing a different delivery safely ignore foreign part mutations in their active view.
    */
   broadcastEvent(event) {
     if (event.sequenceNumber > this.latestSeq) {
@@ -3642,6 +3790,9 @@ var PalletTrackRealtimeBroker = class {
         this.clients.delete(connId);
       }
     }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
   }
   broadcastToDeliveryRoom(deliveryId, message) {
     const packet = JSON.stringify(message);
@@ -3657,6 +3808,9 @@ var PalletTrackRealtimeBroker = class {
           this.clients.delete(connId);
         }
       }
+    }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
     }
   }
   safeSend(socket, payload) {
@@ -3718,9 +3872,29 @@ var PalletTrackRealtimeBroker = class {
     }
   }
   /**
+   * Synchronises this isolate's sequence number with D1 and broadcasts any new events
+   * written by other Cloudflare Worker isolates since `this.latestSeq` to connected clients.
+   */
+  async syncFromDatabase(db) {
+    const activeDb = db || this.lastDb;
+    if (!activeDb) return [];
+    this.lastDb = activeDb;
+    const prevSeq = this.latestSeq;
+    const dbMax = await this.getLatestSequenceNumber(activeDb);
+    if (dbMax > prevSeq) {
+      const missed = await this.getEventsSince(activeDb, prevSeq);
+      for (const ev of missed) {
+        this.broadcastEvent(ev);
+      }
+      return missed;
+    }
+    return [];
+  }
+  /**
    * Get the latest sequence number from memory or D1
    */
   async getLatestSequenceNumber(db) {
+    this.lastDb = db;
     try {
       const row = await db.prepare("SELECT MAX(seq) as max_seq FROM realtime_events").first();
       const dbMax = Number(row?.max_seq || 0);
@@ -3732,7 +3906,30 @@ var PalletTrackRealtimeBroker = class {
     return this.latestSeq;
   }
 };
-var realtimeBroker = new PalletTrackRealtimeBroker();
+var _realtimeBrokerInstance = null;
+function getRealtimeBroker() {
+  if (!_realtimeBrokerInstance) {
+    _realtimeBrokerInstance = new PalletTrackRealtimeBroker();
+  }
+  return _realtimeBrokerInstance;
+}
+var realtimeBroker = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      if (prop === "constructor") {
+        return PalletTrackRealtimeBroker;
+      }
+      const instance = getRealtimeBroker();
+      const value = Reflect.get(instance, prop, instance);
+      return typeof value === "function" ? value.bind(instance) : value;
+    },
+    set(_target, prop, value) {
+      const instance = getRealtimeBroker();
+      return Reflect.set(instance, prop, value, instance);
+    }
+  }
+);
 
 // src/server/api/palletTrackApiRouter.ts
 var CORS_HEADERS = {
@@ -4226,6 +4423,20 @@ async function handlePalletTrackApiRequest(request, db, env) {
             return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber });
           }
           return jsonResponse(updated);
+        }
+        if (method === "DELETE") {
+          if (isEmployeeRole(currentUser.role)) {
+            return errorResponse(
+              "Forbidden: Employees cannot delete deliveries.",
+              403,
+              "FORBIDDEN"
+            );
+          }
+          const deleted = await service.deleteDelivery(deliveryId);
+          if (!deleted) {
+            return errorResponse(`Delivery not found: ${deliveryId}`, 404, "NOT_FOUND");
+          }
+          return jsonResponse({ success: true, id: deliveryId });
         }
       }
       if (subPath === "/parts" || subPath === "/parts/") {

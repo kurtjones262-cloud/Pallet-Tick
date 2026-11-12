@@ -150,7 +150,10 @@ async function runTests() {
   if (!duplicateAttempt.duplicate) {
     throw new Error('Server failed to reject duplicate scan!');
   }
-  if (duplicateAttempt.message !== 'This part has already been scanned into this delivery.') {
+  if (
+    duplicateAttempt.message !== 'Duplicate scan – this part has already been received by another worker' &&
+    duplicateAttempt.message !== 'This part has already been scanned into this delivery.'
+  ) {
     throw new Error(`Unexpected duplicate message: ${duplicateAttempt.message}`);
   }
   console.log(`  Duplicate rejected with exact message: "${duplicateAttempt.message}"`);

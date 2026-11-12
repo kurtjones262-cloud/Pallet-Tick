@@ -149,6 +149,8 @@ export interface Delivery {
   palletCount?: number;
   notes?: string;
   version?: number;
+  totalParts?: number;
+  receivedParts?: number;
   status: 'receiving' | 'completed';
   docketAttachments: DocketAttachment[];
   parts: DeliveryPart[];

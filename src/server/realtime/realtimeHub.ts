@@ -93,6 +93,7 @@ export class PalletTrackRealtimeBroker {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private readonly disableIntervalTimer: boolean;
   private durableObjectForwarder?: (event: RealtimeEvent) => Promise<void>;
+  private lastDb?: D1Database;
 
   constructor(options?: RealtimeBrokerOptions) {
     this.disableIntervalTimer = Boolean(options?.disableIntervalTimer);
@@ -249,6 +250,7 @@ export class PalletTrackRealtimeBroker {
     });
 
     if (db) {
+      this.lastDb = db;
       this.getLatestSequenceNumber(db)
         .then(async (latestDbSeq) => {
           if (typeof lastSeq === 'number' && lastSeq > 0 && latestDbSeq > lastSeq) {
@@ -261,7 +263,7 @@ export class PalletTrackRealtimeBroker {
               this.safeSend(socket, {
                 type: 'sync_catchup',
                 sinceSeq: lastSeq,
-                latestSeq: this.latestSeq,
+                latestSeq: latestDbSeq,
                 presence: this.getPresenceSummary(initialDeliveryId || null),
                 events: missedEvents,
                 timestamp: new Date().toISOString(),
@@ -505,16 +507,18 @@ export class PalletTrackRealtimeBroker {
 
       case 'sync_request': {
         if (!db) break;
+        this.lastDb = db;
         const sinceSeq = Math.max(0, Number(msg.sinceSeq) || 0);
         const deliveryId =
           typeof msg.deliveryId === 'string' && msg.deliveryId.trim()
             ? msg.deliveryId.trim()
             : undefined;
         const missedEvents = await this.getEventsSince(db, sinceSeq, deliveryId);
+        const latestSeq = await this.getLatestSequenceNumber(db);
         this.safeSend(client.socket, {
           type: 'sync_response',
           sinceSeq,
-          latestSeq: this.latestSeq,
+          latestSeq,
           events: missedEvents,
           presence: this.getPresenceSummary(client.activeDeliveryId),
           timestamp: new Date().toISOString(),
@@ -871,9 +875,30 @@ export class PalletTrackRealtimeBroker {
   }
 
   /**
+   * Synchronises this isolate's sequence number with D1 and broadcasts any new events
+   * written by other Cloudflare Worker isolates since `this.latestSeq` to connected clients.
+   */
+  public async syncFromDatabase(db?: D1Database): Promise<RealtimeEvent[]> {
+    const activeDb = db || this.lastDb;
+    if (!activeDb) return [];
+    this.lastDb = activeDb;
+    const prevSeq = this.latestSeq;
+    const dbMax = await this.getLatestSequenceNumber(activeDb);
+    if (dbMax > prevSeq) {
+      const missed = await this.getEventsSince(activeDb, prevSeq);
+      for (const ev of missed) {
+        this.broadcastEvent(ev);
+      }
+      return missed;
+    }
+    return [];
+  }
+
+  /**
    * Get the latest sequence number from memory or D1
    */
   public async getLatestSequenceNumber(db: D1Database): Promise<number> {
+    this.lastDb = db;
     try {
       const row = await db
         .prepare('SELECT MAX(seq) as max_seq FROM realtime_events')

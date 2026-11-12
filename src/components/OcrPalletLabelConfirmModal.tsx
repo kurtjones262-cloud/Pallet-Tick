@@ -67,7 +67,6 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
 
   // Live evaluation against the compiled parts list
   const evaluation = useMemo(() => {
-    // If operator manually edited the part number or clicked a candidate, treat confidence as operator-verified ('high')
     const effectiveConfidence = manualOverrideConfirmed
       ? 'high'
       : extraction.ocrConfidence;
@@ -138,9 +137,9 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
   return (
     <div
       onClick={(e) => e.stopPropagation()}
-      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
     >
-      <div className="w-full max-w-md bg-[#1C1C1E] border border-zinc-700 rounded-[8px] shadow-2xl text-white overflow-hidden animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[94dvh] flex flex-col">
+      <div className="w-full max-w-md bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl text-[var(--pt-text,#FFFFFF)] overflow-hidden animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[94dvh] flex flex-col">
         {/* Top Status Indicator Header (GREEN / ORANGE / RED) */}
         <div
           className={`px-4 py-3 border-b flex items-center justify-between gap-2 shrink-0 ${
@@ -160,14 +159,14 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
               <XCircle className="w-4 h-4 shrink-0" />
             )}
             <div className="min-w-0">
-              <h3 className="font-bold text-xs uppercase tracking-wider truncate">
+              <h3 className="font-bold text-xs uppercase tracking-wider truncate pt-keep-white">
                 {isGreen
                   ? 'Matched · Exact Expected Quantity'
                   : isOrange
                   ? 'Matched · Partial or Mismatched Quantity'
                   : 'Unmatched or Uncertain Part Number'}
               </h3>
-              <p className="text-[11px] opacity-95 truncate">
+              <p className="text-[11px] opacity-95 truncate pt-keep-white">
                 {isGreen
                   ? `Total scanned (${evaluation.newTotalScannedQty}/${evaluation.expectedQty}) matches expected quantity`
                   : isOrange
@@ -180,7 +179,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
           <button
             type="button"
             onClick={onCancel}
-            className="p-1 rounded hover:bg-black/20 text-white/90 hover:text-white cursor-pointer shrink-0"
+            className="p-1 rounded hover:bg-black/20 text-white/90 hover:text-white cursor-pointer shrink-0 pt-keep-white"
             aria-label="Cancel OCR scan"
           >
             <X className="w-4 h-4" />
@@ -190,21 +189,21 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
         {/* Scrollable Body */}
         <form onSubmit={handleConfirm} className="p-4 space-y-3.5 overflow-y-auto flex-1">
           {/* Captured Label Thumbnail + Raw OCR Toggle */}
-          <div className="flex items-center gap-3 p-2.5 rounded-[5px] bg-black/40 border border-zinc-800">
+          <div className="flex items-center gap-3 p-2.5 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)]">
             {extraction.croppedPreviewDataUrl && (
               <img
                 src={extraction.croppedPreviewDataUrl}
                 alt="Captured pallet label"
-                className="w-20 h-14 object-cover rounded-[3px] border border-zinc-700 shrink-0 bg-zinc-900"
+                className="w-20 h-14 object-cover rounded-lg border border-[var(--pt-border,#29243D)] shrink-0 bg-black"
               />
             )}
             <div className="min-w-0 flex-1 text-xs">
               <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
+                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#00D979]/15 text-[#00D979] border border-[#00D979]/30 font-semibold">
                   On-Device Offline OCR
                 </span>
                 {Math.abs(extraction.detectedSkewDegrees) >= 1 && (
-                  <span className="font-mono text-[10px] text-zinc-400">
+                  <span className="font-mono text-[10px] text-[var(--pt-text-secondary,#A3A8BD)]">
                     Deskewed {extraction.detectedSkewDegrees > 0 ? '+' : ''}
                     {extraction.detectedSkewDegrees}°
                   </span>
@@ -213,7 +212,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
               <button
                 type="button"
                 onClick={() => setShowRawOcr((prev) => !prev)}
-                className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-mono text-emerald-400 hover:underline cursor-pointer"
+                className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-mono text-[var(--pt-primary-light,#C084FC)] hover:underline cursor-pointer"
               >
                 <Eye className="w-3 h-3" />
                 <span>{showRawOcr ? 'Hide raw OCR text' : 'Inspect raw OCR text'}</span>
@@ -222,25 +221,25 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
           </div>
 
           {showRawOcr && (
-            <div className="p-2.5 rounded-[4px] bg-black/60 border border-zinc-800 text-left">
-              <span className="block font-mono text-[10px] uppercase text-zinc-400 mb-1">
+            <div className="p-2.5 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-left">
+              <span className="block font-mono text-[10px] uppercase text-[var(--pt-text-secondary,#A3A8BD)] mb-1">
                 Raw OCR Text (Troubleshooting):
               </span>
-              <pre className="font-mono text-[11px] text-zinc-300 whitespace-pre-wrap max-h-28 overflow-y-auto">
+              <pre className="font-mono text-[11px] text-[var(--pt-text,#FFFFFF)] whitespace-pre-wrap max-h-28 overflow-y-auto">
                 {extraction.rawOcrText || '(No raw text detected)'}
               </pre>
             </div>
           )}
 
-          {/* Duplicate Pallet Label Warning (Does NOT auto-reject since separate pallets can have identical labels) */}
+          {/* Duplicate Pallet Label Warning */}
           {previousIdenticalScans.length > 0 && (
-            <div className="p-3 rounded-[5px] bg-amber-950/70 border border-amber-500/50 text-amber-200 text-xs flex items-start gap-2.5">
-              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="p-3 rounded-xl bg-[#F59E0B]/15 border border-[#F59E0B]/50 text-[#F59E0B] text-xs flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-[#F59E0B] shrink-0 mt-0.5" />
               <div className="min-w-0 flex-1">
-                <span className="font-semibold text-amber-300 block">
+                <span className="font-semibold block">
                   Previously Scanned Label Warning ({previousIdenticalScans.length}x)
                 </span>
-                <p className="text-[11px] text-amber-200/90 mt-0.5 leading-snug">
+                <p className="text-[11px] text-[var(--pt-text,#FFFFFF)] mt-0.5 leading-snug">
                   A pallet label for <strong className="font-mono">{partNumberInput}</strong> with
                   quantity <strong className="font-mono">{parsedQty}</strong> was already confirmed
                   at{' '}
@@ -257,12 +256,12 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
 
           {/* Editable OCR Fields */}
           <div className="space-y-3">
-            {/* Field 1: Extracted Part Number (Treated strictly as string to preserve leading zeros & hyphens) */}
+            {/* Field 1: Extracted Part Number */}
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label
                   htmlFor="ocr-label-part-number-input"
-                  className="text-[11px] font-mono uppercase tracking-wider text-zinc-300 font-semibold"
+                  className="text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] font-semibold"
                 >
                   1. Extracted Part Number
                 </label>
@@ -274,7 +273,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                       const found = delivery.parts.find((p) => p.id === e.target.value);
                       if (found) handleSelectCandidatePart(found);
                     }}
-                    className="h-6 px-1.5 rounded bg-zinc-800 border border-zinc-700 text-[10px] font-mono text-emerald-300 outline-none cursor-pointer"
+                    className="h-6 px-1.5 rounded bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)] outline-none cursor-pointer"
                   >
                     <option value="">Select from docket list...</option>
                     {delivery.parts.map((p) => (
@@ -295,17 +294,17 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                   setValidationError(null);
                 }}
                 placeholder="e.g. 0045-PLT-102"
-                className={`w-full h-10 px-3 bg-[#0F0F0E] border rounded-[5px] font-mono text-sm font-bold text-white outline-none ${
+                className={`w-full h-10 px-3 bg-[var(--pt-input-bg,#080B12)] border rounded-xl font-mono text-sm font-bold text-[var(--pt-text,#FFFFFF)] outline-none ${
                   evaluation.matchedPart
-                    ? 'border-emerald-500/70 focus:border-emerald-400'
-                    : 'border-red-500/70 focus:border-red-400'
+                    ? 'border-[#00D979]/70 focus:border-[#00D979]'
+                    : 'border-[#EF4444]/70 focus:border-[#EF4444]'
                 }`}
               />
 
-              {/* If unmatched or uncertain, show close candidate suggestions from docket */}
+              {/* Candidate suggestions from docket */}
               {!evaluation.matchedPart && evaluation.candidateParts.length > 0 && (
-                <div className="mt-1.5 p-2 rounded bg-zinc-900 border border-zinc-700">
-                  <span className="block text-[10px] font-mono text-amber-300 mb-1">
+                <div className="mt-1.5 p-2 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)]">
+                  <span className="block text-[10px] font-mono text-[#F59E0B] mb-1">
                     Similar part numbers on docket (tap to select — never auto-confirmed):
                   </span>
                   <div className="flex flex-wrap gap-1.5">
@@ -314,7 +313,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                         key={cand.id}
                         type="button"
                         onClick={() => handleSelectCandidatePart(cand)}
-                        className="px-2 py-1 rounded bg-zinc-800 hover:bg-emerald-950 border border-zinc-600 hover:border-emerald-500 font-mono text-xs text-white cursor-pointer"
+                        className="px-2 py-1 rounded bg-[var(--pt-bg-secondary,#101321)] hover:bg-[var(--pt-hover-bg)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] font-mono text-xs text-[var(--pt-text,#FFFFFF)] cursor-pointer"
                       >
                         {cand.partNumber} (Exp: {cand.quantity ?? 1})
                       </button>
@@ -328,7 +327,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
             <div>
               <label
                 htmlFor="ocr-label-description-input"
-                className="block text-[11px] font-mono uppercase tracking-wider text-zinc-300 font-semibold mb-1"
+                className="block text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] font-semibold mb-1"
               >
                 2. Extracted Description
               </label>
@@ -338,7 +337,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                 value={descriptionInput}
                 onChange={(e) => setDescriptionInput(e.target.value)}
                 placeholder="Part description from label"
-                className="w-full h-9 px-3 bg-[#0F0F0E] border border-zinc-700 focus:border-emerald-400 rounded-[5px] text-xs text-white outline-none"
+                className="w-full h-9 px-3 bg-[var(--pt-input-bg,#080B12)] border border-[var(--pt-border,#29243D)] focus:border-[var(--pt-primary,#A020F0)] rounded-xl text-xs text-[var(--pt-text,#FFFFFF)] outline-none"
               />
             </div>
 
@@ -346,7 +345,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
             <div>
               <label
                 htmlFor="ocr-label-quantity-input"
-                className="block text-[11px] font-mono uppercase tracking-wider text-zinc-300 font-semibold mb-1"
+                className="block text-[11px] font-mono uppercase tracking-wider text-[var(--pt-text-secondary,#A3A8BD)] font-semibold mb-1"
               >
                 3. Extracted Pallet Quantity (Added to Scanned Total)
               </label>
@@ -358,7 +357,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                     setQuantityInput(String(Math.max(1, curr - 1)));
                     setValidationError(null);
                   }}
-                  className="w-10 h-10 rounded-[5px] bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-white flex items-center justify-center cursor-pointer shrink-0"
+                  className="w-10 h-10 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-[var(--pt-hover-bg)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text,#FFFFFF)] flex items-center justify-center cursor-pointer shrink-0"
                   aria-label="Decrease quantity"
                 >
                   <Minus className="w-4 h-4" />
@@ -373,7 +372,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                     setQuantityInput(e.target.value);
                     setValidationError(null);
                   }}
-                  className="flex-1 h-10 px-3 bg-[#0F0F0E] border border-zinc-700 focus:border-emerald-400 rounded-[5px] font-mono text-lg font-bold text-white text-center outline-none"
+                  className="flex-1 h-10 px-3 bg-[var(--pt-input-bg,#080B12)] border border-[var(--pt-border,#29243D)] focus:border-[var(--pt-primary,#A020F0)] rounded-xl font-mono text-lg font-bold text-[var(--pt-text,#FFFFFF)] text-center outline-none"
                 />
                 <button
                   type="button"
@@ -382,7 +381,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                     setQuantityInput(String(curr + 1));
                     setValidationError(null);
                   }}
-                  className="w-10 h-10 rounded-[5px] bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-white flex items-center justify-center cursor-pointer shrink-0"
+                  className="w-10 h-10 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-[var(--pt-hover-bg)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text,#FFFFFF)] flex items-center justify-center cursor-pointer shrink-0"
                   aria-label="Increase quantity"
                 >
                   <Plus className="w-4 h-4" />
@@ -394,53 +393,52 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
           {/* Matched Docket Part & Cumulative Multi-Pallet Quantity Summary */}
           {evaluation.matchedPart ? (
             <div
-              className={`p-3 rounded-[6px] border ${
+              className={`p-3 rounded-xl border ${
                 isGreen
-                  ? 'bg-emerald-950/50 border-emerald-500/40'
-                  : 'bg-amber-950/50 border-amber-500/40'
+                  ? 'bg-[#00D979]/10 border-[#00D979]/40'
+                  : 'bg-[#F59E0B]/10 border-[#F59E0B]/40'
               }`}
             >
               <div className="flex items-center justify-between gap-2 mb-2">
                 <div className="flex items-center gap-1.5 min-w-0">
-                  <Layers className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span className="font-mono text-xs font-bold text-white truncate">
+                  <Layers className="w-3.5 h-3.5 text-[#00D979] shrink-0" />
+                  <span className="font-mono text-xs font-bold text-[var(--pt-text,#FFFFFF)] truncate">
                     Matched: {evaluation.matchedPart.partNumber}
                   </span>
                 </div>
-                <span className="px-1.5 py-0.5 rounded bg-black/40 font-mono text-[10px] text-zinc-300 shrink-0">
+                <span className="px-1.5 py-0.5 rounded bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] font-mono text-[10px] text-[var(--pt-text-secondary,#A3A8BD)] shrink-0">
                   Docket No. {evaluation.matchedPart.itemNumber}
                 </span>
               </div>
 
-              <p className="text-xs text-zinc-300 truncate mb-2.5">
+              <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] truncate mb-2.5">
                 {evaluation.matchedPart.description}
               </p>
 
-              {/* Cumulative Quantity Math Box: Prior + This Pallet = New Total / Expected */}
-              <div className="grid grid-cols-3 gap-2 p-2 rounded bg-black/40 border border-white/10 text-center font-mono">
+              <div className="grid grid-cols-3 gap-2 p-2 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-center font-mono">
                 <div>
-                  <span className="block text-[9px] uppercase text-zinc-400">
+                  <span className="block text-[9px] uppercase text-[var(--pt-text-muted,#737B94)]">
                     Prior Scanned
                   </span>
-                  <span className="text-sm font-bold text-zinc-200">
+                  <span className="text-sm font-bold text-[var(--pt-text,#FFFFFF)]">
                     {evaluation.existingScannedQty}
                   </span>
                 </div>
                 <div>
-                  <span className="block text-[9px] uppercase text-zinc-400">
+                  <span className="block text-[9px] uppercase text-[var(--pt-text-muted,#737B94)]">
                     This Pallet
                   </span>
-                  <span className="text-sm font-bold text-emerald-400">
+                  <span className="text-sm font-bold text-[#00D979]">
                     +{evaluation.addedPalletQty}
                   </span>
                 </div>
                 <div>
-                  <span className="block text-[9px] uppercase text-zinc-400">
+                  <span className="block text-[9px] uppercase text-[var(--pt-text-muted,#737B94)]">
                     Total / Expected
                   </span>
                   <span
                     className={`text-sm font-bold ${
-                      isGreen ? 'text-emerald-400' : 'text-amber-400'
+                      isGreen ? 'text-[#00D979]' : 'text-[#F59E0B]'
                     }`}
                   >
                     {evaluation.newTotalScannedQty} / {evaluation.expectedQty}
@@ -449,12 +447,12 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
               </div>
             </div>
           ) : (
-            <div className="p-3 rounded-[6px] bg-red-950/50 border border-red-500/40 text-xs text-red-200">
-              <div className="flex items-center gap-1.5 font-semibold text-red-300 mb-1">
+            <div className="p-3 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-xs text-[#EF4444]">
+              <div className="flex items-center gap-1.5 font-semibold mb-1">
                 <XCircle className="w-4 h-4 shrink-0" />
                 <span>No Exact Match on Compiled Parts List</span>
               </div>
-              <p className="text-[11px] leading-snug">
+              <p className="text-[11px] leading-snug text-[var(--pt-text,#FFFFFF)]">
                 Part number <strong className="font-mono">{partNumberInput || '—'}</strong> was not
                 found on this delivery docket. Edit the part number above if OCR misread a character,
                 or log this label as an Unexpected Part.
@@ -463,7 +461,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
           )}
 
           {validationError && (
-            <p className="text-xs text-red-400 font-medium">{validationError}</p>
+            <p className="text-xs text-[#EF4444] font-medium">{validationError}</p>
           )}
 
           {/* Action Buttons */}
@@ -471,7 +469,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
             {evaluation.matchedPart ? (
               <button
                 type="submit"
-                className={`w-full h-11 px-4 rounded-[5px] font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-lg ${
+                className={`w-full h-11 px-4 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-lg ${
                   isGreen
                     ? 'bg-[#059669] hover:bg-[#047857] text-white'
                     : 'bg-amber-600 hover:bg-amber-700 text-white'
@@ -494,7 +492,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
                     rawOcrText: extraction.rawOcrText,
                   });
                 }}
-                className="w-full h-10 px-4 rounded-[5px] bg-red-600 hover:bg-red-700 text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                className="w-full h-10 px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
               >
                 <FileText className="w-4 h-4" />
                 <span>Record as Unexpected Part (Red)</span>
@@ -504,7 +502,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
             <button
               type="button"
               onClick={onCancel}
-              className="w-full h-9 px-4 rounded-[5px] border border-zinc-700 bg-transparent hover:bg-zinc-800 text-zinc-300 font-medium text-xs cursor-pointer transition-colors"
+              className="w-full h-9 px-4 rounded-xl border border-[var(--pt-border,#29243D)] bg-[var(--pt-bg-secondary,#101321)] hover:bg-[var(--pt-hover-bg)] text-[var(--pt-text-secondary,#A3A8BD)] font-medium text-xs cursor-pointer transition-colors"
             >
               Retake / Cancel
             </button>

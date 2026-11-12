@@ -2,6 +2,17 @@ import { createRoot } from 'react-dom/client';
 import { registerSW } from 'virtual:pwa-register';
 import App from './App.tsx';
 import './index.css';
+import { getStoredThemePreferences, applyThemeToDocument } from './config/theme';
+import { getStoredUser } from './services/palletTrackApi';
+
+// Apply saved theme & Dark/Light mode immediately before first paint
+if (typeof window !== 'undefined') {
+  const initialUser = getStoredUser();
+  const initialPrefs = getStoredThemePreferences(
+    initialUser?.id || initialUser?.employeeCode || null
+  );
+  applyThemeToDocument(initialPrefs.themeId, initialPrefs.mode);
+}
 
 // Proactively evict any legacy PalletTick / PalletCheck Service Worker caches
 if (typeof window !== 'undefined' && 'caches' in window) {

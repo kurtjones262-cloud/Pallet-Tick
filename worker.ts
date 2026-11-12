@@ -650,6 +650,7 @@ export default {
 
         const initialDeliveryId = url.searchParams.get('deliveryId') || null;
         const lastSeq = Math.max(0, Number(url.searchParams.get('lastSeq')) || 0);
+        await realtimeBroker.getLatestSequenceNumber(env.DB);
         const connId = realtimeBroker.registerClient(
           serverWs,
           user,
@@ -750,6 +751,79 @@ export default {
 
     if (url.pathname === '/api/recover-docket-items' && request.method === 'POST') {
       return handleRecoverDocketItems(request, env);
+    }
+
+    if (url.pathname === '/api/read-part-label' && request.method === 'POST') {
+      const apiKey = (env.GEMINI_API_KEY || '').trim();
+      if (!apiKey) {
+        return new Response(
+          JSON.stringify({
+            error: 'GEMINI_API_KEY is not configured on the Worker.',
+            code: 'MISSING_GEMINI_API_KEY',
+          }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+          }
+        );
+      }
+      try {
+        const body: any = await request.json().catch(() => ({}));
+        const imageDataUrl = body?.imageDataUrl;
+        if (!imageDataUrl || typeof imageDataUrl !== 'string') {
+          return new Response(JSON.stringify({ error: 'Missing imageDataUrl' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+          });
+        }
+        const parsedImg = parseDataUrl(imageDataUrl);
+        const schema = {
+          type: 'OBJECT',
+          properties: {
+            partNumber: { type: 'STRING' },
+            quantity: { type: 'NUMBER' },
+            itemNumber: { type: 'STRING' },
+            rawText: { type: 'STRING' },
+          },
+          required: ['partNumber', 'quantity', 'rawText'],
+        };
+        const { parsed } = await callGeminiRestWithRetryAndFallback(
+          apiKey,
+          env,
+          'You are an industrial manufacturing label OCR reader. Extract partNumber, quantity, itemNumber, and rawText.',
+          [
+            { inlineData: { mimeType: parsedImg.mimeType, data: parsedImg.base64Data } },
+            { text: 'Read this industrial part or pallet label.' },
+          ],
+          schema
+        );
+        return new Response(JSON.stringify(parsed || {}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        });
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({ error: err?.message || 'Failed to read part label' }),
+          {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+          }
+        );
+      }
+    }
+
+    // Never allow unmatched /api/* routes to fall through to SPA index.html
+    if (url.pathname.startsWith('/api/')) {
+      return new Response(
+        JSON.stringify({
+          error: `API route not found: ${request.method} ${url.pathname}`,
+          code: 'NOT_FOUND',
+        }),
+        {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+        }
+      );
     }
 
     // Serve frontend static assets through Cloudflare Worker with SPA fallback

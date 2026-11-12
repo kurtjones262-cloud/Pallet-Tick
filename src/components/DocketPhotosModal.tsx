@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, ChevronLeft, ChevronRight, FileText, Download } from 'lucide-react';
 import { Delivery } from '../types/delivery';
-import { getDocketImagesForDelivery, StoredDocketImage } from '../utils/indexedDb';
+import { getDocketImagesForDelivery } from '../utils/indexedDb';
 
 interface DocketPhotosModalProps {
   delivery: Delivery;
@@ -18,7 +18,6 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
 
   useEffect(() => {
     async function loadImages() {
-      // 1. Check IndexedDB first for full-resolution photos
       const fromDb = await getDocketImagesForDelivery(delivery.id);
       if (fromDb && fromDb.length > 0) {
         setImages(fromDb);
@@ -26,13 +25,14 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
         return;
       }
 
-      // 2. Fallback to delivery.docketAttachments
       if (delivery.docketAttachments && delivery.docketAttachments.length > 0) {
-        const mapped = delivery.docketAttachments.map((att, idx) => ({
-          pageNumber: idx + 1,
-          dataUrl: att.dataUrl || '',
-          name: att.name || `Page ${idx + 1}`,
-        })).filter((it) => Boolean(it.dataUrl));
+        const mapped = delivery.docketAttachments
+          .map((att, idx) => ({
+            pageNumber: idx + 1,
+            dataUrl: att.dataUrl || '',
+            name: att.name || `Page ${idx + 1}`,
+          }))
+          .filter((it) => Boolean(it.dataUrl));
         setImages(mapped);
       }
       setLoading(false);
@@ -45,23 +45,23 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4"
+      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-4xl h-[92dvh] bg-[#141413] border border-white/10 rounded-[6px] shadow-2xl flex flex-col overflow-hidden text-white"
+        className="w-full max-w-4xl h-[92dvh] bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] rounded-2xl shadow-2xl flex flex-col overflow-hidden text-[var(--pt-text,#FFFFFF)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-4 py-3 bg-black/60 border-b border-white/10 flex items-center justify-between shrink-0">
+        <div className="px-4 py-3 bg-[var(--pt-card,#15182A)] border-b border-[var(--pt-border,#29243D)] flex items-center justify-between shrink-0">
           <div>
             <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4 text-emerald-400" />
-              <h3 className="font-bold text-xs sm:text-sm font-mono truncate">
+              <FileText className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)]" />
+              <h3 className="font-bold text-xs sm:text-sm font-mono truncate text-[var(--pt-text,#FFFFFF)]">
                 {delivery.docketNumber} — {delivery.supplier}
               </h3>
             </div>
-            <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
+            <p className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] font-mono mt-0.5">
               Original Photographed Delivery Docket
               {images.length > 0 && ` · Page ${activeIdx + 1} of ${images.length}`}
             </p>
@@ -72,7 +72,7 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
               <a
                 href={currentImage.dataUrl}
                 download={`${delivery.docketNumber}_page${activeIdx + 1}.jpg`}
-                className="h-7 px-2.5 rounded-[4px] bg-white/15 hover:bg-white/25 text-white text-xs font-medium inline-flex items-center gap-1 cursor-pointer transition-colors"
+                className="h-7 px-2.5 rounded-lg pt-btn-primary text-xs font-mono font-bold inline-flex items-center gap-1 cursor-pointer transition-colors"
                 title="Download photo"
               >
                 <Download className="w-3.5 h-3.5" />
@@ -82,7 +82,7 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
 
             <button
               onClick={onClose}
-              className="p-1 text-zinc-400 hover:text-white cursor-pointer"
+              className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] cursor-pointer"
             >
               <X className="w-4 h-4" />
             </button>
@@ -90,13 +90,13 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
         </div>
 
         {/* Image Canvas / Viewport */}
-        <div className="flex-1 overflow-auto p-4 flex items-center justify-center relative bg-black/40">
+        <div className="flex-1 overflow-auto p-4 flex items-center justify-center relative bg-[var(--pt-bg,#080B12)]">
           {loading ? (
-            <div className="text-center text-xs text-zinc-400">
+            <div className="text-center text-xs text-[var(--pt-text-secondary,#A3A8BD)]">
               Loading docket photo...
             </div>
           ) : images.length === 0 ? (
-            <div className="text-center text-xs text-zinc-400 max-w-xs">
+            <div className="text-center text-xs text-[var(--pt-text-secondary,#A3A8BD)] max-w-xs">
               No photo attached to this delivery docket.
             </div>
           ) : (
@@ -114,7 +114,7 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
                 onClick={() =>
                   setActiveIdx((prev) => (prev > 0 ? prev - 1 : images.length - 1))
                 }
-                className="absolute left-3 p-2 rounded-full bg-black/60 hover:bg-black/90 text-white cursor-pointer border border-white/10"
+                className="absolute left-3 p-2 rounded-full bg-[var(--pt-card,#15182A)]/90 hover:bg-[var(--pt-card,#15182A)] text-[var(--pt-text,#FFFFFF)] cursor-pointer border border-[var(--pt-border,#29243D)] shadow-md"
                 title="Previous page"
               >
                 <ChevronLeft className="w-5 h-5" />
@@ -124,7 +124,7 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
                 onClick={() =>
                   setActiveIdx((prev) => (prev < images.length - 1 ? prev + 1 : 0))
                 }
-                className="absolute right-3 p-2 rounded-full bg-black/60 hover:bg-black/90 text-white cursor-pointer border border-white/10"
+                className="absolute right-3 p-2 rounded-full bg-[var(--pt-card,#15182A)]/90 hover:bg-[var(--pt-card,#15182A)] text-[var(--pt-text,#FFFFFF)] cursor-pointer border border-[var(--pt-border,#29243D)] shadow-md"
                 title="Next page"
               >
                 <ChevronRight className="w-5 h-5" />
@@ -135,15 +135,15 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
 
         {/* Footer Thumbnails (if multi-page) */}
         {images.length > 1 && (
-          <div className="px-4 py-2.5 bg-black/70 border-t border-white/10 flex items-center gap-2 overflow-x-auto shrink-0">
+          <div className="px-4 py-2.5 bg-[var(--pt-card,#15182A)] border-t border-[var(--pt-border,#29243D)] flex items-center gap-2 overflow-x-auto shrink-0">
             {images.map((img, idx) => (
               <button
                 key={idx}
                 onClick={() => setActiveIdx(idx)}
                 className={`relative w-12 h-16 rounded overflow-hidden border cursor-pointer shrink-0 transition-all ${
                   activeIdx === idx
-                    ? 'border-emerald-500 ring-2 ring-emerald-500/30'
-                    : 'border-white/20 opacity-60 hover:opacity-100'
+                    ? 'border-[var(--pt-primary,#A020F0)] ring-2 ring-[var(--pt-primary,#A020F0)]/30'
+                    : 'border-[var(--pt-border,#29243D)] opacity-60 hover:opacity-100'
                 }`}
               >
                 <img
@@ -151,7 +151,7 @@ export const DocketPhotosModal: React.FC<DocketPhotosModalProps> = ({
                   alt={`Thumbnail ${idx + 1}`}
                   className="w-full h-full object-cover"
                 />
-                <span className="absolute bottom-0 inset-x-0 bg-black/80 text-[9px] font-mono text-center">
+                <span className="absolute bottom-0 inset-x-0 bg-black/80 text-white text-[9px] font-mono text-center pt-keep-white">
                   P{idx + 1}
                 </span>
               </button>

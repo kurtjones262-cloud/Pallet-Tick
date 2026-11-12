@@ -2023,7 +2023,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       {/* ============================================================ */}
       {/* FULL-SCREEN CAMERA PREVIEW & VIEWFINDER                      */}
       {/* ============================================================ */}
-      <div className="relative flex-1 w-full h-full bg-black overflow-hidden flex items-center justify-center">
+      <div className="pt-camera-viewport relative flex-1 w-full h-full bg-black overflow-hidden flex items-center justify-center">
         {/* Interactive Camera Container */}
         <div
           onClick={handleTapToFocus}
@@ -2042,13 +2042,13 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               style={{
                 left: focusRingPos.x - 24,
                 top: focusRingPos.y - 24,
-                borderColor: 'var(--pt-primary-light, #C084FC)',
+                borderColor: 'var(--pt-accent-secondary, #C084FC)',
               }}
               className="pointer-events-none absolute z-30 w-12 h-12 rounded-full border-2 bg-[var(--pt-primary,#A020F0)]/15 flex items-center justify-center animate-ping"
             >
               <div
                 className="w-2 h-2 rounded-full"
-                style={{ backgroundColor: 'var(--pt-primary-light, #C084FC)' }}
+                style={{ backgroundColor: 'var(--pt-accent-secondary, #C084FC)' }}
               />
             </div>
           )}
@@ -2072,32 +2072,32 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center p-4">
             {/* Viewfinder Target Reticle */}
             <div className="relative w-[84%] max-w-[350px] aspect-[4/3] rounded-2xl flex items-center justify-center">
-              {/* Theme-Aware Purple / Neon Targeting Corner Guides */}
+              {/* Theme-Aware High-Contrast Targeting Corner Guides */}
               <div
                 className="absolute top-0 left-0 w-9 h-9 border-t-3 border-l-3 rounded-tl-xl"
                 style={{
-                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  borderColor: 'var(--pt-accent-secondary, #C084FC)',
                   boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
                 }}
               />
               <div
                 className="absolute top-0 right-0 w-9 h-9 border-t-3 border-r-3 rounded-tr-xl"
                 style={{
-                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  borderColor: 'var(--pt-accent-secondary, #C084FC)',
                   boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
                 }}
               />
               <div
                 className="absolute bottom-0 left-0 w-9 h-9 border-b-3 border-l-3 rounded-bl-xl"
                 style={{
-                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  borderColor: 'var(--pt-accent-secondary, #C084FC)',
                   boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
                 }}
               />
               <div
                 className="absolute bottom-0 right-0 w-9 h-9 border-b-3 border-r-3 rounded-br-xl"
                 style={{
-                  borderColor: 'var(--pt-primary-light, #C084FC)',
+                  borderColor: 'var(--pt-accent-secondary, #C084FC)',
                   boxShadow: '0 0 14px var(--pt-glow, rgba(160, 32, 240, 0.55))',
                 }}
               />
@@ -2109,7 +2109,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                     className="h-[2px] w-full"
                     style={{
                       background:
-                        'linear-gradient(90deg, transparent 0%, var(--pt-primary-light, #C084FC) 50%, transparent 100%)',
+                        'linear-gradient(90deg, transparent 0%, var(--pt-accent-secondary, #C084FC) 50%, transparent 100%)',
                       boxShadow: '0 0 14px var(--pt-primary, #A020F0)',
                     }}
                   />
@@ -2126,18 +2126,18 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               {/* Subtle Central Scanning Reticle */}
               <div
                 className="w-4 h-4 border rounded-full flex items-center justify-center opacity-70"
-                style={{ borderColor: 'var(--pt-primary-light, #C084FC)' }}
+                style={{ borderColor: 'var(--pt-accent-secondary, #C084FC)' }}
               >
                 <div
                   className="w-1.5 h-1.5 rounded-full"
-                  style={{ backgroundColor: 'var(--pt-primary-light, #C084FC)' }}
+                  style={{ backgroundColor: 'var(--pt-accent-secondary, #C084FC)' }}
                 />
               </div>
             </div>
 
             {/* Instruction Tagline below reticle */}
             <div className="mt-4 px-3.5 py-1.5 rounded-full bg-[#080B12]/80 backdrop-blur-md border border-[var(--pt-border,#29243D)] text-center shadow-lg">
-              <span className="font-mono text-[10px] font-bold tracking-wider text-[var(--pt-primary-light,#C084FC)] uppercase">
+              <span className="font-mono text-[10px] font-bold tracking-wider text-[var(--pt-accent-secondary,#C084FC)] uppercase">
                 {activeSupplierRule.id === 'ocr_label'
                   ? 'OCR Label Mode • Reading printed label text (QR auto-scan disabled)'
                   : `${activeSupplierRule.name} • Align barcode, QR code or pallet label`}

@@ -6,20 +6,28 @@
 }
 
 /* ============================================================================
- * PARTTRACK GLOBAL THEME ENGINE (3 COMPLETE INDUSTRIAL THEMES)
+ * PARTTRACK GLOBAL THEME ENGINE (4 INDUSTRIAL THEMES × DARK & LIGHT MODES)
  * 1. Purple / Graphite (Default)
  * 2. Emerald / Black
  * 3. Electric Blue / Black
+ * 4. Yellow — Industrial
  * ============================================================================ */
 
 :root,
-:root[data-theme="purple"] {
+:root[data-theme="purple"],
+:root[data-theme="purple"][data-mode="dark"] {
   --pt-primary: #A020F0;
   --pt-primary-light: #C084FC;
   --pt-primary-deep: #6B21A8;
+  --pt-accent-secondary: #C084FC;
+  --pt-primary-contrast: #FFFFFF;
   --pt-bg: #080B12;
   --pt-bg-secondary: #101321;
   --pt-card: #15182A;
+  --pt-modal-bg: #101321;
+  --pt-input-bg: #080B12;
+  --pt-table-header: #101321;
+  --pt-hover-bg: rgba(255, 255, 255, 0.05);
   --pt-border: #29243D;
   --pt-text: #FFFFFF;
   --pt-text-secondary: #A3A8BD;
@@ -34,44 +42,154 @@
   --pt-info: #078BFF;
 }
 
-:root[data-theme="emerald"] {
+:root[data-theme="purple"][data-mode="light"] {
+  --pt-primary: #8B1CD9;
+  --pt-primary-light: #7E22CE;
+  --pt-primary-deep: #6B21A8;
+  --pt-accent-secondary: #A855F7;
+  --pt-primary-contrast: #FFFFFF;
+  --pt-bg: #F4F3F8;
+  --pt-bg-secondary: #FFFFFF;
+  --pt-card: #FFFFFF;
+  --pt-modal-bg: #FFFFFF;
+  --pt-input-bg: #F8F7FC;
+  --pt-table-header: #EFECE6;
+  --pt-hover-bg: rgba(126, 34, 206, 0.06);
+  --pt-border: #DDD8E8;
+  --pt-text: #1E1B2E;
+  --pt-text-secondary: #5A5570;
+  --pt-text-muted: #7C7694;
+  --pt-glow: rgba(139, 28, 217, 0.22);
+  --pt-glow-soft: rgba(139, 28, 217, 0.10);
+}
+
+:root[data-theme="emerald"],
+:root[data-theme="emerald"][data-mode="dark"] {
   --pt-primary: #00D979;
   --pt-primary-light: #34D399;
   --pt-primary-deep: #059669;
+  --pt-accent-secondary: #34D399;
+  --pt-primary-contrast: #06150E;
   --pt-bg: #060A09;
   --pt-bg-secondary: #0C1412;
   --pt-card: #111C19;
+  --pt-modal-bg: #0C1412;
+  --pt-input-bg: #060A09;
+  --pt-table-header: #0C1412;
+  --pt-hover-bg: rgba(255, 255, 255, 0.05);
   --pt-border: #1E332C;
   --pt-text: #FFFFFF;
   --pt-text-secondary: #9FB5AD;
   --pt-text-muted: #688279;
   --pt-glow: rgba(0, 217, 121, 0.32);
   --pt-glow-soft: rgba(0, 217, 121, 0.14);
-
-  --pt-success: #00D979;
-  --pt-warning: #F59E0B;
-  --pt-error: #EF4444;
-  --pt-info: #078BFF;
 }
 
-:root[data-theme="blue"] {
+:root[data-theme="emerald"][data-mode="light"] {
+  --pt-primary: #059669;
+  --pt-primary-light: #047857;
+  --pt-primary-deep: #065F46;
+  --pt-accent-secondary: #10B981;
+  --pt-primary-contrast: #FFFFFF;
+  --pt-bg: #F3F7F5;
+  --pt-bg-secondary: #FFFFFF;
+  --pt-card: #FFFFFF;
+  --pt-modal-bg: #FFFFFF;
+  --pt-input-bg: #F7FAF8;
+  --pt-table-header: #EBF2EE;
+  --pt-hover-bg: rgba(5, 150, 105, 0.06);
+  --pt-border: #D5E2DC;
+  --pt-text: #16241E;
+  --pt-text-secondary: #52665E;
+  --pt-text-muted: #748A81;
+  --pt-glow: rgba(5, 150, 105, 0.22);
+  --pt-glow-soft: rgba(5, 150, 105, 0.10);
+}
+
+:root[data-theme="blue"],
+:root[data-theme="blue"][data-mode="dark"] {
   --pt-primary: #078BFF;
   --pt-primary-light: #38BDF8;
   --pt-primary-deep: #0284C7;
+  --pt-accent-secondary: #38BDF8;
+  --pt-primary-contrast: #FFFFFF;
   --pt-bg: #070A0F;
   --pt-bg-secondary: #0E1522;
   --pt-card: #131C2E;
+  --pt-modal-bg: #0E1522;
+  --pt-input-bg: #070A0F;
+  --pt-table-header: #0E1522;
+  --pt-hover-bg: rgba(255, 255, 255, 0.05);
   --pt-border: #1E2D44;
   --pt-text: #FFFFFF;
   --pt-text-secondary: #9BA8BD;
   --pt-text-muted: #6A7891;
   --pt-glow: rgba(7, 139, 255, 0.35);
   --pt-glow-soft: rgba(7, 139, 255, 0.15);
+}
 
-  --pt-success: #00D979;
-  --pt-warning: #F59E0B;
-  --pt-error: #EF4444;
-  --pt-info: #078BFF;
+:root[data-theme="blue"][data-mode="light"] {
+  --pt-primary: #0277E6;
+  --pt-primary-light: #0369A1;
+  --pt-primary-deep: #075985;
+  --pt-accent-secondary: #38BDF8;
+  --pt-primary-contrast: #FFFFFF;
+  --pt-bg: #F3F6FA;
+  --pt-bg-secondary: #FFFFFF;
+  --pt-card: #FFFFFF;
+  --pt-modal-bg: #FFFFFF;
+  --pt-input-bg: #F7F9FC;
+  --pt-table-header: #EBF0F7;
+  --pt-hover-bg: rgba(2, 119, 230, 0.06);
+  --pt-border: #D6E0ED;
+  --pt-text: #172130;
+  --pt-text-secondary: #54647A;
+  --pt-text-muted: #78889E;
+  --pt-glow: rgba(2, 119, 230, 0.22);
+  --pt-glow-soft: rgba(2, 119, 230, 0.10);
+}
+
+:root[data-theme="yellow"],
+:root[data-theme="yellow"][data-mode="dark"] {
+  --pt-primary: #F5C400;
+  --pt-primary-light: #FFD633;
+  --pt-primary-deep: #D9AB00;
+  --pt-accent-secondary: #FFD633;
+  --pt-primary-contrast: #111315;
+  --pt-bg: #111315;
+  --pt-bg-secondary: #1A1D20;
+  --pt-card: #22262A;
+  --pt-modal-bg: #1A1D20;
+  --pt-input-bg: #111315;
+  --pt-table-header: #1A1D20;
+  --pt-hover-bg: rgba(245, 196, 0, 0.08);
+  --pt-border: #34393E;
+  --pt-text: #F5F5F5;
+  --pt-text-secondary: #A5A9AD;
+  --pt-text-muted: #7B8085;
+  --pt-glow: rgba(245, 196, 0, 0.34);
+  --pt-glow-soft: rgba(245, 196, 0, 0.15);
+}
+
+:root[data-theme="yellow"][data-mode="light"] {
+  --pt-primary: #E5B400;
+  --pt-primary-light: #9E7800;
+  --pt-primary-deep: #C99B00;
+  --pt-accent-secondary: #F5C400;
+  --pt-primary-contrast: #111315;
+  --pt-bg: #F5F6F7;
+  --pt-bg-secondary: #FFFFFF;
+  --pt-card: #FFFFFF;
+  --pt-modal-bg: #FFFFFF;
+  --pt-input-bg: #F5F6F7;
+  --pt-table-header: #ECEEF0;
+  --pt-hover-bg: rgba(229, 180, 0, 0.10);
+  --pt-border: #DDE1E5;
+  --pt-text: #202327;
+  --pt-text-secondary: #666D73;
+  --pt-text-muted: #858C93;
+  --pt-glow: rgba(229, 180, 0, 0.25);
+  --pt-glow-soft: rgba(229, 180, 0, 0.12);
 }
 
 @layer base {
@@ -82,6 +200,7 @@
     color: var(--pt-text);
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior-y: none;
+    transition: background-color 180ms ease, color 150ms ease;
   }
 
   /* Tabular numerals for all numbers, counters, quantities, and timestamps */
@@ -90,20 +209,32 @@
   .tabular-nums {
     font-variant-numeric: tabular-nums;
   }
+
+  /* Theme-aware focus ring for keyboard and touch accessibility */
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  button:focus-visible {
+    outline: 2px solid var(--pt-primary);
+    outline-offset: 1px;
+  }
 }
 
 /* Reusable Theme-Aware Surface & Accent Classes */
 .pt-surface-bg {
   background-color: var(--pt-bg);
+  color: var(--pt-text);
 }
 
 .pt-surface-secondary {
   background-color: var(--pt-bg-secondary);
+  color: var(--pt-text);
 }
 
 .pt-surface-card {
   background-color: var(--pt-card);
   border-color: var(--pt-border);
+  color: var(--pt-text);
 }
 
 .pt-border-color {
@@ -116,18 +247,135 @@
 
 .pt-accent-bg {
   background-color: var(--pt-primary);
+  color: var(--pt-primary-contrast);
 }
 
-.pt-btn-primary {
+.pt-btn-primary,
+.pt-btn-primary.text-white {
   background: linear-gradient(135deg, var(--pt-primary) 0%, var(--pt-primary-deep) 100%);
-  color: #FFFFFF;
+  color: var(--pt-primary-contrast) !important;
   box-shadow: 0 0 22px var(--pt-glow);
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.pt-btn-primary svg {
+  color: var(--pt-primary-contrast) !important;
 }
 
 .pt-btn-primary:hover:not(:disabled) {
-  filter: brightness(1.12);
+  filter: brightness(1.08);
   box-shadow: 0 0 28px var(--pt-glow);
+}
+
+/* ============================================================================
+ * GLOBAL LIGHT MODE ADAPTATION LAYER
+ * Automatically adapts foreground text, subtle hover states, and translucent
+ * borders in Light Mode while protecting camera viewports & solid buttons.
+ * ============================================================================ */
+:root[data-mode="light"] .text-white:not(.pt-btn-primary):not(.pt-keep-white):not(.pt-camera-viewport *):not([class*="bg-red-"]):not([class*="bg-rose-"]):not([class*="bg-emerald-6"]):not([class*="bg-amber-6"]):not([class*="bg-[#059669]"]):not([class*="bg-[#EF4444]"]):not([class*="bg-black"]) {
+  color: var(--pt-text);
+}
+
+:root[data-mode="light"] .text-zinc-200:not(.pt-camera-viewport *),
+:root[data-mode="light"] .text-zinc-300:not(.pt-camera-viewport *),
+:root[data-mode="light"] .text-slate-200:not(.pt-camera-viewport *),
+:root[data-mode="light"] .text-slate-300:not(.pt-camera-viewport *) {
+  color: var(--pt-text-secondary);
+}
+
+:root[data-mode="light"] .text-zinc-400:not(.pt-camera-viewport *),
+:root[data-mode="light"] .text-slate-400:not(.pt-camera-viewport *) {
+  color: var(--pt-text-muted);
+}
+
+:root[data-mode="light"] .hover\:text-white:hover:not(.pt-btn-primary):not(.pt-keep-white):not(.pt-camera-viewport *) {
+  color: var(--pt-text);
+}
+
+:root[data-mode="light"] .hover\:bg-white\/5:hover:not(.pt-camera-viewport *),
+:root[data-mode="light"] .hover\:bg-white\/10:hover:not(.pt-camera-viewport *),
+:root[data-mode="light"] .hover\:bg-white\/\[0\.02\]:hover:not(.pt-camera-viewport *),
+:root[data-mode="light"] .hover\:bg-white\/\[0\.03\]:hover:not(.pt-camera-viewport *) {
+  background-color: var(--pt-hover-bg);
+}
+
+/* ============================================================================
+ * THEME-AWARE TABLE & EDITOR MODAL ADAPTATION (.pt-themed-modal)
+ * Ensures complex OCR review & multi-row part editors adapt to all 4 themes
+ * and both Dark Mode and Light Mode.
+ * ============================================================================ */
+.pt-themed-modal {
+  background-color: var(--pt-bg-secondary) !important;
+  border-color: var(--pt-border) !important;
+  color: var(--pt-text) !important;
+}
+
+.pt-themed-modal .bg-\[\#F6F5F2\],
+.pt-themed-modal .bg-zinc-50,
+.pt-themed-modal .bg-zinc-100 {
+  background-color: var(--pt-bg) !important;
+}
+
+.pt-themed-modal .bg-white {
+  background-color: var(--pt-card) !important;
+  color: var(--pt-text) !important;
+}
+
+.pt-themed-modal .border-\[\#E4E3DE\],
+.pt-themed-modal .border-zinc-200,
+.pt-themed-modal .border-zinc-100 {
+  border-color: var(--pt-border) !important;
+}
+
+.pt-themed-modal .divide-\[\#E4E3DE\] > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--pt-border) !important;
+}
+
+.pt-themed-modal .text-\[\#18181B\],
+.pt-themed-modal .text-zinc-900,
+.pt-themed-modal .text-zinc-800,
+.pt-themed-modal .text-zinc-700 {
+  color: var(--pt-text) !important;
+}
+
+.pt-themed-modal .text-zinc-600,
+.pt-themed-modal .text-zinc-500 {
+  color: var(--pt-text-secondary) !important;
+}
+
+.pt-themed-modal .text-zinc-400 {
+  color: var(--pt-text-muted) !important;
+}
+
+.pt-themed-modal input:not([type="checkbox"]),
+.pt-themed-modal select {
+  background-color: var(--pt-input-bg) !important;
+  color: var(--pt-text) !important;
+  border-color: var(--pt-border) !important;
+}
+
+.pt-themed-modal thead {
+  background-color: var(--pt-table-header) !important;
+  color: var(--pt-text-secondary) !important;
+}
+
+.pt-themed-modal .bg-\[\#059669\] {
+  background: linear-gradient(135deg, var(--pt-primary) 0%, var(--pt-primary-deep) 100%) !important;
+  color: var(--pt-primary-contrast) !important;
+}
+
+.pt-themed-modal .text-\[\#059669\] {
+  color: var(--pt-primary-light) !important;
+}
+
+/* Camera Viewport Protection: Never obscure video stream with solid theme fills */
+.pt-camera-viewport {
+  background-color: #000000 !important;
+  color: #FFFFFF;
+}
+
+.pt-camera-viewport video {
+  background-color: transparent !important;
 }
 
 /* Safe area padding for mobile notch / home indicator */

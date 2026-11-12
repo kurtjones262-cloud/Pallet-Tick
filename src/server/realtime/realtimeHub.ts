@@ -75,35 +75,84 @@ interface ConnectedClient {
   lastScanSummary?: string;
 }
 
+export interface RealtimeBrokerOptions {
+  /**
+   * When true (e.g. inside a Cloudflare Durable Object using native storage.setAlarm),
+   * interval timers are not used and heartbeat is driven by the Durable Object alarm() lifecycle.
+   */
+  disableIntervalTimer?: boolean;
+}
+
 const WS_OPEN = 1;
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const STALE_CONNECTION_TIMEOUT_MS = 45_000;
+export const HEARTBEAT_INTERVAL_MS = 15_000;
+export const STALE_CONNECTION_TIMEOUT_MS = 45_000;
 
 export class PalletTrackRealtimeBroker {
   private clients = new Map<string, ConnectedClient>();
   private latestSeq = 0;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly disableIntervalTimer: boolean;
   private durableObjectForwarder?: (event: RealtimeEvent) => Promise<void>;
 
-  constructor() {
-    this.startHeartbeat();
+  constructor(options?: RealtimeBrokerOptions) {
+    this.disableIntervalTimer = Boolean(options?.disableIntervalTimer);
+    // CRITICAL FOR CLOUDFLARE WORKERS:
+    // Never call startHeartbeat(), setInterval(), setTimeout(), fetch(), or Math.random()
+    // inside the constructor or during global module initialisation.
+    // Heartbeat timers are started lazily inside active request/WebSocket handlers
+    // when clients connect, and stopped automatically when the last client disconnects.
   }
 
   public setDurableObjectForwarder(fn: (event: RealtimeEvent) => Promise<void>) {
     this.durableObjectForwarder = fn;
   }
 
-  private startHeartbeat() {
-    if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => {
-      this.pruneStaleConnectionsAndPing();
-    }, HEARTBEAT_INTERVAL_MS);
-    if (typeof (this.heartbeatTimer as any)?.unref === 'function') {
-      (this.heartbeatTimer as any).unref();
+  public getConnectedClientCount(): number {
+    return this.clients.size;
+  }
+
+  public isHeartbeatRunning(): boolean {
+    return this.heartbeatTimer !== null;
+  }
+
+  /**
+   * Lazily starts the periodic heartbeat timer inside an active request/connection context.
+   * Safe against duplicate timers and no-ops when no clients are connected or when Durable Object
+   * native alarms are managing the heartbeat schedule.
+   */
+  public startHeartbeat(): void {
+    if (this.disableIntervalTimer) return;
+    if (this.heartbeatTimer !== null) return;
+    if (this.clients.size === 0) return;
+
+    try {
+      this.heartbeatTimer = setInterval(() => {
+        this.pruneStaleConnectionsAndPing();
+      }, HEARTBEAT_INTERVAL_MS);
+      if (typeof (this.heartbeatTimer as any)?.unref === 'function') {
+        (this.heartbeatTimer as any).unref();
+      }
+    } catch {
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Stops and clears the active heartbeat interval timer when no clients remain connected.
+   */
+  public stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
   public pruneStaleConnectionsAndPing() {
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+      return;
+    }
+
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     let changed = false;
@@ -138,6 +187,10 @@ export class PalletTrackRealtimeBroker {
         this.clients.delete(connId);
         changed = true;
       }
+    }
+
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
     }
 
     if (changed) {
@@ -175,6 +228,9 @@ export class PalletTrackRealtimeBroker {
     };
 
     this.clients.set(connectionId, client);
+
+    // Lazily start heartbeat inside the active request/WebSocket lifecycle
+    this.startHeartbeat();
 
     // Send initial welcome handshake with current sequence number & presence
     this.safeSend(socket, {
@@ -221,9 +277,19 @@ export class PalletTrackRealtimeBroker {
    */
   public unregisterClient(connectionId: string) {
     const existing = this.clients.get(connectionId);
-    if (!existing) return;
+    if (!existing) {
+      if (this.clients.size === 0) {
+        this.stopHeartbeat();
+      }
+      return;
+    }
     const prevDeliveryId = existing.activeDeliveryId;
     this.clients.delete(connectionId);
+
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
+
     this.broadcastPresenceUpdate(prevDeliveryId);
     if (prevDeliveryId !== null) {
       this.broadcastPresenceUpdate(null);
@@ -251,6 +317,11 @@ export class PalletTrackRealtimeBroker {
         this.clients.delete(connId);
       }
     }
+
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
+
     for (const delId of affectedDeliveries) {
       this.broadcastPresenceUpdate(delId);
     }
@@ -276,6 +347,11 @@ export class PalletTrackRealtimeBroker {
         this.clients.delete(connId);
       }
     }
+
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
+
     for (const delId of affectedDeliveries) {
       this.broadcastPresenceUpdate(delId);
     }
@@ -295,6 +371,7 @@ export class PalletTrackRealtimeBroker {
     const client = this.clients.get(connectionId);
     if (!client) return;
 
+    this.startHeartbeat();
     client.lastPongMs = Date.now();
     client.lastActivityAt = new Date().toISOString();
 
@@ -642,13 +719,6 @@ export class PalletTrackRealtimeBroker {
 
   /**
    * Broadcast a RealtimeEvent to all connected authenticated WebSocket clients.
-   * Room isolation rule:
-   * - `part:duplicate_rejected` and `worker:scanning_activity` are only sent to clients
-   *   actively viewing/scanning the target `deliveryId` (or the triggering user).
-   * - Authoritative delivery/part state transitions (`delivery:*`, `part:*`, `quantity:updated`)
-   *   include `deliveryId` and `deliveryVersion` and are sent to all authenticated clients so both
-   *   open checklists for that delivery AND dashboard progress bars update instantaneously, while
-   *   clients viewing a different delivery safely ignore foreign part mutations in their active view.
    */
   public broadcastEvent(event: RealtimeEvent) {
     if (event.sequenceNumber > this.latestSeq) {
@@ -684,6 +754,10 @@ export class PalletTrackRealtimeBroker {
         this.clients.delete(connId);
       }
     }
+
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
+    }
   }
 
   private broadcastToDeliveryRoom(deliveryId: string, message: Record<string, any>) {
@@ -700,6 +774,9 @@ export class PalletTrackRealtimeBroker {
           this.clients.delete(connId);
         }
       }
+    }
+    if (this.clients.size === 0) {
+      this.stopHeartbeat();
     }
   }
 
@@ -797,4 +874,33 @@ export class PalletTrackRealtimeBroker {
   }
 }
 
-export const realtimeBroker = new PalletTrackRealtimeBroker();
+let _realtimeBrokerInstance: PalletTrackRealtimeBroker | null = null;
+
+/**
+ * Lazily returns the process/isolate-level PalletTrackRealtimeBroker instance on first request.
+ * Ensures zero instantiation or timer operations occur during Cloudflare Worker global module evaluation.
+ */
+export function getRealtimeBroker(): PalletTrackRealtimeBroker {
+  if (!_realtimeBrokerInstance) {
+    _realtimeBrokerInstance = new PalletTrackRealtimeBroker();
+  }
+  return _realtimeBrokerInstance;
+}
+
+export const realtimeBroker: PalletTrackRealtimeBroker = new Proxy(
+  {} as PalletTrackRealtimeBroker,
+  {
+    get(_target, prop) {
+      if (prop === 'constructor') {
+        return PalletTrackRealtimeBroker;
+      }
+      const instance = getRealtimeBroker();
+      const value = Reflect.get(instance, prop, instance);
+      return typeof value === 'function' ? value.bind(instance) : value;
+    },
+    set(_target, prop, value) {
+      const instance = getRealtimeBroker();
+      return Reflect.set(instance, prop, value, instance);
+    },
+  }
+);

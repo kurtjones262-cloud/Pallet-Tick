@@ -997,6 +997,201 @@ async function runTests() {
   workerB.disconnect();
   workerC.disconnect();
 
+  // 18. Cloudflare Worker Global Scope Validation on build/worker.js
+  {
+    const origSetInterval = globalThis.setInterval;
+    const origSetTimeout = globalThis.setTimeout;
+    const origFetch = globalThis.fetch;
+    const origMathRandom = Math.random;
+
+    let globalScopeError: Error | null = null;
+    const disallow = (op: string) => () => {
+      const err = new Error(
+        `Uncaught Error: Disallowed operation called within global scope (${op}).`
+      );
+      globalScopeError = err;
+      throw err;
+    };
+
+    try {
+      (globalThis as any).setInterval = disallow('setInterval');
+      (globalThis as any).setTimeout = disallow('setTimeout');
+      (globalThis as any).fetch = disallow('fetch');
+      Math.random = disallow('Math.random') as any;
+
+      const workerModule = await import('../build/worker.js');
+      const hasDefaultExport = typeof workerModule?.default?.fetch === 'function';
+      const hasDurableObjectClass = typeof workerModule?.PalletTrackRealtimeHub === 'function';
+
+      recordResult(
+        18,
+        'Cloudflare Worker bundle (build/worker.js) passes strict global-scope validation',
+        globalScopeError === null && hasDefaultExport && hasDurableObjectClass,
+        `Imported build/worker.js with zero global-scope timers/fetch/random calls (default.fetch=${hasDefaultExport}, PalletTrackRealtimeHub=${hasDurableObjectClass})`
+      );
+    } catch (err: any) {
+      recordResult(
+        18,
+        'Cloudflare Worker bundle (build/worker.js) passes strict global-scope validation',
+        false,
+        `Global scope violation: ${err?.message || err}`
+      );
+    } finally {
+      globalThis.setInterval = origSetInterval;
+      globalThis.setTimeout = origSetTimeout;
+      globalThis.fetch = origFetch;
+      Math.random = origMathRandom;
+    }
+  }
+
+  // 19. Lazy Request-Scoped Heartbeat Lifecycle & Clean Shutdown
+  {
+    const { PalletTrackRealtimeBroker } = await import('../src/server/realtime/realtimeHub.ts');
+    const broker = new PalletTrackRealtimeBroker();
+    const idleBeforeConnect = broker.isHeartbeatRunning() === false;
+
+    const sentPackets: string[] = [];
+    const mockSocket1 = {
+      readyState: 1,
+      send: (data: string) => sentPackets.push(data),
+      close: () => {},
+    };
+    const mockSocket2 = {
+      readyState: 1,
+      send: (data: string) => sentPackets.push(data),
+      close: () => {},
+    };
+    const mockUser = {
+      id: 'usr_hb_test',
+      employeeName: 'Heartbeat Tester',
+      employeeCode: 'HB-01',
+      role: 'operator' as const,
+      active: true,
+    };
+
+    const conn1 = broker.registerClient(mockSocket1, mockUser, 'tok_hb_1', null);
+    const runningAfterFirst = broker.isHeartbeatRunning() === true;
+
+    const conn2 = broker.registerClient(mockSocket2, mockUser, 'tok_hb_2', null);
+    const runningAfterSecond = broker.isHeartbeatRunning() === true;
+
+    broker.pruneStaleConnectionsAndPing();
+    const receivedPing = sentPackets.some((p) => p.includes('"type":"ping"'));
+
+    broker.unregisterClient(conn1);
+    const stillRunningWithOneClient = broker.isHeartbeatRunning() === true;
+
+    broker.unregisterClient(conn2);
+    const stoppedAfterLastDisconnect =
+      broker.isHeartbeatRunning() === false && broker.getConnectedClientCount() === 0;
+
+    recordResult(
+      19,
+      'Lazy heartbeat starts on client connect, avoids duplicate timers, pings, and stops when idle',
+      idleBeforeConnect &&
+        runningAfterFirst &&
+        runningAfterSecond &&
+        receivedPing &&
+        stillRunningWithOneClient &&
+        stoppedAfterLastDisconnect,
+      `idleAtConstruct=${idleBeforeConnect} -> activeOnConnect=${runningAfterFirst} -> pingSent=${receivedPing} -> stoppedWhenEmpty=${stoppedAfterLastDisconnect}`
+    );
+  }
+
+  // 20. Cloudflare Durable Object (PalletTrackRealtimeHub) Native Alarm Lifecycle
+  {
+    const { PalletTrackRealtimeHub } = await import('../worker.ts');
+    let scheduledAlarmMs: number | null = null;
+    let setAlarmCalls = 0;
+    let deleteAlarmCalls = 0;
+
+    const mockDoState = {
+      storage: {
+        getAlarm: async () => scheduledAlarmMs,
+        setAlarm: async (time: number | Date) => {
+          scheduledAlarmMs = typeof time === 'number' ? time : time.getTime();
+          setAlarmCalls++;
+        },
+        deleteAlarm: async () => {
+          scheduledAlarmMs = null;
+          deleteAlarmCalls++;
+        },
+      },
+    };
+
+    const listeners: Record<string, Array<(evt?: any) => void>> = {};
+    const doSentMessages: string[] = [];
+    const origWebSocketPair = (globalThis as any).WebSocketPair;
+    (globalThis as any).WebSocketPair = class {
+      0: any;
+      1: any;
+      constructor() {
+        this[0] = {};
+        this[1] = {
+          readyState: 1,
+          accept: () => {},
+          send: (data: string) => doSentMessages.push(data),
+          close: () => {},
+          addEventListener: (event: string, cb: (evt?: any) => void) => {
+            listeners[event] = listeners[event] || [];
+            listeners[event].push(cb);
+          },
+        };
+      }
+    };
+
+    try {
+      const hub = new PalletTrackRealtimeHub(mockDoState, {});
+      const noAlarmAtInit = scheduledAlarmMs === null && setAlarmCalls === 0;
+
+      // Simulate authenticated WebSocket upgrade request to Durable Object
+      const wsReq = new Request('https://internal.pallettrack/api/realtime/ws?deliveryId=del_do_1', {
+        headers: {
+          Upgrade: 'websocket',
+          'X-Authenticated-User': JSON.stringify({
+            id: 'usr_do_1',
+            employeeName: 'DO Worker',
+            employeeCode: 'DO-01',
+            role: 'operator',
+            active: true,
+          }),
+          'X-Session-Token': 'tok_do_1',
+        },
+      });
+      await hub.fetch(wsReq).catch(() => {
+        // Node Response(null, { status: 101 }) throws RangeError in standard Node fetch Response,
+        // which occurs after registerClient & scheduleHeartbeatAlarmIfNeeded complete
+      });
+
+      const alarmScheduledAfterConnect = scheduledAlarmMs !== null && setAlarmCalls === 1;
+
+      // Trigger Durable Object alarm() handler
+      await hub.alarm();
+      const pingSentOnAlarm = doSentMessages.some((m) => m.includes('"type":"ping"'));
+      const alarmRescheduled = scheduledAlarmMs !== null && setAlarmCalls === 2;
+
+      // Simulate WebSocket close event
+      for (const closeCb of listeners['close'] || []) {
+        closeCb();
+      }
+      await new Promise((r) => setTimeout(r, 20));
+      const alarmCleanedUp = scheduledAlarmMs === null && deleteAlarmCalls >= 1;
+
+      recordResult(
+        20,
+        'Durable Object PalletTrackRealtimeHub uses native storage.setAlarm() and cleans up on disconnect',
+        noAlarmAtInit &&
+          alarmScheduledAfterConnect &&
+          pingSentOnAlarm &&
+          alarmRescheduled &&
+          alarmCleanedUp,
+        `noAlarmAtInit=${noAlarmAtInit}, scheduled=${alarmScheduledAfterConnect}, alarmPing=${pingSentOnAlarm}, cleanedUp=${alarmCleanedUp}`
+      );
+    } finally {
+      (globalThis as any).WebSocketPair = origWebSocketPair;
+    }
+  }
+
   const passedCount = results.filter((r) => r.passed).length;
   const minLat = Math.min(...broadcastLatenciesMs);
   const maxLat = Math.max(...broadcastLatenciesMs);

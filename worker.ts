@@ -13,7 +13,12 @@ import {
   extractSessionTokenFromRequest,
 } from './src/server/api/palletTrackApiRouter.ts';
 import { PalletTrackDbService } from './src/server/api/palletTrackDbService.ts';
-import { realtimeBroker, RealtimeEvent } from './src/server/realtime/realtimeHub.ts';
+import {
+  realtimeBroker,
+  PalletTrackRealtimeBroker,
+  HEARTBEAT_INTERVAL_MS,
+  RealtimeEvent,
+} from './src/server/realtime/realtimeHub.ts';
 
 export interface Env {
   GEMINI_API_KEY?: string;
@@ -767,13 +772,65 @@ export default {
  * Cloudflare Durable Object: PalletTrackRealtimeHub
  * Coordinates multi-user WebSocket rooms, presence, and instantaneous event fan-out
  * across Cloudflare edge isolates while D1 remains the authoritative state store.
+ * Uses the native Durable Object Alarm API for scheduled heartbeat & stale connection pruning.
  */
+export interface DurableObjectStorageLike {
+  getAlarm?: () => Promise<number | null>;
+  setAlarm?: (scheduledTime: number | Date) => Promise<void>;
+  deleteAlarm?: () => Promise<void>;
+}
+
+export interface DurableObjectStateLike {
+  storage?: DurableObjectStorageLike;
+}
+
 export class PalletTrackRealtimeHub {
-  private broker = new (realtimeBroker.constructor as any)();
+  private broker: PalletTrackRealtimeBroker;
+  private state: DurableObjectStateLike | null;
   private env: Env;
 
-  constructor(_state: unknown, env: Env) {
+  constructor(state: DurableObjectStateLike, env: Env) {
+    this.state = state || null;
     this.env = env;
+    const hasNativeAlarm = typeof state?.storage?.setAlarm === 'function';
+    this.broker = new PalletTrackRealtimeBroker({
+      disableIntervalTimer: hasNativeAlarm,
+    });
+  }
+
+  private async scheduleHeartbeatAlarmIfNeeded(): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage || typeof storage.setAlarm !== 'function') {
+      this.broker.startHeartbeat();
+      return;
+    }
+
+    if (this.broker.getConnectedClientCount() === 0) {
+      if (typeof storage.deleteAlarm === 'function') {
+        await storage.deleteAlarm().catch(() => {});
+      }
+      return;
+    }
+
+    try {
+      const existingAlarm =
+        typeof storage.getAlarm === 'function' ? await storage.getAlarm() : null;
+      if (existingAlarm === null || existingAlarm === undefined || existingAlarm <= Date.now()) {
+        await storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+      }
+    } catch {
+      this.broker.startHeartbeat();
+    }
+  }
+
+  async alarm(): Promise<void> {
+    this.broker.pruneStaleConnectionsAndPing();
+    if (this.broker.getConnectedClientCount() > 0) {
+      const storage = this.state?.storage;
+      if (storage && typeof storage.setAlarm === 'function') {
+        await storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS).catch(() => {});
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -803,6 +860,7 @@ export class PalletTrackRealtimeHub {
 
       const initialDeliveryId = url.searchParams.get('deliveryId') || null;
       const connId = this.broker.registerClient(serverWs, user, token, initialDeliveryId);
+      await this.scheduleHeartbeatAlarmIfNeeded();
 
       serverWs.addEventListener('message', (evt: any) => {
         const text = typeof evt.data === 'string' ? evt.data : String(evt.data || '');
@@ -810,9 +868,11 @@ export class PalletTrackRealtimeHub {
       });
       serverWs.addEventListener('close', () => {
         this.broker.unregisterClient(connId);
+        this.scheduleHeartbeatAlarmIfNeeded().catch(() => {});
       });
       serverWs.addEventListener('error', () => {
         this.broker.unregisterClient(connId);
+        this.scheduleHeartbeatAlarmIfNeeded().catch(() => {});
       });
 
       return new Response(null, { status: 101, webSocket: clientWs } as any);
@@ -824,4 +884,5 @@ export class PalletTrackRealtimeHub {
     });
   }
 }
+
 

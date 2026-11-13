@@ -233,8 +233,11 @@ async function runTests() {
   await workerC.connect();
 
   // 2. Test Live Docket Processing Notification + Live Delivery Upload Synchronisation
-  const deliveryId1 = `del_rt_test_${Date.now()}`;
-  const deliveryId2 = `del_rt_iso_${Date.now()}`;
+  const tsRun = Date.now();
+  const deliveryId1 = `del_rt_test_${tsRun}`;
+  const deliveryId2 = `del_rt_iso_${tsRun}`;
+  const docketNumber1 = `DK-RT-99401-${tsRun}`;
+  const docketNumber2 = `DK-ISO-202-${tsRun}`;
 
   {
     const procWaitB = workerB.waitForEvent((e) => e.type === 'delivery:processing');
@@ -258,7 +261,7 @@ async function runTests() {
     const t0Create = performance.now();
     const createRes = await apiReq('/api/deliveries', 'POST', tokenA, {
       id: deliveryId1,
-      docketNumber: 'DK-RT-99401',
+      docketNumber: docketNumber1,
       supplier: 'GCI',
       supplierProfile: 'gci',
       deliveryDate: '2026-11-12',
@@ -321,7 +324,7 @@ async function runTests() {
       'Worker A uploads new delivery -> Worker B & C receive live without refresh',
       createRes.status === 201 &&
         Boolean(procEv) &&
-        evB.payload?.delivery?.docketNumber === 'DK-RT-99401' &&
+        evB.payload?.delivery?.docketNumber === docketNumber1 &&
         evC.payload?.delivery?.parts?.length === 5 &&
         createLat < 500,
       `Processing notice (${procLat.toFixed(1)}ms) + delivery:created broadcast to B & C (${createLat.toFixed(1)}ms), seq=${evB.sequenceNumber}`,
@@ -792,7 +795,7 @@ async function runTests() {
     const mockDeliveries: Delivery[] = [
       {
         id: deliveryId1,
-        docketNumber: 'DK-RT-99401',
+        docketNumber: docketNumber1,
         supplier: 'GCI',
         deliveryDate: '2026-11-12',
         createdAt: new Date().toISOString(),
@@ -907,7 +910,7 @@ async function runTests() {
   {
     await apiReq('/api/deliveries', 'POST', loginC.data.token, {
       id: deliveryId2,
-      docketNumber: 'DK-ISO-202',
+      docketNumber: docketNumber2,
       supplier: 'Laser Central',
       supplierProfile: 'laser_central',
       deliveryDate: '2026-11-12',
@@ -967,7 +970,7 @@ async function runTests() {
       !workerCInDel1 &&
         workerCInDel2 &&
         (del2Check.data?.parts || del2Check.data?.delivery?.parts)?.[0]?.status === 'received' &&
-        (del1Check.data?.docketNumber || del1Check.data?.delivery?.docketNumber) === 'DK-RT-99401',
+        (del1Check.data?.docketNumber || del1Check.data?.delivery?.docketNumber) === docketNumber1,
       `Worker C isolated in Delivery 2 room (inDel1=${workerCInDel1}, inDel2=${workerCInDel2})`
     );
   }

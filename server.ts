@@ -41,10 +41,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve public directory static assets (Tesseract offline workers, wasm, and lang data)
+// Serve public directory static assets (icons, manifest, PDF.js worker)
 app.use(express.static(path.resolve(__dirname, 'public')));
-// Fallback for /tesseract/worker.min.js directly from node_modules/tesseract.js/dist
-app.use('/tesseract', express.static(path.resolve(__dirname, 'node_modules/tesseract.js/dist')));
 
 
 import { getLocalDevDatabase } from './src/server/db/nodeSqliteAdapter.ts';
@@ -136,7 +134,7 @@ app.get('/api/export-project-zip', async (_req: ExpressRequest, res: ExpressResp
           const sub = zipFolder.folder(item.name);
           if (sub) addDirectory(itemFullPath, sub);
         } else if (item.isFile()) {
-          // Avoid bundling huge files like the 20MB local wasm engine in source zip
+          // Avoid bundling oversized binary assets into the source zip
           const stat = fs.statSync(itemFullPath);
           if (stat.size < 10 * 1024 * 1024) {
             const fileContent = fs.readFileSync(itemFullPath);
@@ -250,9 +248,11 @@ app.post('/api/recover-docket-items', async (req: ExpressRequest, res: ExpressRe
  */
 app.post('/api/read-part-label', async (req: ExpressRequest, res: ExpressResponse) => {
   try {
-    const { image, imageBase64, mimeType, knownParts, docketParts } = req.body || {};
+    const { imageDataUrl, image, imageBase64, mimeType, knownParts, docketParts } = req.body || {};
     const resolvedImage =
-      typeof image === 'string' && image
+      typeof imageDataUrl === 'string' && imageDataUrl
+        ? imageDataUrl
+        : typeof image === 'string' && image
         ? image
         : typeof imageBase64 === 'string' && imageBase64
         ? `data:${mimeType || 'image/jpeg'};base64,${imageBase64}`
@@ -275,8 +275,12 @@ app.post('/api/read-part-label', async (req: ExpressRequest, res: ExpressRespons
       scannedCode: result.detectedCode,
     });
   } catch (err: any) {
-    return res.status(500).json({
-      error: err?.message || 'Failed to read part label.',
+    const { classifyGeminiError } = await import('./src/server/docketOcr.ts');
+    const classification = classifyGeminiError(err);
+    return res.status(classification.statusCode).json({
+      error: classification.cleanMessage || 'Failed to read part label.',
+      code: classification.errorCode,
+      retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
     });
   }
 });

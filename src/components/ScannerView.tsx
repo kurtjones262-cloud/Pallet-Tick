@@ -47,9 +47,8 @@ import { apiScanGroupPart, isBackendOnline } from '../services/palletTrackApi';
 import { realtimeClient } from '../services/realtimeSync';
 
 import {
-  recognizePalletLabelOffline,
+  recognizePalletLabelWithGemini,
   evaluatePalletLabelMatch,
-  prewarmPalletLabelOcrEngine,
   computeVideoFrameSignature,
   computeFrameSignatureDifference,
 } from '../utils/palletLabelOcr';
@@ -1422,7 +1421,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       liveOcrIntervalRef.current = null;
     }
 
-    // Do NOT run background Tesseract OCR during GCI QR or Laser Central barcode scanning
+    // Do NOT run background OCR during GCI QR or Laser Central barcode scanning
     if (activeSupplierRuleRef.current?.id !== 'ocr_label') {
       return;
     }
@@ -1433,6 +1432,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       if (
         !isMountedRef.current ||
         activeSupplierRuleRef.current?.id !== 'ocr_label' ||
+        (typeof navigator !== 'undefined' && navigator.onLine === false) ||
         isLiveOcrBusyRef.current ||
         isProcessingOcrLabel ||
         activeScanConfirmationRef.current !== null ||
@@ -1471,7 +1471,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           : [];
         const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
 
-        const result = await recognizePalletLabelOffline(
+        const result = await recognizePalletLabelWithGemini(
           video,
           partsPool,
           { x: 0.05, y: 0.16, width: 0.9, height: 0.68 }
@@ -1488,7 +1488,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
 
         if (result.partNumber && scopedDeliveries.length > 0) {
-          recordDecodeDiagnostics(ocrElapsedMs, true, 'BarcodeDetector (1D) + Offline OCR');
+          recordDecodeDiagnostics(ocrElapsedMs, true, 'BarcodeDetector (1D) + Gemini Label OCR');
           const matches = isGroupMode
             ? findMatchingPartsInGroup(scopedDeliveries, result.partNumber)
             : findMatchingPartsInDelivery(scopedDeliveries[0], result.partNumber);
@@ -1914,7 +1914,6 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   // Mount/unmount lifecycle: start camera automatically on mount
   useEffect(() => {
     isMountedRef.current = true;
-    prewarmPalletLabelOcrEngine();
     startScanner();
 
     return () => {
@@ -1938,7 +1937,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   };
 
   /**
-   * Manual Snapshot / Shutter capture for instant Barcode/QR Fast-Path + Offline OCR Label processing
+   * Manual Snapshot / Shutter capture for instant Barcode/QR Fast-Path + Gemini Vision Label OCR
    */
   const handleShutterCapture = async () => {
     if (
@@ -1977,7 +1976,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
       }
 
-      // 2. Run high-detail unsharp-masked OCR on the video frame
+      // 2. Run Gemini Vision pallet label OCR on the cropped camera frame
       const isGroupMode =
         scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
       const scopedDeliveries = isGroupMode
@@ -1988,7 +1987,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
 
       const t0 = performance.now();
-      const ocrResult = await recognizePalletLabelOffline(
+      const ocrResult = await recognizePalletLabelWithGemini(
         video,
         partsPool,
         { x: 0.05, y: 0.15, width: 0.9, height: 0.7 }
@@ -1996,7 +1995,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       recordDecodeDiagnostics(
         performance.now() - t0,
         Boolean(ocrResult.partNumber),
-        'Shutter Offline OCR (Unsharp)'
+        'Shutter Gemini Label OCR'
       );
 
       if (ocrResult.partNumber && scopedDeliveries.length > 0) {
@@ -2203,7 +2202,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   };
 
   /**
-   * Handle photo upload from gallery or file picker (runs Barcode/QR fast-path first, then Offline OCR)
+   * Handle photo upload from gallery or file picker (runs Barcode/QR fast-path first, then Gemini Vision OCR)
    */
   const handleFilePicked = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -2225,7 +2224,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
       }
 
-      // 2. Run high-detail unsharp-masked OCR on picked file
+      // 2. Run Gemini Vision pallet label OCR on picked file
       const isGroupMode =
         scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
       const scopedDeliveries = isGroupMode
@@ -2236,7 +2235,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
 
       const t0 = performance.now();
-      const ocrResult = await recognizePalletLabelOffline(
+      const ocrResult = await recognizePalletLabelWithGemini(
         file,
         partsPool,
         { x: 0, y: 0, width: 1, height: 1 }
@@ -2244,7 +2243,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       recordDecodeDiagnostics(
         performance.now() - t0,
         Boolean(ocrResult.partNumber),
-        'File Offline OCR (Unsharp)'
+        'File Gemini Label OCR'
       );
 
       const partNo = (ocrResult.partNumber || file.name.replace(/\.[^.]+$/, '')).trim();

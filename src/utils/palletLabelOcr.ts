@@ -1,13 +1,15 @@
-import { createWorker, OEM } from 'tesseract.js';
 import { DeliveryPart } from '../types/delivery';
+import { getAuthToken } from '../services/palletTrackApi';
+import { resolveApiUrl } from './apiConfig';
 
 export interface PalletLabelExtractionResult {
   partNumber: string;
   description: string;
   quantity: number | null;
+  unit?: string;
   rawOcrText: string;
   ocrConfidence: 'high' | 'medium' | 'low';
-  engineUsed: 'mlkit-native' | 'on-device-bundled';
+  engineUsed: 'mlkit-native' | 'gemini-vision';
   croppedPreviewDataUrl: string;
   enhancedOcrDataUrl: string;
   detectedSkewDegrees: number;
@@ -24,110 +26,9 @@ export interface PalletLabelMatchEvaluation {
   expectedQty: number;
 }
 
-/**
- * Persistent warm on-device OCR worker instance so warehouse operators get
- * fast recognition without re-initializing WebAssembly on every label capture.
- */
-let warmOcrWorkerPromise: Promise<any> | null = null;
-let latestProgressCallback: ((statusText: string, percent: number) => void) | null = null;
-
-async function getOrInitWarmOnDeviceWorker(): Promise<any> {
-  if (warmOcrWorkerPromise) {
-    return warmOcrWorkerPromise;
-  }
-
-  warmOcrWorkerPromise = (async () => {
-    const origin =
-      typeof window !== 'undefined' && window.location && window.location.origin
-        ? window.location.origin
-        : '';
-
-    console.info('[PartTrack OCR] Initializing bundled offline Tesseract LSTM worker...');
-
-    // Purge any stale/corrupted tesseract keyval-store IndexedDB cache from earlier sessions
-    if (typeof window !== 'undefined' && 'indexedDB' in window) {
-      try {
-        window.indexedDB.deleteDatabase('keyval-store');
-      } catch {
-        // Ignore IndexedDB cleanup errors
-      }
-    }
-
-    const loggerFn = (m: any) => {
-      if (m && m.status === 'recognizing text' && latestProgressCallback) {
-        const pct = Math.round((m.progress || 0) * 100);
-        latestProgressCallback(`Reading label text (${pct}%)...`, pct);
-      }
-    };
-
-    const LABEL_WORKER_INIT_TIMEOUT_MS = 15000;
-    const withWorkerInitTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
-      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          reject(new Error(`[PartTrack OCR] ${label} initialization timed out after ${LABEL_WORKER_INIT_TIMEOUT_MS}ms.`));
-        }, LABEL_WORKER_INIT_TIMEOUT_MS);
-      });
-      try {
-        return await Promise.race([promise, timeoutPromise]);
-      } finally {
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-        }
-      }
-    };
-
-    try {
-      const worker = await withWorkerInitTimeout(
-        createWorker('eng', OEM.LSTM_ONLY, {
-          workerPath: `${origin}/tesseract/worker.min.js`,
-          workerBlobURL: false,
-          corePath: `${origin}/tesseract/core`,
-          langPath: `${origin}/tesseract/lang-data`,
-          gzip: true,
-          cacheMethod: 'none',
-          logger: loggerFn,
-        }),
-        'Primary offline LSTM worker'
-      );
-      console.info('[PartTrack OCR] Bundled offline LSTM worker initialized and ready.');
-      return worker;
-    } catch (firstErr) {
-      console.warn(
-        '[PartTrack OCR] Primary non-blob worker init failed, retrying with blob URL fallback:',
-        firstErr
-      );
-      const fallbackWorker = await withWorkerInitTimeout(
-        createWorker('eng', OEM.LSTM_ONLY, {
-          workerPath: '/tesseract/worker.min.js',
-          corePath: `${origin}/tesseract/core`,
-          langPath: `${origin}/tesseract/lang-data`,
-          gzip: true,
-          cacheMethod: 'none',
-          logger: loggerFn,
-        }),
-        'Fallback offline LSTM worker'
-      );
-      console.info('[PartTrack OCR] Fallback offline LSTM worker initialized.');
-      return fallbackWorker;
-    }
-  })().catch((err) => {
-    console.error('[PartTrack OCR] Worker initialization failed:', err);
-    warmOcrWorkerPromise = null;
-    throw err;
-  });
-
-  return warmOcrWorkerPromise;
-}
-
-/**
- * Pre-warms the bundled offline OCR worker when the scanner starts or switches to OCR mode.
- */
-export function prewarmPalletLabelOcrEngine(): void {
-  if (typeof window === 'undefined') return;
-  getOrInitWarmOnDeviceWorker().catch((err) => {
-    console.warn('[PartTrack OCR] Prewarm note (will retry on capture):', err);
-  });
+export interface PalletLabelOcrOptions {
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }
 
 /**
@@ -332,10 +233,10 @@ function levenshteinDistance(a: string, b: string): number {
 /**
  * Captures a frame from the live camera video element (or an uploaded/snapped image file),
  * crops to the pallet label guide box, corrects skew/rotation, and enhances contrast
- * before running completely offline on-device OCR.
- * Includes a multi-pass fallback on the full frame if the cropped pass yields insufficient text.
+ * before invoking Gemini 4 Hydrogen Vision (/api/read-part-label).
+ * Automatically uses native Google ML Kit bridge when running inside a native Capacitor app.
  */
-export async function recognizePalletLabelOffline(
+export async function recognizePalletLabelWithGemini(
   source: HTMLVideoElement | File | string,
   docketParts: DeliveryPart[] = [],
   cropBoxRatio: { x: number; y: number; width: number; height: number } = {
@@ -344,111 +245,140 @@ export async function recognizePalletLabelOffline(
     width: 0.9,
     height: 0.68,
   },
-  onProgress?: (statusText: string, percent: number) => void
+  onProgress?: (statusText: string, percent: number) => void,
+  options?: PalletLabelOcrOptions
 ): Promise<PalletLabelExtractionResult> {
   const startTime = performance.now();
-  latestProgressCallback = onProgress || null;
+  onProgress?.('Capturing & enhancing camera frame...', 15);
 
-  try {
-    onProgress?.('Capturing & enhancing camera frame...', 12);
+  // 1. Capture, deskew, and enhance contrast smoothly
+  const preprocessed = await captureAndPreprocessLabelImage(source, cropBoxRatio);
 
-    // 1. Capture, deskew, and enhance contrast gently
-    const preprocessed = await captureAndPreprocessLabelImage(source, cropBoxRatio);
-
-    // 2. Try Native Google ML Kit Text Recognition (Capacitor Android/iOS bridge) if running natively
-    const mlKitResult = await tryNativeMlKitTextRecognition(preprocessed.enhancedOcrDataUrl);
-    if (mlKitResult !== null) {
-      const parsed = parsePalletLabelOcrText(mlKitResult.text, docketParts, mlKitResult.confidence);
-      console.info(
-        `[PartTrack OCR] Native ML Kit finished in ${Math.round(performance.now() - startTime)}ms:`,
-        { partNumber: parsed.partNumber, quantity: parsed.quantity, description: parsed.description }
-      );
-      return {
-        ...parsed,
-        rawOcrText: mlKitResult.text,
-        engineUsed: 'mlkit-native',
-        croppedPreviewDataUrl: preprocessed.croppedPreviewDataUrl,
-        enhancedOcrDataUrl: preprocessed.enhancedOcrDataUrl,
-        detectedSkewDegrees: preprocessed.detectedSkewDegrees,
-      };
-    }
-
-    // 3. Run bundled offline on-device LSTM OCR engine (/public/tesseract/)
-    onProgress?.('Initializing offline OCR engine...', 25);
-    const worker = await getOrInitWarmOnDeviceWorker();
-
-    onProgress?.('Recognizing printed pallet label text...', 40);
-    const ocrResult = await worker.recognize(
-      preprocessed.enhancedOcrDataUrl,
-      {},
-      { text: true }
-    );
-
-    let rawText = (ocrResult?.data?.text || '').trim();
-    let avgConf = typeof ocrResult?.data?.confidence === 'number' ? ocrResult.data.confidence : 80;
-    let parsed = parsePalletLabelOcrText(rawText, docketParts, avgConf);
-
-    // 4. Multi-Pass Fallback: If the cropped/enhanced pass didn't find a part number and we cropped a video frame,
-    // run a second pass on the full un-enhanced color/grayscale frame so labels outside the guide box still read!
-    if (
-      !parsed.partNumber &&
-      (cropBoxRatio.width < 0.94 || cropBoxRatio.height < 0.94 || rawText.length < 10)
-    ) {
-      onProgress?.('Running full-frame secondary OCR pass...', 75);
-      const fullPreprocessed = await captureAndPreprocessLabelImage(
-        source,
-        { x: 0.01, y: 0.04, width: 0.98, height: 0.92 },
-        true // raw grayscale without contrast clipping
-      );
-      const fallbackOcrResult = await worker.recognize(
-        fullPreprocessed.enhancedOcrDataUrl,
-        {},
-        { text: true }
-      );
-      const fallbackText = (fallbackOcrResult?.data?.text || '').trim();
-      const fallbackConf =
-        typeof fallbackOcrResult?.data?.confidence === 'number'
-          ? fallbackOcrResult.data.confidence
-          : 78;
-      const fallbackParsed = parsePalletLabelOcrText(fallbackText, docketParts, fallbackConf);
-
-      if (
-        fallbackParsed.partNumber ||
-        fallbackText.length > rawText.length
-      ) {
-        rawText = [rawText, fallbackText].filter(Boolean).join('\n');
-        avgConf = Math.max(avgConf, fallbackConf);
-        parsed = parsePalletLabelOcrText(rawText, docketParts, avgConf);
-      }
-    }
-
-    console.info(
-      `[PartTrack OCR] On-device OCR finished in ${Math.round(performance.now() - startTime)}ms:`,
-      {
-        partNumber: parsed.partNumber || '(none)',
-        description: parsed.description || '(none)',
-        quantity: parsed.quantity,
-        confidence: parsed.ocrConfidence,
-        rawTextPreview: rawText.slice(0, 160).replace(/\n/g, ' | '),
-      }
-    );
-
+  // 2. Try Native Google ML Kit Text Recognition (Capacitor Android/iOS bridge) if running natively
+  const mlKitResult = await tryNativeMlKitTextRecognition(preprocessed.enhancedOcrDataUrl);
+  if (mlKitResult !== null) {
+    const parsed = parsePalletLabelOcrText(mlKitResult.text, docketParts, mlKitResult.confidence);
     return {
       ...parsed,
-      rawOcrText: rawText,
-      engineUsed: 'on-device-bundled',
+      rawOcrText: mlKitResult.text,
+      engineUsed: 'mlkit-native',
       croppedPreviewDataUrl: preprocessed.croppedPreviewDataUrl,
       enhancedOcrDataUrl: preprocessed.enhancedOcrDataUrl,
       detectedSkewDegrees: preprocessed.detectedSkewDegrees,
     };
-  } finally {
-    latestProgressCallback = null;
   }
+
+  // 3. Check network connectivity unless a mock fetchImpl was injected by tests
+  const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+  if (!isOnline && !options?.fetchImpl) {
+    throw new Error(
+      'Pallet label OCR requires an internet connection for Gemini 4 Hydrogen Vision. You can still scan 1D/QR barcodes offline or enter codes manually.'
+    );
+  }
+
+  onProgress?.('Reading pallet label with Gemini 4 Hydrogen...', 45);
+  const fetchFn = options?.fetchImpl || fetch;
+  const endpoint = resolveApiUrl('/api/read-part-label');
+  const timeoutMs = options?.timeoutMs ?? 15000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try {
+    const token = getAuthToken();
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+  } catch {
+    // Ignore localStorage unavailability in headless tests
+  }
+
+  let response: Response;
+  try {
+    response = await fetchFn(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        imageDataUrl: preprocessed.croppedPreviewDataUrl || preprocessed.enhancedOcrDataUrl,
+        enhancedImageDataUrl: preprocessed.enhancedOcrDataUrl,
+        knownParts: (docketParts || []).slice(0, 80).map((p) => ({
+          partNumber: p.partNumber,
+          description: p.description,
+          quantity: p.quantity,
+        })),
+      }),
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    const aborted = controller.signal.aborted || err?.name === 'AbortError';
+    if (aborted) {
+      throw new Error(`Pallet label OCR timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }
+    throw new Error(`Could not reach pallet label OCR service: ${err?.message || String(err)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    throw new Error(
+      errBody?.error || `Gemini pallet label OCR failed (HTTP ${response.status}).`
+    );
+  }
+
+  const payload = await response.json().catch(() => ({}));
+  onProgress?.('Matching label against docket parts...', 85);
+
+  const rawText = String(payload?.rawText || '').trim();
+  const fallbackParsed = rawText
+    ? parsePalletLabelOcrText(rawText, docketParts, 85)
+    : { partNumber: '', description: '', quantity: null, ocrConfidence: 'medium' as const };
+
+  const partNumber = String(
+    payload?.partNumber || payload?.detectedCode || payload?.scannedCode || fallbackParsed.partNumber || ''
+  ).trim();
+  const description = String(
+    payload?.description || fallbackParsed.description || ''
+  ).trim();
+
+  const rawQty = payload?.quantity;
+  let quantity: number | null =
+    typeof rawQty === 'number' && Number.isFinite(rawQty) && rawQty > 0 && rawQty <= 50000
+      ? Math.round(rawQty)
+      : fallbackParsed.quantity;
+
+  const rawConf = String(payload?.confidence || '').toLowerCase();
+  const ocrConfidence: 'high' | 'medium' | 'low' =
+    rawConf === 'high' || rawConf === 'medium' || rawConf === 'low'
+      ? (rawConf as 'high' | 'medium' | 'low')
+      : partNumber && quantity !== null
+      ? 'high'
+      : partNumber
+      ? 'medium'
+      : 'low';
+
+  console.info(
+    `[PartTrack OCR] Gemini pallet label OCR finished in ${Math.round(performance.now() - startTime)}ms:`,
+    { partNumber: partNumber || '(none)', quantity, ocrConfidence }
+  );
+
+  onProgress?.('Label reading complete.', 100);
+
+  return {
+    partNumber,
+    description,
+    quantity,
+    unit: typeof payload?.unit === 'string' && payload.unit.trim() ? payload.unit.trim() : undefined,
+    rawOcrText: rawText || [partNumber, description, quantity ? `QTY: ${quantity}` : ''].filter(Boolean).join('\n'),
+    ocrConfidence,
+    engineUsed: 'gemini-vision',
+    croppedPreviewDataUrl: preprocessed.croppedPreviewDataUrl,
+    enhancedOcrDataUrl: preprocessed.enhancedOcrDataUrl,
+    detectedSkewDegrees: preprocessed.detectedSkewDegrees,
+  };
 }
 
 /**
  * Attempts to invoke Google ML Kit Text Recognition on-device via Capacitor plugin or native WebView bridge.
- * Returns null when running in a standard Web browser so the bundled offline WASM engine is used.
+ * Returns null when running in a standard Web browser so Gemini Vision API is used.
  */
 async function tryNativeMlKitTextRecognition(
   base64DataUrl: string
@@ -486,7 +416,7 @@ async function tryNativeMlKitTextRecognition(
       }
     }
   } catch (err) {
-    console.warn('[PartTrack OCR] Native ML Kit bridge fallback to bundled offline OCR:', err);
+    console.warn('[PartTrack OCR] Native ML Kit bridge fallback to Gemini Vision:', err);
   }
 
   return null;
@@ -520,7 +450,7 @@ async function captureAndPreprocessLabelImage(
     const sw = Math.max(64, Math.min(vw - sx, Math.round(vw * cropBoxRatio.width)));
     const sh = Math.max(64, Math.min(vh - sy, Math.round(vh * cropBoxRatio.height)));
 
-    // Upscale smaller video crops to at least 1100px width so Tesseract LSTM character height is optimal
+    // Upscale smaller video crops to at least 1100px width so small printed digits stay crisp
     const minTargetW = 1100;
     const scale = sw < minTargetW ? Math.min(2.2, minTargetW / sw) : 1;
     const tw = Math.round(sw * scale);
@@ -683,7 +613,7 @@ export function enhanceLabelContrastSmoothly(
   const ctx = out.getContext('2d', { willReadFrequently: true });
   if (!ctx) return canvas;
 
-  // Fill clean white quiet-zone border around the image (Tesseract LSTM performs significantly better with a quiet border)
+  // Fill clean white quiet-zone border around the label image for clearer stroke contrast
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, w, h);
   ctx.drawImage(canvas, pad, pad);

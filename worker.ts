@@ -26,9 +26,13 @@ import {
   GEMINI_REQUEST_TIMEOUT_MS,
   MAX_AUTOMATIC_RETRIES,
   INITIAL_BACKOFF_MS,
+  DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
   resolveConfiguredVisionModels,
   classifyGeminiError,
   validateAndParseOcrJsonResponse,
+  buildDocketExtractionPrompt,
+  buildRestDocketResponseSchema,
+  normalizeRawBatchItem,
 } from './src/server/docketOcr.ts';
 
 export interface Env {
@@ -390,68 +394,13 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     }
   }
 
-  const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array.
-STRICT PART NUMBER INTEGRITY RULE: Preserve original part numbers, revisions, and quantities exactly as printed. Never invent, complete, or silently correct uncertain part numbers. If blank, return items: [].
-CRITICAL MULTI-DOCKET RULE: Uploaded pages may contain MULTIPLE SEPARATE delivery dockets OR a multi-page single docket. Populate 'pageHeaders' for EVERY page (${pageDescriptions.join(', ')}) with the exact printed docketNumber / delivery note / packing slip / invoice # / Job No visible on that page.`;
-
-  const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in the table.
-Rules:
-1. For EVERY page 1..${totalPages}, record an entry in 'pageHeaders' with: page, docketNumber (exact printed docket/delivery/invoice/Job No if visible on that page, else ""), supplier, deliveryDate (YYYY-MM-DD if visible), orderNumber (Client Order No / PO No), and startsNewDocket (true if this page clearly begins a new docket/header).
-2. Extract every numbered part row from top to bottom.
-3. For each row: record 'page', 'no' (exact printed row/Line number), 'part' (exact part number, Client Part Code, Part Code, or profile name as printed — never invent or silently alter uncertain characters), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer dispatched/delivered quantity).
-4. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
+  const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
+  const pageNumbers = Array.from({ length: totalPages }, (_, idx) => idx + 1);
+  const promptText = buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages);
 
   parts.push({ text: promptText });
 
-  const responseSchema = {
-    type: 'OBJECT',
-    properties: {
-      docketNumber: { type: 'STRING' },
-      supplier: { type: 'STRING' },
-      deliveryDate: { type: 'STRING' },
-      orderNumber: { type: 'STRING' },
-      carrier: { type: 'STRING' },
-      palletCount: { type: 'INTEGER' },
-      pageHeaders: {
-        type: 'ARRAY',
-        items: {
-          type: 'OBJECT',
-          properties: {
-            page: { type: 'INTEGER' },
-            docketNumber: { type: 'STRING' },
-            supplier: { type: 'STRING' },
-            deliveryDate: { type: 'STRING' },
-            orderNumber: { type: 'STRING' },
-            carrier: { type: 'STRING' },
-            palletCount: { type: 'INTEGER' },
-            startsNewDocket: { type: 'BOOLEAN' },
-          },
-          required: ['page'],
-        },
-      },
-      items: {
-        type: 'ARRAY',
-        items: {
-          type: 'OBJECT',
-          properties: {
-            page: { type: 'INTEGER' },
-            no: { type: 'STRING' },
-            part: { type: 'STRING' },
-            desc: { type: 'STRING' },
-            rev: { type: 'STRING' },
-            mat: { type: 'STRING' },
-            thk: { type: 'STRING' },
-            dim: { type: 'STRING' },
-            wt: { type: 'STRING' },
-            qty: { type: 'NUMBER' },
-          },
-          required: ['no', 'part', 'desc', 'qty'],
-        },
-      },
-    },
-    required: ['items'],
-  };
+  const responseSchema = buildRestDocketResponseSchema();
 
   const { parsed, modelUsed, fallbackUsed, retryAttempts } = await callGeminiRestWithRetryAndFallback(
     apiKey,
@@ -463,16 +412,22 @@ Rules:
 
   const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
   const rawPageHeaders: any[] = Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [];
+  const topLevelWarnings: string[] = Array.isArray(parsed.validationWarnings)
+    ? parsed.validationWarnings.map((w: any) => String(w || '').trim()).filter(Boolean)
+    : [];
 
   interface WorkerPageMeta {
     pageNumber: number;
     explicitDocketNumber: string;
     supplier?: string;
+    customerName?: string;
     deliveryDate?: string;
     orderNumber?: string;
+    jobNumber?: string;
     carrier?: string;
     palletCount?: number;
     startsNewDocket?: boolean;
+    validationWarnings: string[];
     rawItems: any[];
     minRowNo?: number;
     maxRowNo?: number;
@@ -480,22 +435,33 @@ Rules:
 
   const pageMetaMap = new Map<number, WorkerPageMeta>();
   for (let p = 1; p <= totalPages; p++) {
-    pageMetaMap.set(p, { pageNumber: p, explicitDocketNumber: '', rawItems: [] });
+    pageMetaMap.set(p, {
+      pageNumber: p,
+      explicitDocketNumber: '',
+      validationWarnings: [],
+      rawItems: [],
+    });
   }
 
   for (const ph of rawPageHeaders) {
-    const pNum = Math.min(totalPages, Math.max(1, Number(ph?.page) || 1));
+    const pNum = Math.min(totalPages, Math.max(1, Number(ph?.page ?? ph?.pageNumber) || 1));
     const meta = pageMetaMap.get(pNum)!;
     const dn = String(ph?.docketNumber || '').trim();
     if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
     if (ph?.supplier && String(ph.supplier).trim() && !meta.supplier) {
       meta.supplier = String(ph.supplier).trim();
     }
+    if (ph?.customerName && String(ph.customerName).trim() && !meta.customerName) {
+      meta.customerName = String(ph.customerName).trim();
+    }
     if (ph?.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(ph.deliveryDate).trim()) && !meta.deliveryDate) {
       meta.deliveryDate = String(ph.deliveryDate).trim();
     }
     if (ph?.orderNumber && String(ph.orderNumber).trim() && !meta.orderNumber) {
       meta.orderNumber = String(ph.orderNumber).trim();
+    }
+    if (ph?.jobNumber && String(ph.jobNumber).trim() && !meta.jobNumber) {
+      meta.jobNumber = String(ph.jobNumber).trim();
     }
     if (ph?.carrier && String(ph.carrier).trim() && !meta.carrier) {
       meta.carrier = String(ph.carrier).trim();
@@ -513,14 +479,19 @@ Rules:
     firstMeta.explicitDocketNumber = String(parsed.docketNumber).trim();
   }
   if (!firstMeta.supplier && parsed.supplier?.trim()) firstMeta.supplier = String(parsed.supplier).trim();
+  if (!firstMeta.customerName && parsed.customerName?.trim()) {
+    firstMeta.customerName = String(parsed.customerName).trim();
+  }
   if (!firstMeta.deliveryDate && parsed.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(parsed.deliveryDate).trim())) {
     firstMeta.deliveryDate = String(parsed.deliveryDate).trim();
   }
   if (!firstMeta.orderNumber && parsed.orderNumber?.trim()) firstMeta.orderNumber = String(parsed.orderNumber).trim();
+  if (!firstMeta.jobNumber && parsed.jobNumber?.trim()) firstMeta.jobNumber = String(parsed.jobNumber).trim();
   if (!firstMeta.carrier && parsed.carrier?.trim()) firstMeta.carrier = String(parsed.carrier).trim();
+  if (topLevelWarnings.length > 0) firstMeta.validationWarnings.push(...topLevelWarnings);
 
   for (const rawIt of rawItems) {
-    const pNum = Math.min(totalPages, Math.max(1, Number(rawIt?.page) || 1));
+    const pNum = Math.min(totalPages, Math.max(1, Number(rawIt?.page ?? rawIt?.pageNumber) || 1));
     const meta = pageMetaMap.get(pNum)!;
     meta.rawItems.push({ ...rawIt, page: pNum });
     const nVal = parseInt(parseCleanRowNo(rawIt?.no), 10);
@@ -535,13 +506,16 @@ Rules:
     explicitDocketNumber: string;
     hasExplicitDocketNumber: boolean;
     supplier: string;
+    customerName?: string;
     deliveryDate: string;
     carrier?: string;
     orderNumber?: string;
+    jobNumber?: string;
     palletCount: number;
     pageNumbers: number[];
     maxRowSeen: number;
     rawItems: any[];
+    validationWarnings: string[];
     separationUncertain: boolean;
     separationReason?: string;
   }
@@ -561,13 +535,16 @@ Rules:
         explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
         hasExplicitDocketNumber: hasExplicit,
         supplier: meta.supplier || 'Steel Fabrication Supplier',
+        customerName: meta.customerName,
         deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
         carrier: meta.carrier,
         orderNumber: meta.orderNumber,
+        jobNumber: meta.jobNumber,
         palletCount: Math.max(1, meta.palletCount || 1),
         pageNumbers: [p],
         maxRowSeen: meta.maxRowNo || 0,
         rawItems: [...meta.rawItems],
+        validationWarnings: [...meta.validationWarnings],
         separationUncertain: !hasExplicit && totalPages > 1,
         separationReason:
           !hasExplicit && totalPages > 1
@@ -584,9 +561,12 @@ Rules:
       if (existingSameDocket) {
         existingSameDocket.pageNumbers.push(p);
         existingSameDocket.rawItems.push(...meta.rawItems);
+        existingSameDocket.validationWarnings.push(...meta.validationWarnings);
         existingSameDocket.maxRowSeen = Math.max(existingSameDocket.maxRowSeen, meta.maxRowNo || 0);
         if (!existingSameDocket.carrier && meta.carrier) existingSameDocket.carrier = meta.carrier;
         if (!existingSameDocket.orderNumber && meta.orderNumber) existingSameDocket.orderNumber = meta.orderNumber;
+        if (!existingSameDocket.customerName && meta.customerName) existingSameDocket.customerName = meta.customerName;
+        if (!existingSameDocket.jobNumber && meta.jobNumber) existingSameDocket.jobNumber = meta.jobNumber;
         existingSameDocket.palletCount = Math.max(existingSameDocket.palletCount, meta.palletCount || 1);
       } else {
         segments.push({
@@ -594,13 +574,16 @@ Rules:
           explicitDocketNumber: meta.explicitDocketNumber,
           hasExplicitDocketNumber: true,
           supplier: meta.supplier || 'Steel Fabrication Supplier',
+          customerName: meta.customerName,
           deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
           carrier: meta.carrier,
           orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
           palletCount: Math.max(1, meta.palletCount || 1),
           pageNumbers: [p],
           maxRowSeen: meta.maxRowNo || 0,
           rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
           separationUncertain: false,
         });
       }
@@ -626,92 +609,84 @@ Rules:
         explicitDocketNumber: fallbackDk,
         hasExplicitDocketNumber: false,
         supplier: meta.supplier || prevSeg.supplier,
+        customerName: meta.customerName || prevSeg.customerName,
         deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
         carrier: meta.carrier,
         orderNumber: meta.orderNumber,
+        jobNumber: meta.jobNumber,
         palletCount: Math.max(1, meta.palletCount || 1),
         pageNumbers: [p],
         maxRowSeen: meta.maxRowNo || 0,
         rawItems: [...meta.rawItems],
+        validationWarnings: [...meta.validationWarnings],
         separationUncertain: true,
         separationReason: reason,
       });
     } else {
       prevSeg.pageNumbers.push(p);
       prevSeg.rawItems.push(...meta.rawItems);
+      prevSeg.validationWarnings.push(...meta.validationWarnings);
       prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, meta.maxRowNo || 0);
       prevSeg.palletCount = Math.max(prevSeg.palletCount, meta.palletCount || 1);
     }
   }
 
   const builtDockets = segments.map((seg) => {
-    const items = seg.rawItems.map((it: any, idx: number) => {
-      const cleanNo = parseCleanRowNo(it.no) || String(idx + 1);
-      const rawQty = Number(it.qty);
-      const qty = !Number.isNaN(rawQty) && rawQty >= 1 ? Math.round(rawQty) : 1;
-      const partNumber = String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase();
-      const description = String(it.desc || it.part || '').trim();
-      const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
-      const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
-      const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
-
-      return {
-        partNumber,
-        itemNumber: cleanNo,
-        description,
-        revision,
-        material,
-        thickness,
-        dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
-        weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
-        quantity: qty,
-        palletNumber: 'Pallet 1',
-        pageNumber: Number(it.page) || seg.pageNumbers[0],
-        confidence: 'high',
-        originalOcrValues: {
-          partNumber,
-          itemNumber: cleanNo,
-          description,
-          revision,
-          quantity: qty,
-          material,
-          thickness,
-        },
-      };
-    });
+    const items: any[] = [];
+    let autoSeq = 1;
+    for (const rawIt of seg.rawItems) {
+      const normalized = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
+      if (!normalized) continue;
+      items.push({
+        ...normalized.item,
+        itemNumber: normalized.cleanNo || String(autoSeq++),
+      });
+    }
+    const flaggedCount = items.filter((it) => it.confidence === 'low').length;
+    const dedupWarnings = Array.from(new Set(seg.validationWarnings.filter(Boolean)));
 
     return {
       docketNumber: seg.explicitDocketNumber,
       supplier: seg.supplier,
+      customerName: seg.customerName,
       deliveryDate: seg.deliveryDate,
       carrier: seg.carrier,
       orderNumber: seg.orderNumber,
+      jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items,
-      confidenceScore: items.length > 0 ? (seg.separationUncertain ? 75 : 100) : 0,
-      needsManualReview: items.length === 0 || seg.separationUncertain,
+      confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedCount > 0 ? 80 : 100) : 0,
+      needsManualReview: items.length === 0 || seg.separationUncertain || flaggedCount > 0,
       separationUncertain: seg.separationUncertain,
       separationReason: seg.separationReason,
       sourcePageNumbers: [...seg.pageNumbers],
-      extractionMethod: 'ai-vision',
+      extractionMethod: 'gemini-vision',
+      extractionEngineLabel: `Gemini (${modelUsed})`,
       aiModelUsed: modelUsed,
       fallbackUsed,
       retryAttempts,
       pagesScanned: seg.pageNumbers.length,
+      hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
+      flaggedRowCount: flaggedCount,
+      validationFlags: dedupWarnings.length > 0 ? dedupWarnings : undefined,
+      validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : undefined,
     };
   });
 
   const primary = builtDockets[0] || {
     docketNumber: String(parsed.docketNumber || `DK-${Math.floor(10000 + Math.random() * 90000)}`).trim(),
     supplier: String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
+    customerName: parsed.customerName ? String(parsed.customerName).trim() : undefined,
     deliveryDate: String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
     carrier: parsed.carrier ? String(parsed.carrier).trim() : undefined,
     orderNumber: parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined,
+    jobNumber: parsed.jobNumber ? String(parsed.jobNumber).trim() : undefined,
     palletCount: Math.max(1, Number(parsed.palletCount) || 1),
     items: [],
     confidenceScore: 0,
     needsManualReview: true,
-    extractionMethod: 'ai-vision',
+    extractionMethod: 'gemini-vision',
+    extractionEngineLabel: `Gemini (${modelUsed})`,
     aiModelUsed: modelUsed,
     fallbackUsed,
     retryAttempts,
@@ -1046,31 +1021,71 @@ export default {
           });
         }
         const parsedImg = parseDataUrl(imageDataUrl);
+        const partsList = Array.isArray(body?.knownParts)
+          ? body.knownParts
+          : Array.isArray(body?.docketParts)
+          ? body.docketParts
+          : [];
+        const knownContext =
+          partsList.length > 0
+            ? `\nActive Docket Expected Parts:\n${partsList
+                .slice(0, 120)
+                .map((p: any) => `- Docket No: ${p.itemNumber || p.no || ''} | Part#: ${p.partNumber || ''} (${p.description || ''})`)
+                .join('\n')}`
+            : '';
+
         const schema = {
           type: 'OBJECT',
           properties: {
             detectedCode: { type: 'STRING' },
+            partNumber: { type: 'STRING' },
+            description: { type: 'STRING' },
+            quantity: { type: 'NUMBER' },
+            unit: { type: 'STRING' },
+            rawText: { type: 'STRING' },
             confidence: { type: 'STRING' },
           },
-          required: ['detectedCode'],
+          required: ['detectedCode', 'rawText', 'confidence'],
         };
-        const { parsed } = await callGeminiRestWithRetryAndFallback(
+        const { parsed, modelUsed, fallbackUsed } = await callGeminiRestWithRetryAndFallback(
           apiKey,
           env,
-          'Read the barcode or part code from the image.',
+          'Read the barcode, part code, description, quantity, and literal text from the industrial part/pallet label image without fabricating values.',
           [
             { inlineData: { mimeType: parsedImg.mimeType, data: parsedImg.base64Data } },
-            { text: 'Read the barcode value, QR code text, or Part Number shown on this part label photo.' },
+            {
+              text: `Examine this industrial part or pallet label photograph and transcribe the literal label details.${knownContext}\nExtract detectedCode, partNumber, description, quantity (numeric or 0), unit, rawText, confidence (high|medium|low).`,
+            },
           ],
           schema,
           'label'
         );
-        const detectedCode = String(parsed?.detectedCode || '').trim();
+        const detectedCode = String(parsed?.detectedCode || parsed?.partNumber || '').trim();
+        const partNumber =
+          parsed?.partNumber && String(parsed.partNumber).trim()
+            ? String(parsed.partNumber).trim().toUpperCase()
+            : detectedCode || null;
+        const rawQty = Number(parsed?.quantity);
+        const quantity =
+          !Number.isNaN(rawQty) && rawQty > 0 && rawQty <= 99999 ? Math.round(rawQty) : null;
         return new Response(
           JSON.stringify({
             detectedCode,
             scannedCode: detectedCode,
-            confidence: String(parsed?.confidence || 'high'),
+            partNumber,
+            description:
+              parsed?.description && String(parsed.description).trim()
+                ? String(parsed.description).trim()
+                : null,
+            quantity,
+            unit:
+              parsed?.unit && String(parsed.unit).trim()
+                ? String(parsed.unit).trim().toUpperCase()
+                : null,
+            rawText: String(parsed?.rawText || '').trim(),
+            confidence: String(parsed?.confidence || 'high').toLowerCase(),
+            aiModelUsed: modelUsed,
+            fallbackUsed,
           }),
           {
             status: 200,
@@ -1113,9 +1128,8 @@ export default {
         return assetRes;
       }
       const isStaticAssetPath =
-        url.pathname.startsWith('/tesseract/') ||
         url.pathname.startsWith('/assets/') ||
-        /\.(?:js|mjs|wasm|gz|traineddata|css|map|png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(url.pathname);
+        /\.(?:js|mjs|wasm|gz|css|map|png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(url.pathname);
       if (!isStaticAssetPath && (request.method === 'GET' || request.method === 'HEAD')) {
         const indexUrl = new URL('/', request.url);
         return env.ASSETS.fetch(new Request(indexUrl.toString(), request));

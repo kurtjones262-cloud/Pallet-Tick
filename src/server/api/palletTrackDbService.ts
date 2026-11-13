@@ -2894,8 +2894,7 @@ export class PalletTrackDbService {
       )`,
     ];
 
-    const schemaBootstrapStatements = [
-      ...createStatements,
+    const indexStatements = [
       'CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)',
       'CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)',
@@ -2920,14 +2919,21 @@ export class PalletTrackDbService {
       'CREATE INDEX IF NOT EXISTS idx_docket_group_items_group ON docket_group_items(group_id)',
     ];
 
+    const schemaBootstrapStatements = [...createStatements, ...indexStatements];
+
     try {
-      await this.db.batch(schemaBootstrapStatements.map((sql) => this.db.prepare(sql)));
+      await this.db.exec(`${schemaBootstrapStatements.join(';\n')};`);
     } catch {
-      for (const sql of schemaBootstrapStatements) {
-        try {
-          await this.db.prepare(sql).run();
-        } catch (e) {
-          console.warn('Schema bootstrap notice:', e);
+      try {
+        await this.db.batch(createStatements.map((sql) => this.db.prepare(sql)));
+        await this.db.batch(indexStatements.map((sql) => this.db.prepare(sql)));
+      } catch {
+        for (const sql of schemaBootstrapStatements) {
+          try {
+            await this.db.prepare(sql).run();
+          } catch (e) {
+            console.warn('Schema bootstrap notice:', e);
+          }
         }
       }
     }

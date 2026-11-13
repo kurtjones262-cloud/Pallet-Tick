@@ -28,6 +28,7 @@ import {
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { isIgnoredNonPartQrPayload } from './utils/ignoredQrCodes';
+import { processPendingDocketUploads } from './utils/offlineDocketQueue';
 import { SplashScreen } from './components/SplashScreen';
 import { OrdersView } from './components/OrdersView';
 import { DocketGroupsView } from './components/DocketGroupsView';
@@ -221,6 +222,9 @@ export function App() {
 
       // Start live multi-user WebSocket synchronisation
       realtimeClient.start(getActiveDelivery()?.id || null);
+
+      // Process any offline docket uploads queued in IndexedDB while connectivity was offline
+      processPendingDocketUploads().catch(() => {});
     } else {
       realtimeClient.stop();
     }
@@ -257,10 +261,16 @@ export function App() {
     const handleDeliveriesUpdate = () => reloadDelivery();
     const handleActiveChange = () => reloadDelivery();
     const handleConnectionRequired = () => setIsConnectionRequiredOpen(true);
+    const handleOnlineReconnect = () => {
+      if (currentUser) {
+        processPendingDocketUploads().catch(() => {});
+      }
+    };
 
     window.addEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
     window.addEventListener('parttrack_active_delivery_changed', handleActiveChange);
     window.addEventListener('parttrack_connection_required', handleConnectionRequired);
+    window.addEventListener('online', handleOnlineReconnect);
 
     return () => {
       unsubRealtimeEvent();
@@ -268,6 +278,7 @@ export function App() {
       window.removeEventListener('parttrack_deliveries_updated', handleDeliveriesUpdate);
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
       window.removeEventListener('parttrack_connection_required', handleConnectionRequired);
+      window.removeEventListener('online', handleOnlineReconnect);
     };
   }, [initAppWorkspace, reloadDelivery, refreshGroups, currentUser]);
 

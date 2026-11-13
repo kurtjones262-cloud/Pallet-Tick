@@ -1,6 +1,6 @@
 /**
- * Runtime and native platform environment detection for PalletTick.
- * PalletTick operates 100% offline and on-device (local IndexedDB & offline Tesseract.js OCR).
+ * Runtime and native platform environment detection for PartTrack.
+ * PartTrack uses local IndexedDB storage with an offline docket queue and Gemini-first vision OCR.
  */
 
 export function isCapacitorNativeRuntime(): boolean {

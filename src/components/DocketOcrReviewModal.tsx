@@ -29,6 +29,7 @@ import {
   performSmartDocketExtraction,
   PageTextHint,
 } from '../utils/offlineOcr';
+import { removePendingDocketUpload } from '../utils/offlineDocketQueue';
 
 interface AttachedPage {
   pageNumber: number;
@@ -42,6 +43,7 @@ interface DocketOcrReviewModalProps {
   extractedData: ExtractedDocketResult;
   initialSupplierRule?: SupplierRuleId;
   attachedPages?: AttachedPage[];
+  pendingQueueId?: string;
   onClose: () => void;
   onDeliveryCreated: (delivery: Delivery | Delivery[]) => void;
 }
@@ -121,6 +123,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   extractedData,
   initialSupplierRule = 'laser_central',
   attachedPages = [],
+  pendingQueueId,
   onClose,
   onDeliveryCreated,
 }) => {
@@ -340,15 +343,11 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     setActiveDraftIdx((prevIdx) => Math.max(0, Math.min(prevIdx, drafts.length - 2)));
   };
 
-  const handleRerunOcrPreservingManualEdits = async (forceGemini = false) => {
+  const handleRerunOcrPreservingManualEdits = async () => {
     if (attachedPages.length === 0 || isRetryingOcr) return;
     setIsRetryingOcr(true);
     setRetryOcrError(null);
-    setRetryOcrStatus(
-      forceGemini
-        ? 'Running Gemini AI extraction while preserving your manual edits...'
-        : 'Re-running Tesseract.js OCR while preserving your manual edits...'
-    );
+    setRetryOcrStatus('Re-running Gemini 4 Hydrogen extraction while preserving your manual edits...');
 
     try {
       const imagesToProcess = attachedPages.map((p) => p.dataUrl);
@@ -364,7 +363,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         {
           supplierHint: activeDraft.supplierRule,
           sourceFileIds,
-          forceGemini,
+          forceGemini: true,
         }
       );
 
@@ -592,6 +591,9 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       }
 
       if (createdDeliveries.length > 0) {
+        if (pendingQueueId) {
+          await removePendingDocketUpload(pendingQueueId).catch(() => {});
+        }
         setActiveDeliveryId(createdDeliveries[0].id);
         onDeliveryCreated(
           createdDeliveries.length === 1 ? createdDeliveries[0] : createdDeliveries
@@ -619,20 +621,13 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   ? `Separated Delivery Dockets (${drafts.length} Independent Dockets Detected)`
                   : `Compiled Docket Parts List (${items.length} Part Rows · ${totalExpandedParts} Total Quantities)`}
               </h3>
-              {activeExtractionMeta.extractionMethod === 'ai-vision' ? (
-                <span className="font-mono text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
-                  <Sparkles className="w-2.5 h-2.5 text-amber-600" />
-                  <span>
-                    {activeExtractionMeta.extractionEngineLabel ||
-                      `Gemini AI (${activeExtractionMeta.aiModelUsed || 'gemini-4-hydrogen'})`}
-                  </span>
+              <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
+                <Sparkles className="w-2.5 h-2.5 text-[#059669]" />
+                <span>
+                  {activeExtractionMeta.extractionEngineLabel ||
+                    `Gemini Vision (${activeExtractionMeta.aiModelUsed || 'gemini-4-hydrogen'})`}
                 </span>
-              ) : (
-                <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
-                  <Check className="w-2.5 h-2.5" />
-                  <span>{activeExtractionMeta.extractionEngineLabel || 'Tesseract.js OCR'}</span>
-                </span>
-              )}
+              </span>
               {manuallyEditedCount > 0 && (
                 <span className="font-mono text-[10px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-[3px]">
                   {manuallyEditedCount} Edited
@@ -649,21 +644,12 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <>
                 <button
                   type="button"
-                  onClick={() => handleRerunOcrPreservingManualEdits(false)}
-                  disabled={isRetryingOcr}
-                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className={`w-3 h-3 ${isRetryingOcr ? 'animate-spin text-[#059669]' : ''}`} />
-                  <span className="hidden sm:inline">Re-run OCR</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleRerunOcrPreservingManualEdits(true)}
+                  onClick={handleRerunOcrPreservingManualEdits}
                   disabled={isRetryingOcr}
                   className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-emerald-50 border border-emerald-200 text-[#059669] hover:bg-emerald-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
                 >
-                  <Sparkles className="w-3 h-3" />
-                  <span className="hidden md:inline">Use Gemini AI</span>
+                  <RefreshCw className={`w-3 h-3 ${isRetryingOcr ? 'animate-spin' : ''}`} />
+                  <span className="hidden sm:inline">Re-run Gemini OCR</span>
                 </button>
                 <button
                   type="button"
@@ -782,6 +768,19 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               {isDuplicateExisting
                 ? `Docket "${activeDocketKey}" already exists in PalletTrack. Rename the docket number or cancel to avoid duplicate docket creation.`
                 : `Another separated tab already uses Docket "${activeDocketKey}". Use unique docket numbers or click "Merge with Prev".`}
+            </span>
+          </div>
+        )}
+
+        {(activeExtractionMeta.missingRowNumbers.length > 0 ||
+          activeExtractionMeta.validationFlags.length > 0) && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center gap-2 shrink-0">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              <strong>Validation Notice:</strong>{' '}
+              {activeExtractionMeta.validationFlags.length > 0
+                ? activeExtractionMeta.validationFlags.join(' · ')
+                : `Check row numbers ${activeExtractionMeta.missingRowNumbers.join(', ')}`}
             </span>
           </div>
         )}

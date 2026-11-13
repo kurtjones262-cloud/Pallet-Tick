@@ -158,6 +158,7 @@ export interface Delivery {
   palletCount?: number;
   notes?: string;
   version?: number;
+  pendingSync?: boolean;
   totalParts?: number;
   receivedParts?: number;
   status: 'receiving' | 'completed';

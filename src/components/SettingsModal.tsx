@@ -554,9 +554,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 font-mono">
               <div className="p-3 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] flex items-center justify-between">
                 <div>
-                  <div className="text-xs font-bold text-white">Docket AI Vision + OCR</div>
+                  <div className="text-xs font-bold text-white">Docket AI Vision &amp; OCR</div>
                   <div className="text-[10px] text-[var(--pt-text-secondary,#A3A8BD)]">
-                    Cloud Vision + Local Tesseract
+                    Gemini 4 Hydrogen Vision + Offline Queue
                   </div>
                 </div>
                 <span className="px-2 py-0.5 rounded bg-[#00D979]/15 border border-[#00D979]/40 text-[#00D979] text-[10px] font-bold">

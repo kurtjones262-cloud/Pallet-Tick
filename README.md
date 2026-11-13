@@ -8,8 +8,8 @@ PartTrack is an enterprise-grade, mobile and offline-capable industrial parts re
 
 - **Standalone Android Application**: Configured as a native Android app via Capacitor (`com.parttrack.app`). Installs directly via APK onto Samsung Galaxy and Android phones and tablets—zero Google Play Store or hosted server required.
 - **Continuous Industrial Camera Scanning**: Real-time camera scanner for 1D Barcodes (Item Numbers) and 2D QR Codes (Part Numbers) with audio chimes and haptic vibration feedback.
-- **100% Offline On-Device OCR**: Photographs single or multi-page delivery dockets and extracts metadata, part numbers, item codes, and quantities locally using on-device Tesseract.js WebAssembly. Works with Wi-Fi and mobile data completely disabled.
-- **Local Persistence via IndexedDB**: Full-resolution docket photos, deliveries, pallets, and scan event logs are stored locally on the device (`parttrack_offline_db`). Data survives app restarts and phone reboots.
+- **Gemini-First AI Docket & Label OCR**: Photographs single or multi-page delivery dockets or pallet labels and extracts metadata, part numbers, revisions, item codes, and quantities via **Gemini 4 Hydrogen** (`/api/extract-docket`, `/api/recover-docket-items`, `/api/read-part-label`) with automatic **`gemini-3.1-flash-lite`** fallback and post-extraction industrial validation.
+- **Resilient Offline Mode & Local Queueing via IndexedDB**: 1D/2D barcode and QR scanning continues 100% offline. If a delivery docket is uploaded while offline, original high-resolution pages are safely queued in IndexedDB (`parttrack_offline_db`) and automatically processed when connectivity returns without faking OCR.
 - **Comprehensive Verification & Exports**:
   - Live progress tracking (`Received / Total Parts`).
   - Pallet breakdown and itemized checklist.
@@ -41,7 +41,7 @@ npm run android:sync
 ```
 *(Or `npm run build && npx cap sync android`)*
 
-This compiles the frontend application and copies all web assets, icons, and offline OCR WebAssembly models into `android/app/src/main/assets/public`.
+This compiles the frontend application and copies all web assets and icons into `android/app/src/main/assets/public`.
 
 ---
 
@@ -114,7 +114,7 @@ To create an optimized, signed release APK:
 ## Testing Offline Functionality
 1. Open PartTrack on your phone.
 2. Put the phone into **Airplane Mode** (disable Wi-Fi and Cellular Data).
-3. Create a delivery and photograph a docket—the on-device OCR engine processes the document without internet access.
-4. Scan parts or simulate barcodes—all matches, duplicates, and discrepancies update instantly.
+3. Scan parts or simulate 1D/QR barcodes—all matches, duplicates, and discrepancies update instantly from IndexedDB.
+4. Upload a new docket while offline—PartTrack preserves the full-resolution docket pages in the local IndexedDB queue (`Awaiting Processing`) and automatically runs Gemini 4 Hydrogen extraction once connectivity returns.
 5. Export a `.zip` receiving package—the PDF report, CSVs, and photos are bundled entirely in the device memory.
-6. Force close the app and reopen—all deliveries and scan history remain intact in local storage.
+6. Force close the app and reopen—all deliveries, queued uploads, and scan history remain intact in local storage.

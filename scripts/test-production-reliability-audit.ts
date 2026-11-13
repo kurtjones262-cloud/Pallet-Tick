@@ -1129,6 +1129,7 @@ async function runAudit() {
       deliveryDate: '2026-04-19',
       status: 'receiving',
       version: 1,
+      pendingSync: true,
       totalParts: 2,
       receivedParts: 1,
       docketAttachments: [localPhotoAttachment],

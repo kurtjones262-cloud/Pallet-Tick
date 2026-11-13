@@ -16,6 +16,10 @@ import {
   reconnectAndSyncWithCentralDb,
   getActiveDeliveryId,
 } from '../utils/storage.ts';
+import {
+  listPendingDocketUploads,
+  PENDING_DOCKET_QUEUE_UPDATED_EVENT,
+} from '../utils/offlineDocketQueue.ts';
 import { WorkerPresence } from '../types/delivery.ts';
 
 interface LiveActivityNotice {
@@ -32,8 +36,17 @@ export const ConnectionStatusBar: React.FC = () => {
   const [retryDiagnostic, setRetryDiagnostic] = useState<string | null>(null);
   const [rtState, setRtState] = useState<RealtimeClientState>(() => realtimeClient.getState());
   const [liveNotice, setLiveNotice] = useState<LiveActivityNotice | null>(null);
+  const [pendingDocketsCount, setPendingDocketsCount] = useState<number>(0);
 
   useEffect(() => {
+    const refreshPendingDockets = () => {
+      listPendingDocketUploads()
+        .then((items) => setPendingDocketsCount(items.length))
+        .catch(() => {});
+    };
+    refreshPendingDockets();
+    window.addEventListener(PENDING_DOCKET_QUEUE_UPDATED_EVENT, refreshPendingDockets);
+
     checkBackendConnection().catch(() => {});
 
     const interval = setInterval(() => {
@@ -138,6 +151,7 @@ export const ConnectionStatusBar: React.FC = () => {
       unsubscribeRtEvent();
       window.removeEventListener('online', handleWindowOnline);
       window.removeEventListener('offline', handleWindowOffline);
+      window.removeEventListener(PENDING_DOCKET_QUEUE_UPDATED_EVENT, refreshPendingDockets);
     };
   }, []);
 
@@ -181,8 +195,18 @@ export const ConnectionStatusBar: React.FC = () => {
             </span>
             <span className="text-amber-200">
               Receiving paused.
-              {rtState.pendingOfflineScansCount > 0
-                ? ` (${rtState.pendingOfflineScansCount} scan pending server verification)`
+              {rtState.pendingOfflineScansCount > 0 || pendingDocketsCount > 0
+                ? ` (${
+                    rtState.pendingOfflineScansCount > 0
+                      ? `${rtState.pendingOfflineScansCount} scan pending`
+                      : ''
+                  }${
+                    rtState.pendingOfflineScansCount > 0 && pendingDocketsCount > 0 ? ' · ' : ''
+                  }${
+                    pendingDocketsCount > 0
+                      ? `${pendingDocketsCount} docket${pendingDocketsCount === 1 ? '' : 's'} queued for Gemini`
+                      : ''
+                  })`
                 : diagnosticDetail
                 ? ` ${diagnosticDetail}`
                 : ' Reconnect to sync with central D1 database.'}
@@ -310,11 +334,19 @@ export const ConnectionStatusBar: React.FC = () => {
             </div>
           )}
 
-          {/* Pending Offline Scans Indicator */}
+          {/* Pending Offline Scans / Queued Dockets Indicator */}
           {rtState.pendingOfflineScansCount > 0 && (
             <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#F59E0B]/15 border border-[#F59E0B]/50 text-[#F59E0B] font-mono text-[10px]">
               <Clock className="w-3 h-3 text-[#F59E0B] animate-spin" />
               <span>{rtState.pendingOfflineScansCount} Pending Sync</span>
+            </div>
+          )}
+          {pendingDocketsCount > 0 && (
+            <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--pt-primary,#A020F0)]/20 border border-[var(--pt-primary,#A020F0)]/50 text-[var(--pt-primary-light,#C084FC)] font-mono text-[10px]">
+              <FileUp className="w-3 h-3 shrink-0" />
+              <span>
+                {pendingDocketsCount} Queued {pendingDocketsCount === 1 ? 'Docket' : 'Dockets'}
+              </span>
             </div>
           )}
         </div>

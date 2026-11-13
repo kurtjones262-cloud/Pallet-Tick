@@ -13,9 +13,12 @@ var docketOcr_exports = {};
 __export(docketOcr_exports, {
   DEFAULT_FALLBACK_VISION_MODELS: () => DEFAULT_FALLBACK_VISION_MODELS,
   DEFAULT_PRIMARY_VISION_MODEL: () => DEFAULT_PRIMARY_VISION_MODEL,
+  DOCKET_EXTRACTION_SYSTEM_INSTRUCTION: () => DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
   GEMINI_REQUEST_TIMEOUT_MS: () => GEMINI_REQUEST_TIMEOUT_MS,
   INITIAL_BACKOFF_MS: () => INITIAL_BACKOFF_MS,
   MAX_AUTOMATIC_RETRIES: () => MAX_AUTOMATIC_RETRIES,
+  buildDocketExtractionPrompt: () => buildDocketExtractionPrompt,
+  buildRestDocketResponseSchema: () => buildRestDocketResponseSchema,
   classifyGeminiError: () => classifyGeminiError,
   clearGeminiModelCooldownsForTesting: () => clearGeminiModelCooldownsForTesting,
   computeExponentialBackoffWithJitter: () => computeExponentialBackoffWithJitter,
@@ -23,6 +26,7 @@ __export(docketOcr_exports, {
   extractPartCodeWithGeminiVision: () => extractPartCodeWithGeminiVision,
   generateWithRetryAndFallback: () => generateWithRetryAndFallback,
   logOcrEvent: () => logOcrEvent,
+  normalizeRawBatchItem: () => normalizeRawBatchItem,
   recoverMissingDocketItems: () => recoverMissingDocketItems,
   resolveConfiguredVisionModels: () => resolveConfiguredVisionModels,
   sanitizeVisionModelIdentifier: () => sanitizeVisionModelIdentifier,
@@ -181,8 +185,11 @@ function validateAndParseOcrJsonResponse(rawText, mode = "batch") {
     throw new Error("Malformed OCR response: Root JSON value must be an object.");
   }
   if (mode === "label") {
-    if (typeof parsed.detectedCode !== "string") {
-      throw new Error("Malformed label OCR response: missing detectedCode string field.");
+    const hasCode = typeof parsed.detectedCode === "string" || typeof parsed.partNumber === "string" || typeof parsed.rawText === "string";
+    if (!hasCode) {
+      throw new Error(
+        "Malformed label OCR response: missing detectedCode, partNumber, or rawText string field."
+      );
     }
     return parsed;
   }
@@ -229,6 +236,98 @@ function parseCleanRowNo(raw) {
     }
   }
   return "";
+}
+function buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages) {
+  return `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order. If the document is blank or has no part rows, return items: [].
+
+MANDATORY 100%-RECALL EXTRACTION RULES:
+1. RECORD FIRST & LAST VISIBLE ROW NUMBERS:
+   - Record printed "No" of first visible part row in 'firstVisibleRowNo' and last visible row in 'lastVisibleRowNo' (or "" if none).
+2. EXTRACT EVERY SINGLE PART ROW FROM TOP TO BOTTOM:
+   - Never skip a numbered row and never merge two separate numbered rows into one item.
+   - If a page is presented as an UPPER half and a LOWER half with center overlap, read top-to-bottom without duplicating overlap rows and without skipping rows near the seam.
+   - Preserve legitimate separate rows even if the same part number appears multiple times with different revisions, pallets, descriptions, or line numbers.
+3. IGNORE NON-PART LINES:
+   - Exclude phone/fax numbers, ABN numbers, street/postal codes, delivery instructions, header barcodes, consignment notes, column headers, weights/kg totals, and tax/charge rows (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Total, Balance Due).
+4. MULTIPLE DOCKETS / PAGE HEADERS:
+   - Record one entry in 'pageHeaders' for EVERY page (${pageNumbers.join(", ")}) with: page, docketNumber (exact printed Docket No, Delivery Note, Packing Slip, Tax Invoice No; "" if continuation page has no header), supplier (sender/fabricator e.g. Laser Central, GCI), customerName (Deliver To / Customer / Bill To recipient), deliveryDate (YYYY-MM-DD if visible), orderNumber (Customer PO / Order No), jobNumber (Job # / Work Order # if separate), carrier, palletCount, and startsNewDocket (true if this page clearly starts a new docket/invoice).
+5. FIELD MAPPING FOR EACH PART ROW:
+   - page: Page number (${pageNumbers.join(" or ")}) where row appears.
+   - no: Exact printed "No" / "Item" / "Pos" / "Line" / "#" number (if a NEW docket starts and numbering restarts at 1, keep "1").
+   - part: Exact Part Number, Client Part Code, Drawing Number, J-series code, Mark, or Profile Name as printed. Join wrapped multi-line part codes cleanly. Never place row numbers, phone numbers, or quantities into 'part'.
+   - desc: Full part description written on the row. If quantity/unit like "4 EA" appears beside description while Qty column is numeric, keep unit ("EA") in 'unit'.
+   - rev: Drawing revision / Rev code if shown ("A", "B", "01"), else "".
+   - mat: Material grade if printed, else "".
+   - thk: Thickness if printed, else "".
+   - dim: Dimensions/size if printed, else "".
+   - wt: Weight if printed, else "".
+   - unit: Unit of measurement (e.g. "EA", "PC", "PCS", "SET", "M", "KG") if shown, else "".
+   - qty: Dispatched/delivered numeric quantity (prefer "Desp" / "Despatched" / "Shipped" / "Qty"; never use Unit Price $ or Total $).
+   - originalText: Exact raw text string read from this row when helpful for review/verification.
+   - confidence: "high", "medium", or "low" (use "low" if smudged, faded, ambiguous, or split awkwardly).
+   - validationWarnings: Array of short warnings for this row if uncertain (else []).`;
+}
+function buildRestDocketResponseSchema() {
+  return {
+    type: "OBJECT",
+    properties: {
+      docketNumber: { type: "STRING" },
+      supplier: { type: "STRING" },
+      customerName: { type: "STRING" },
+      deliveryDate: { type: "STRING" },
+      orderNumber: { type: "STRING" },
+      jobNumber: { type: "STRING" },
+      carrier: { type: "STRING" },
+      palletCount: { type: "INTEGER" },
+      validationWarnings: { type: "ARRAY", items: { type: "STRING" } },
+      pageHeaders: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            page: { type: "INTEGER" },
+            docketNumber: { type: "STRING" },
+            supplier: { type: "STRING" },
+            customerName: { type: "STRING" },
+            deliveryDate: { type: "STRING" },
+            orderNumber: { type: "STRING" },
+            jobNumber: { type: "STRING" },
+            carrier: { type: "STRING" },
+            palletCount: { type: "INTEGER" },
+            startsNewDocket: { type: "BOOLEAN" }
+          },
+          required: ["page"]
+        }
+      },
+      hasPrintedNoColumn: { type: "BOOLEAN" },
+      firstVisibleRowNo: { type: "STRING" },
+      lastVisibleRowNo: { type: "STRING" },
+      items: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            page: { type: "INTEGER" },
+            no: { type: "STRING" },
+            part: { type: "STRING" },
+            desc: { type: "STRING" },
+            rev: { type: "STRING" },
+            mat: { type: "STRING" },
+            thk: { type: "STRING" },
+            dim: { type: "STRING" },
+            wt: { type: "STRING" },
+            unit: { type: "STRING" },
+            qty: { type: "NUMBER" },
+            originalText: { type: "STRING" },
+            confidence: { type: "STRING" },
+            validationWarnings: { type: "ARRAY", items: { type: "STRING" } }
+          },
+          required: ["no", "part", "desc", "qty"]
+        }
+      }
+    },
+    required: ["items"]
+  };
 }
 async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInstruction, responseSchema, mode = "batch", envOverride, baseDelayMs = INITIAL_BACKOFF_MS) {
   const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
@@ -439,48 +538,24 @@ ${payload.pdfSelectableText.slice(0, 18e3)}`
       });
     }
   }
-  const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Your job is to transcribe EVERY single physical part row literally visible across the provided page image(s) and/or extracted PDF text into the JSON 'items' array without skipping or merging any rows.
-STRICT ANTI-HALLUCINATION & PART NUMBER INTEGRITY RULE:
-- Preserve original part numbers, revisions, and quantities exactly as printed.
-- Never invent, complete, or silently correct uncertain part numbers.
-- Only extract rows and text that are literally present in the provided document. If a document is blank or contains no physical part rows, return an empty items array [].`;
-  const promptText = `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in the table in top-to-bottom order. If the image is blank or has no part rows, return items: [].
-
-MANDATORY 100%-RECALL EXTRACTION RULES:
-1. RECORD FIRST & LAST VISIBLE ROW NUMBERS:
-   - Look at the first visible part row in this batch and record its printed "No" in 'firstVisibleRowNo', and look at the very last visible part row at the bottom of this batch and record its printed "No" in 'lastVisibleRowNo' (or "" if no part rows are visible).
-2. EXTRACT EVERY SINGLE PART ROW FROM TOP TO BOTTOM:
-   - Do NOT skip any row. Every single numbered row in the table is a distinct part that MUST have its own entry in 'items'.
-   - Notice each page is shown as an UPPER half and a LOWER half with a small overlap in the middle so every row is large and clear. Read continuously from the top of the UPPER half to the bottom of the LOWER half without duplicating the overlap rows and without skipping any row.
-   - Do NOT merge two separate numbered rows into one item.
-3. IGNORE NON-PART LINES:
-   - Ignore document header barcodes, consignment notes, and column headers.
-   - On Tax Invoices, ignore non-physical charge/summary lines (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Tax, Total, Balance Due).
-4. MULTIPLE DOCKETS / PAGE HEADERS:
-   - The upload may contain MULTIPLE separate delivery dockets (each with its own docket/invoice number) OR a multi-page single docket.
-   - Record one entry in 'pageHeaders' for EVERY page (${batchPages.map((b) => b.pageNumber).join(", ")}) with that page's exact 'docketNumber' (e.g., Docket No, Delivery Note, Tax Invoice No, or Job No; or "" if a continuation page has no docket header printed), 'supplier', 'deliveryDate', 'orderNumber' (e.g., Client Order No / PO No), 'carrier', 'palletCount', and 'startsNewDocket' (true if a new docket/invoice starts on that page).
-   - Never fabricate a docket number if none is printed on a continuation page.
-5. FIELD MAPPING FOR EACH PART ROW:
-   - page: The page number (${batchPages.map((b) => b.pageNumber).join(" or ")}) this row is on.
-   - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. If a NEW docket starts on a page and its row numbers restart at 1, keep the printed "1".
-   - part: The exact Part Number, Client Part Code, Part Code, Drawing Number, Mark, or DXF/Profile Name as printed on the row. Preserve original part numbers exactly as printed; never invent, complete, or silently correct uncertain part numbers. NEVER put the row number or quantity in 'part'.
-   - desc: The full part description or name written on the row.
-   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "B", "01"), else "".
-   - mat: Material grade ONLY if written on the row, else "".
-   - thk: Thickness ONLY if written on the row, else "".
-   - dim: Dimensions/length/size ONLY if written on the row, else "".
-   - wt: Weight ONLY if written on the row, else "".
-   - qty: Integer dispatched/delivered quantity for this part row (prefer "Desp" / "Despatched" / "Shipped" / "Qty" column; convert decimals like 4.00 to 4; never use Unit Price $ or Line Total $).`;
+  const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
+  const promptText = buildDocketExtractionPrompt(
+    pageDescriptions,
+    batchPages.map((b) => b.pageNumber),
+    totalPages
+  );
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
       docketNumber: { type: Type.STRING },
       supplier: { type: Type.STRING },
+      customerName: { type: Type.STRING },
       deliveryDate: { type: Type.STRING },
       orderNumber: { type: Type.STRING },
+      jobNumber: { type: Type.STRING },
       carrier: { type: Type.STRING },
       palletCount: { type: Type.INTEGER },
+      validationWarnings: { type: Type.ARRAY, items: { type: Type.STRING } },
       pageHeaders: {
         type: Type.ARRAY,
         description: "Per-page docket header metadata used to keep multi-page dockets together and separate distinct dockets.",
@@ -490,8 +565,10 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             page: { type: Type.INTEGER },
             docketNumber: { type: Type.STRING },
             supplier: { type: Type.STRING },
+            customerName: { type: Type.STRING },
             deliveryDate: { type: Type.STRING },
             orderNumber: { type: Type.STRING },
+            jobNumber: { type: Type.STRING },
             carrier: { type: Type.STRING },
             palletCount: { type: Type.INTEGER },
             startsNewDocket: { type: Type.BOOLEAN }
@@ -526,10 +603,29 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
             thk: { type: Type.STRING },
             dim: { type: Type.STRING },
             wt: { type: Type.STRING },
-            qty: { type: Type.NUMBER, description: "Quantity of this part (never price)." }
+            unit: { type: Type.STRING, description: "Unit of measurement (e.g. EA, PCS, SET)." },
+            qty: { type: Type.NUMBER, description: "Quantity of this part (never price)." },
+            originalText: { type: Type.STRING, description: "Raw row text snippet if uncertain." },
+            confidence: { type: Type.STRING, description: "high, medium, or low." },
+            validationWarnings: { type: Type.ARRAY, items: { type: Type.STRING } }
           },
           required: ["no", "part", "desc", "qty"],
-          propertyOrdering: ["page", "no", "part", "desc", "rev", "mat", "thk", "dim", "wt", "qty"]
+          propertyOrdering: [
+            "page",
+            "no",
+            "part",
+            "desc",
+            "rev",
+            "mat",
+            "thk",
+            "dim",
+            "wt",
+            "unit",
+            "qty",
+            "originalText",
+            "confidence",
+            "validationWarnings"
+          ]
         }
       }
     },
@@ -537,10 +633,13 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     propertyOrdering: [
       "docketNumber",
       "supplier",
+      "customerName",
       "deliveryDate",
       "orderNumber",
+      "jobNumber",
       "carrier",
       "palletCount",
+      "validationWarnings",
       "pageHeaders",
       "hasPrintedNoColumn",
       "firstVisibleRowNo",
@@ -560,10 +659,13 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
   return {
     docketNumber: parsed.docketNumber,
     supplier: parsed.supplier,
+    customerName: parsed.customerName,
     deliveryDate: parsed.deliveryDate,
     carrier: parsed.carrier,
     orderNumber: parsed.orderNumber,
+    jobNumber: parsed.jobNumber,
     palletCount: parsed.palletCount,
+    validationWarnings: Array.isArray(parsed.validationWarnings) ? parsed.validationWarnings : [],
     pageHeaders: Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [],
     hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
     firstVisibleRowNo: parsed.firstVisibleRowNo,
@@ -643,14 +745,14 @@ STRICT RULE: Only return rows that are actually visible in the images.`;
   }
 }
 function normalizeRawBatchItem(it, defaultPageNumber) {
-  let pn = String(it.part || "").trim();
-  const desc = String(it.desc || "").trim();
+  let pn = String(it.part || "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  const desc = String(it.desc || "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   if (!pn && !desc) return null;
-  if (/^(?:subtotal|sub-total|total|gst|tax|freight|delivery\s*charge|cartage|balance\s*due|amount\s*due|discount)$/i.test(
+  if (/^(?:subtotal|sub-total|total|gst|tax|freight|delivery\s*charge|cartage|balance\s*due|amount\s*due|discount|abn|acn|phone|ph:|fax|email|web|bsb|account|page\s*\d+\s*of\s*\d+)$/i.test(
     pn
-  ) || /^(?:subtotal|sub-total|gst\s*10%?|total\s*incl|total\s*excl|amount\s*due|balance\s*due|freight\s*charge)$/i.test(
+  ) || /^(?:subtotal|sub-total|gst\s*10%?|total\s*incl|total\s*excl|amount\s*due|balance\s*due|freight\s*charge|bank\s*details|remittance\s*advice|terms\s*and\s*conditions)$/i.test(
     desc
-  )) {
+  ) || /^(?:0[2378]\s*\d{4}\s*\d{4}|\(\s*0[2378]\s*\)\s*\d{4}\s*\d{4}|\+61\s*\d[\s\d]{7,10})$/.test(pn) || /^(?:ABN|ACN)\s*[:#]?\s*[\d\s]{9,14}$/i.test(pn)) {
     return null;
   }
   let cleanNo = parseCleanRowNo(it.no);
@@ -675,6 +777,10 @@ function normalizeRawBatchItem(it, defaultPageNumber) {
   const cleanRev = it.rev && String(it.rev).trim() ? String(it.rev).trim() : void 0;
   const cleanMat = it.mat && String(it.mat).trim() ? String(it.mat).trim() : void 0;
   const cleanThk = it.thk && String(it.thk).trim() ? String(it.thk).trim() : void 0;
+  const cleanUnit = it.unit && String(it.unit).trim() ? String(it.unit).trim().toUpperCase() : void 0;
+  const rawWarnings = Array.isArray(it.validationWarnings) ? it.validationWarnings.map((w) => String(w || "").trim()).filter(Boolean) : [];
+  const rawConf = String(it.confidence || "").toLowerCase();
+  const confidence = rawConf === "low" ? "low" : rawConf === "medium" ? "medium" : "high";
   return {
     cleanNo,
     item: {
@@ -687,9 +793,13 @@ function normalizeRawBatchItem(it, defaultPageNumber) {
       dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : void 0,
       weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : void 0,
       quantity: cleanQty,
+      unit: cleanUnit,
       palletNumber: "Pallet 1",
       pageNumber: resolvedPage,
-      confidence: "high",
+      originalText: it.originalText && String(it.originalText).trim() ? String(it.originalText).trim() : void 0,
+      confidence,
+      validationFlags: rawWarnings.length > 0 ? rawWarnings : void 0,
+      validationWarnings: rawWarnings.length > 0 ? rawWarnings : void 0,
       originalOcrValues: {
         partNumber: cleanPn,
         itemNumber: cleanNo,
@@ -740,7 +850,12 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   }
   const pageMetaMap = /* @__PURE__ */ new Map();
   for (let p = 1; p <= totalPages; p++) {
-    pageMetaMap.set(p, { pageNumber: p, explicitDocketNumber: "", rawItems: [] });
+    pageMetaMap.set(p, {
+      pageNumber: p,
+      explicitDocketNumber: "",
+      validationWarnings: [],
+      rawItems: []
+    });
   }
   let anyPrintedNoColumn = false;
   let modelUsed = DEFAULT_PRIMARY_VISION_MODEL;
@@ -757,15 +872,19 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     const batchPageNums = batches[bIdx].map((b) => b.pageNumber);
     const defaultPage = batchPageNums[0];
     for (const ph of bRes.pageHeaders || []) {
-      const pNum = Math.min(totalPages, Math.max(1, Number(ph.page) || defaultPage));
+      const pNum = Math.min(totalPages, Math.max(1, Number(ph.page ?? ph.pageNumber) || defaultPage));
       const meta = pageMetaMap.get(pNum);
       const dn = String(ph.docketNumber || "").trim();
       if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
       if (ph.supplier && ph.supplier.trim() && !meta.supplier) meta.supplier = ph.supplier.trim();
+      if (ph.customerName && ph.customerName.trim() && !meta.customerName) {
+        meta.customerName = ph.customerName.trim();
+      }
       if (ph.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(ph.deliveryDate.trim()) && !meta.deliveryDate) {
         meta.deliveryDate = ph.deliveryDate.trim();
       }
       if (ph.orderNumber && ph.orderNumber.trim() && !meta.orderNumber) meta.orderNumber = ph.orderNumber.trim();
+      if (ph.jobNumber && ph.jobNumber.trim() && !meta.jobNumber) meta.jobNumber = ph.jobNumber.trim();
       if (ph.carrier && ph.carrier.trim() && !meta.carrier) meta.carrier = ph.carrier.trim();
       if (ph.palletCount && ph.palletCount > 0 && !meta.palletCount) meta.palletCount = ph.palletCount;
       if (ph.startsNewDocket) meta.startsNewDocket = true;
@@ -775,13 +894,20 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       firstMeta.explicitDocketNumber = bRes.docketNumber.trim();
     }
     if (!firstMeta.supplier && bRes.supplier?.trim()) firstMeta.supplier = bRes.supplier.trim();
+    if (!firstMeta.customerName && bRes.customerName?.trim()) {
+      firstMeta.customerName = bRes.customerName.trim();
+    }
     if (!firstMeta.deliveryDate && bRes.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(bRes.deliveryDate.trim())) {
       firstMeta.deliveryDate = bRes.deliveryDate.trim();
     }
     if (!firstMeta.orderNumber && bRes.orderNumber?.trim()) firstMeta.orderNumber = bRes.orderNumber.trim();
+    if (!firstMeta.jobNumber && bRes.jobNumber?.trim()) firstMeta.jobNumber = bRes.jobNumber.trim();
     if (!firstMeta.carrier && bRes.carrier?.trim()) firstMeta.carrier = bRes.carrier.trim();
+    if (Array.isArray(bRes.validationWarnings) && bRes.validationWarnings.length > 0) {
+      firstMeta.validationWarnings.push(...bRes.validationWarnings.map((w) => String(w || "").trim()).filter(Boolean));
+    }
     for (const rawIt of bRes.items || []) {
-      const targetPage = Math.min(totalPages, Math.max(1, Number(rawIt.page) || defaultPage));
+      const targetPage = Math.min(totalPages, Math.max(1, Number(rawIt.page ?? rawIt.pageNumber) || defaultPage));
       const meta = pageMetaMap.get(targetPage);
       meta.rawItems.push({ ...rawIt, page: targetPage });
       const nVal = parseInt(parseCleanRowNo(rawIt.no), 10);
@@ -804,13 +930,16 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
         explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
         hasExplicitDocketNumber: hasExplicit,
         supplier: meta.supplier || "Steel Fabrication Supplier",
+        customerName: meta.customerName,
         deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
         carrier: meta.carrier,
         orderNumber: meta.orderNumber,
+        jobNumber: meta.jobNumber,
         palletCount: Math.max(1, meta.palletCount || 1),
         pageNumbers: [p],
         maxRowSeen: meta.maxRowNo || 0,
         rawItems: [...meta.rawItems],
+        validationWarnings: [...meta.validationWarnings],
         separationUncertain: !hasExplicit && totalPages > 1,
         separationReason: !hasExplicit && totalPages > 1 ? "Docket number not detected on page 1 \u2014 verify page boundaries." : void 0
       });
@@ -823,9 +952,12 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       if (existingSameDocket) {
         existingSameDocket.pageNumbers.push(p);
         existingSameDocket.rawItems.push(...meta.rawItems);
+        existingSameDocket.validationWarnings.push(...meta.validationWarnings);
         existingSameDocket.maxRowSeen = Math.max(existingSameDocket.maxRowSeen, meta.maxRowNo || 0);
         if (!existingSameDocket.carrier && meta.carrier) existingSameDocket.carrier = meta.carrier;
         if (!existingSameDocket.orderNumber && meta.orderNumber) existingSameDocket.orderNumber = meta.orderNumber;
+        if (!existingSameDocket.customerName && meta.customerName) existingSameDocket.customerName = meta.customerName;
+        if (!existingSameDocket.jobNumber && meta.jobNumber) existingSameDocket.jobNumber = meta.jobNumber;
         existingSameDocket.palletCount = Math.max(existingSameDocket.palletCount, meta.palletCount || 1);
       } else {
         segments.push({
@@ -833,13 +965,16 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
           explicitDocketNumber: meta.explicitDocketNumber,
           hasExplicitDocketNumber: true,
           supplier: meta.supplier || "Steel Fabrication Supplier",
+          customerName: meta.customerName,
           deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
           carrier: meta.carrier,
           orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
           palletCount: Math.max(1, meta.palletCount || 1),
           pageNumbers: [p],
           maxRowSeen: meta.maxRowNo || 0,
           rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
           separationUncertain: false
         });
       }
@@ -859,19 +994,23 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
         explicitDocketNumber: fallbackDk,
         hasExplicitDocketNumber: false,
         supplier: meta.supplier || prevSeg.supplier,
+        customerName: meta.customerName || prevSeg.customerName,
         deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
         carrier: meta.carrier,
         orderNumber: meta.orderNumber,
+        jobNumber: meta.jobNumber,
         palletCount: Math.max(1, meta.palletCount || 1),
         pageNumbers: [p],
         maxRowSeen: meta.maxRowNo || 0,
         rawItems: [...meta.rawItems],
+        validationWarnings: [...meta.validationWarnings],
         separationUncertain: true,
         separationReason: reason
       });
     } else {
       prevSeg.pageNumbers.push(p);
       prevSeg.rawItems.push(...meta.rawItems);
+      prevSeg.validationWarnings.push(...meta.validationWarnings);
       prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, meta.maxRowNo || 0);
       prevSeg.palletCount = Math.max(prevSeg.palletCount, meta.palletCount || 1);
     }
@@ -962,27 +1101,35 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     for (const unnum of segUnnumbered) {
       validItems.push({ ...unnum, itemNumber: String(nextSeq++) });
     }
+    const dedupWarnings = Array.from(new Set(seg.validationWarnings.filter(Boolean)));
+    const flaggedCount = validItems.filter((it) => it.confidence === "low").length;
     builtDockets.push({
       docketNumber: seg.explicitDocketNumber,
       supplier: seg.supplier,
+      customerName: seg.customerName,
       deliveryDate: seg.deliveryDate,
       carrier: seg.carrier,
       orderNumber: seg.orderNumber,
+      jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items: validItems,
-      confidenceScore: validItems.length > 0 ? seg.separationUncertain ? 75 : 100 : 0,
-      needsManualReview: validItems.length === 0 || seg.separationUncertain,
+      confidenceScore: validItems.length > 0 ? seg.separationUncertain || flaggedCount > 0 ? 80 : 100 : 0,
+      needsManualReview: validItems.length === 0 || seg.separationUncertain || flaggedCount > 0,
       separationUncertain: seg.separationUncertain,
       separationReason: seg.separationReason,
       sourcePageNumbers: [...seg.pageNumbers],
-      extractionMethod: "ai-vision",
+      extractionMethod: "gemini-vision",
+      extractionEngineLabel: `Gemini (${modelUsed})`,
       aiModelUsed: modelUsed,
       fallbackUsed,
       retryAttempts: totalRetries,
       pagesScanned: seg.pageNumbers.length,
       hasPrintedNoColumn: anyPrintedNoColumn,
       firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : void 0,
-      lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : void 0
+      lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : void 0,
+      flaggedRowCount: flaggedCount,
+      validationFlags: dedupWarnings.length > 0 ? dedupWarnings : void 0,
+      validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : void 0
     });
   }
   const primary = builtDockets[0] || {
@@ -1055,45 +1202,58 @@ async function extractPartCodeWithGeminiVision(imageDataUrl, knownParts) {
   });
   const { mimeType, base64Data } = parseDataUrl(imageDataUrl);
   const knownContext = Array.isArray(knownParts) && knownParts.length > 0 ? `
-Active Docket Expected Parts (cross-reference the number after "-" against the Docket No):
+Active Docket Expected Parts (cross-reference part number or docket "######-<No>" code):
 ${knownParts.slice(0, 120).map((p) => `- Docket No: ${p.itemNumber} | Part#: ${p.partNumber} (${p.description || ""})`).join("\n")}` : "";
-  const promptText = `Read the barcode value (formatted as "######-<No>", e.g. "482910-3" or "123456-02", where the numbers after the "-" is the "No" on the delivery docket), QR code text, or Part Number shown on this part label photo.${knownContext}
-Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode'.`;
+  const promptText = `Examine this industrial part or pallet label photograph and transcribe the literal label details.${knownContext}
+Rules:
+1. Preserve printed Part Numbers, barcode values (e.g. "482910-3"), or QR text exactly as printed without guessing blurred digits.
+2. Extract:
+   - detectedCode: primary barcode value, QR text, or Part Number (or "" if unreadable)
+   - partNumber: printed Part Number / Drawing No (or "" if none visible)
+   - description: part description line if printed (or "")
+   - quantity: numeric pallet/label quantity if printed (0 if not explicitly printed)
+   - unit: unit like EA, PCS, SET if shown
+   - rawText: literal multi-line text visible on the label
+   - confidence: "high", "medium", or "low"`;
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      detectedCode: {
-        type: Type.STRING,
-        description: "The decoded barcode text, Part Number, or Item Number on the label."
-      },
-      confidence: {
-        type: Type.STRING,
-        description: "high, medium, or low"
-      }
+      detectedCode: { type: Type.STRING },
+      partNumber: { type: Type.STRING },
+      description: { type: Type.STRING },
+      quantity: { type: Type.NUMBER },
+      unit: { type: Type.STRING },
+      rawText: { type: Type.STRING },
+      confidence: { type: Type.STRING }
     },
-    required: ["detectedCode"]
+    required: ["detectedCode", "rawText", "confidence"]
   };
-  try {
-    const { parsed } = await generateWithRetryAndFallback(
-      ai,
-      ThinkingLevel,
-      [
-        { inlineData: { mimeType, data: base64Data } },
-        { text: promptText }
-      ],
-      "Read the barcode or part code from the image.",
-      responseSchema,
-      "label"
-    );
-    return {
-      detectedCode: String(parsed.detectedCode || "").trim(),
-      confidence: String(parsed.confidence || "high")
-    };
-  } catch {
-    return { detectedCode: "", confidence: "low" };
-  }
+  const { parsed } = await generateWithRetryAndFallback(
+    ai,
+    ThinkingLevel,
+    [
+      { inlineData: { mimeType, data: base64Data } },
+      { text: promptText }
+    ],
+    "Read the barcode, part code, description, quantity, and literal text from the industrial part/pallet label image without fabricating values.",
+    responseSchema,
+    "label"
+  );
+  const detectedCode = String(parsed.detectedCode || parsed.partNumber || "").trim();
+  const partNumber = parsed.partNumber && String(parsed.partNumber).trim() ? String(parsed.partNumber).trim().toUpperCase() : detectedCode || null;
+  const rawQty = Number(parsed.quantity);
+  const quantity = !Number.isNaN(rawQty) && rawQty > 0 && rawQty <= 99999 ? Math.round(rawQty) : null;
+  return {
+    detectedCode,
+    partNumber,
+    description: parsed.description && String(parsed.description).trim() ? String(parsed.description).trim() : null,
+    quantity,
+    unit: parsed.unit && String(parsed.unit).trim() ? String(parsed.unit).trim().toUpperCase() : null,
+    rawText: String(parsed.rawText || "").trim(),
+    confidence: String(parsed.confidence || "high").toLowerCase()
+  };
 }
-var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS;
+var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS, DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
 var init_docketOcr = __esm({
   "src/server/docketOcr.ts"() {
     DEFAULT_PRIMARY_VISION_MODEL = "gemini-4-hydrogen";
@@ -1119,6 +1279,14 @@ var init_docketOcr = __esm({
     modelQuotaCooldownUntil = /* @__PURE__ */ new Map();
     MODEL_COOLDOWN_DURATION_MS = 5 * 60 * 1e3;
     MODEL_TRANSIENT_COOLDOWN_MS = 60 * 1e3;
+    DOCKET_EXTRACTION_SYSTEM_INSTRUCTION = `You are a 100%-recall industrial delivery docket, tax invoice, and steel/laser-cutting manifest extraction engine.
+Your job is to transcribe EVERY physical part row literally visible across the provided page image(s) and/or extracted PDF text into the JSON 'items' array without skipping or merging any rows.
+INDUSTRIAL DOCKET & ANTI-HALLUCINATION RULES:
+- Preserve original part numbers (including Laser Central, GCI, and J-series formats), revisions, units, and quantities exactly as printed.
+- If a part number wraps across two visual lines inside a narrow column cell, join the continuation text cleanly without adding extra words.
+- Never confuse contact phone/fax numbers, ABN numbers, postcodes, dates, bank details, weights (kg), dimensions (mm), or unit prices ($) with part numbers or quantities.
+- If a character or digit in a smudged/skewed area is uncertain, record your best literal reading, include the exact raw row snippet in 'originalText', set confidence='low', and explain the uncertainty in 'validationWarnings'. NEVER invent missing rows or guess fabricated codes.
+- Only extract physical part rows literally present in the document. If a document is blank or contains no physical part rows, return items: [].`;
   }
 });
 
@@ -3398,8 +3566,7 @@ var PalletTrackDbService = class _PalletTrackDbService {
         PRIMARY KEY (group_id, delivery_id)
       )`
     ];
-    const schemaBootstrapStatements = [
-      ...createStatements,
+    const indexStatements = [
       "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)",
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)",
       "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
@@ -3423,14 +3590,20 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "CREATE INDEX IF NOT EXISTS idx_docket_group_items_delivery ON docket_group_items(delivery_id)",
       "CREATE INDEX IF NOT EXISTS idx_docket_group_items_group ON docket_group_items(group_id)"
     ];
+    const schemaBootstrapStatements = [...createStatements, ...indexStatements];
     try {
-      await this.db.batch(schemaBootstrapStatements.map((sql) => this.db.prepare(sql)));
+      await this.db.exec(`${schemaBootstrapStatements.join(";\n")};`);
     } catch {
-      for (const sql of schemaBootstrapStatements) {
-        try {
-          await this.db.prepare(sql).run();
-        } catch (e) {
-          console.warn("Schema bootstrap notice:", e);
+      try {
+        await this.db.batch(createStatements.map((sql) => this.db.prepare(sql)));
+        await this.db.batch(indexStatements.map((sql) => this.db.prepare(sql)));
+      } catch {
+        for (const sql of schemaBootstrapStatements) {
+          try {
+            await this.db.prepare(sql).run();
+          } catch (e) {
+            console.warn("Schema bootstrap notice:", e);
+          }
         }
       }
     }
@@ -5762,7 +5935,6 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path2.resolve(__dirname, "public")));
-app.use("/tesseract", express.static(path2.resolve(__dirname, "node_modules/tesseract.js/dist")));
 var localDb = getLocalDevDatabase();
 app.use(async (req, res, next) => {
   if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/groups") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path.startsWith("/api/realtime") || req.path === "/api/health") {
@@ -5897,8 +6069,8 @@ app.post("/api/recover-docket-items", async (req, res) => {
 });
 app.post("/api/read-part-label", async (req, res) => {
   try {
-    const { image, imageBase64, mimeType, knownParts, docketParts } = req.body || {};
-    const resolvedImage = typeof image === "string" && image ? image : typeof imageBase64 === "string" && imageBase64 ? `data:${mimeType || "image/jpeg"};base64,${imageBase64}` : "";
+    const { imageDataUrl, image, imageBase64, mimeType, knownParts, docketParts } = req.body || {};
+    const resolvedImage = typeof imageDataUrl === "string" && imageDataUrl ? imageDataUrl : typeof image === "string" && image ? image : typeof imageBase64 === "string" && imageBase64 ? `data:${mimeType || "image/jpeg"};base64,${imageBase64}` : "";
     if (!resolvedImage) {
       return res.status(400).json({ error: "No part label image provided." });
     }
@@ -5913,8 +6085,12 @@ app.post("/api/read-part-label", async (req, res) => {
       scannedCode: result.detectedCode
     });
   } catch (err) {
-    return res.status(500).json({
-      error: err?.message || "Failed to read part label."
+    const { classifyGeminiError: classifyGeminiError2 } = await Promise.resolve().then(() => (init_docketOcr(), docketOcr_exports));
+    const classification = classifyGeminiError2(err);
+    return res.status(classification.statusCode).json({
+      error: classification.cleanMessage || "Failed to read part label.",
+      code: classification.errorCode,
+      retryable: classification.isRetryableAvailabilityError || classification.isTimeout
     });
   }
 });

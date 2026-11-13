@@ -1,12 +1,12 @@
 /**
  * Cloudflare Pages Function: POST /api/extract-docket
  *
- * Secure server-side Gemini AI invoice & docket extraction with:
- * - Automatic retry handling for HTTP 503, 429, and 5xx errors
- * - Exponential backoff with jitter starting at ~2s (max 3 retries)
- * - Configurable secondary Gemini model failover using identical instructions & schema
- * - Strict output validation before accepting results
- * - Safe operational logging without exposing API keys or document contents
+ * Secure server-side Gemini AI Vision invoice & docket extraction with:
+ * - Primary model: gemini-4-hydrogen (ThinkingLevel LOW), secondary fallback: gemini-3.1-flash-lite
+ * - Per-request 22s AbortController timeout, max 1 retry on transient 503/502/429 errors
+ * - Fast failover on 404 invalid model, daily quota exhaustion, or timeout; immediate abort on 401/403/400
+ * - Multi-docket segmentation via pageHeaders & startsNewDocket
+ * - Rich structured item fields (rev, unit, originalText, confidence, validationWarnings)
  */
 
 interface CloudflareEnv {
@@ -28,13 +28,17 @@ const GEMINI_REQUEST_TIMEOUT_MS = 22000;
 const MAX_AUTOMATIC_RETRIES = 1;
 const INITIAL_BACKOFF_MS = 1800;
 
+const pagesModelCooldownUntil = new Map<string, number>();
+const MODEL_COOLDOWN_MS = 5 * 60 * 1000;
+const TRANSIENT_COOLDOWN_MS = 60 * 1000;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function computeExponentialBackoffWithJitter(retryAttempt: number, baseMs: number = INITIAL_BACKOFF_MS): number {
   const exp = Math.max(0, retryAttempt - 1);
-  return Math.min(20000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 650));
+  return Math.min(8000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 450));
 }
 
 function logPagesOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta: Record<string, unknown> = {}) {
@@ -51,10 +55,20 @@ function logPagesOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta:
 
 function resolveConfiguredModels(env: CloudflareEnv): { primaryModel: string; fallbackModels: string[] } {
   const procEnv = typeof process !== 'undefined' && process.env ? process.env : {};
-  const primaryModel =
+  const obsolete = new Set([
+    'gemini-3.8-flash',
+    'gemini-3-flash-preview',
+    'gemini-3.1-flash-lite-preview',
+    'gemini-flash-latest',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-2.0-flash',
+  ]);
+  const rawPrimary =
     (typeof env?.GEMINI_PRIMARY_MODEL === 'string' && env.GEMINI_PRIMARY_MODEL.trim()) ||
     (typeof procEnv.GEMINI_PRIMARY_MODEL === 'string' && procEnv.GEMINI_PRIMARY_MODEL.trim()) ||
     DEFAULT_PRIMARY_MODEL;
+  const primaryModel = obsolete.has(rawPrimary.toLowerCase()) ? DEFAULT_PRIMARY_MODEL : rawPrimary;
 
   const rawFallbacks =
     (typeof env?.GEMINI_FALLBACK_MODEL === 'string' && env.GEMINI_FALLBACK_MODEL.trim()) ||
@@ -63,14 +77,92 @@ function resolveConfiguredModels(env: CloudflareEnv): { primaryModel: string; fa
     (typeof procEnv.GEMINI_FALLBACK_MODELS === 'string' && procEnv.GEMINI_FALLBACK_MODELS.trim()) ||
     DEFAULT_FALLBACK_MODELS.join(',');
 
-  const fallbackModels = rawFallbacks
-    .split(',')
-    .map((m) => m.trim())
-    .filter((m) => Boolean(m) && m !== primaryModel);
+  const seen = new Set<string>([primaryModel]);
+  const fallbackModels: string[] = [];
+  for (const token of rawFallbacks.split(',')) {
+    const cleaned = token.trim();
+    const resolved = cleaned && !obsolete.has(cleaned.toLowerCase()) ? cleaned : DEFAULT_FALLBACK_MODELS[0];
+    if (resolved && !seen.has(resolved)) {
+      seen.add(resolved);
+      fallbackModels.push(resolved);
+    }
+  }
 
   return {
     primaryModel,
-    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_MODELS],
+    fallbackModels:
+      fallbackModels.length > 0
+        ? fallbackModels
+        : DEFAULT_FALLBACK_MODELS.filter((m) => m !== primaryModel),
+  };
+}
+
+function classifyGeminiError(err: any) {
+  const rawMessage = String(err?.message || err || 'Unknown Gemini API error').replace(
+    /key=[A-Za-z0-9_\-]+/gi,
+    'key=[REDACTED]'
+  );
+  let statusCode = Number(err?.status || err?.statusCode || 0);
+  if (!statusCode) {
+    const m = rawMessage.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
+    if (m) statusCode = parseInt(m[1], 10);
+  }
+  const isTimeout =
+    Boolean(err?.isTimeout) ||
+    err?.name === 'AbortError' ||
+    statusCode === 504 ||
+    /504|DEADLINE_EXCEEDED|timed out|AbortError/i.test(rawMessage);
+  const isAuthError =
+    statusCode === 401 ||
+    statusCode === 403 ||
+    /401|403|UNAUTHENTICATED|PERMISSION_DENIED|API_KEY_INVALID|invalid api key/i.test(rawMessage);
+  const isInvalidModel =
+    statusCode === 404 ||
+    /404|NOT_FOUND|is not found|not supported for generateContent|model not found/i.test(rawMessage);
+  const isHighDemand503 =
+    !isTimeout &&
+    (statusCode === 503 || statusCode === 502 || /503|502|UNAVAILABLE|high demand|overloaded/i.test(rawMessage));
+  const isRateLimit =
+    statusCode === 429 || /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
+  const isModelDailyQuotaExhausted =
+    isRateLimit &&
+    /GenerateRequestsPerDay|free_tier_requests|daily quota|exceeded your current quota|limit:\s*0\b/i.test(rawMessage);
+
+  if (!statusCode) {
+    if (isTimeout) statusCode = 504;
+    else if (isAuthError) statusCode = 401;
+    else if (isInvalidModel) statusCode = 404;
+    else if (isHighDemand503) statusCode = 503;
+    else if (isRateLimit) statusCode = 429;
+    else statusCode = 500;
+  }
+
+  let errorCode = 'AI_EXTRACTION_FAILED';
+  if (isAuthError) errorCode = 'GEMINI_AUTH_ERROR';
+  else if (isInvalidModel) errorCode = 'GEMINI_INVALID_MODEL';
+  else if (statusCode === 400) errorCode = 'GEMINI_BAD_REQUEST';
+  else if (isModelDailyQuotaExhausted) errorCode = 'GEMINI_QUOTA_EXHAUSTED';
+  else if (isRateLimit) errorCode = 'GEMINI_RATE_LIMIT_429';
+  else if (isTimeout) errorCode = 'GEMINI_TIMEOUT';
+  else if (isHighDemand503) errorCode = 'GEMINI_HIGH_DEMAND_503';
+
+  return {
+    statusCode,
+    errorCode,
+    isTimeout,
+    isAuthError,
+    isInvalidModel,
+    isHighDemand503,
+    isRateLimit,
+    isModelDailyQuotaExhausted,
+    isRetryableAvailabilityError:
+      !isAuthError &&
+      !isInvalidModel &&
+      !isModelDailyQuotaExhausted &&
+      !isTimeout &&
+      statusCode !== 400 &&
+      (isHighDemand503 || isRateLimit || statusCode === 500),
+    cleanMessage: rawMessage.slice(0, 260),
   };
 }
 
@@ -83,7 +175,7 @@ function validateOcrPayload(rawText: string): any {
   } catch (e: any) {
     throw new Error(`Malformed OCR JSON response: ${e?.message || 'parse error'}`);
   }
-  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Array.isArray(parsed.items)) {
     throw new Error('Incomplete OCR response: missing items array.');
   }
   for (let i = 0; i < parsed.items.length; i++) {
@@ -126,6 +218,86 @@ function parseCleanRowNo(raw: unknown): string {
   return '';
 }
 
+function normalizePageItem(it: any, defaultPage: number) {
+  const rawPart = String(it.part || '').replace(/\s+/g, ' ').trim();
+  const rawDesc = String(it.desc || '').replace(/\s+/g, ' ').trim();
+  const combined = `${rawPart} ${rawDesc}`.trim();
+
+  if (
+    /^(?:freight|delivery\s*(?:fee|charge)|gst|subtotal|sub-total|total\s*(?:inc|ex)?|balance\s*due|amount\s*due|admin\s*fee|setup\s*fee|pallet\s*fee|abn|acn|phone|fax)\b/i.test(
+      rawPart
+    ) ||
+    (/^(?:freight|gst|subtotal|total|balance\s*due|amount\s*due|surcharge|delivery\s*charge)$/i.test(rawDesc) &&
+      !rawPart)
+  ) {
+    return null;
+  }
+
+  if (/^(?:\+?61|0[23478])\s*\d{4}\s*\d{4}$/.test(rawPart) || /^ABN\s*\d{2}/i.test(combined)) {
+    return null;
+  }
+
+  const cleanNo = parseCleanRowNo(it.no);
+  const rawQty = Number(it.qty);
+  const hasInvalidQty = Number.isNaN(rawQty) || rawQty < 1;
+  const qty = !hasInvalidQty ? Math.round(rawQty) : 1;
+  const partNumber = (rawPart || rawDesc.slice(0, 24) || 'PART').trim().toUpperCase();
+  const description = (rawDesc || rawPart || '').trim();
+  const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim().toUpperCase() : undefined;
+  const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
+  const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+  const dimensions = it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined;
+  const weight = it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined;
+  const unit = it.unit && String(it.unit).trim() ? String(it.unit).trim().toUpperCase() : undefined;
+  const originalText = it.originalText && String(it.originalText).trim() ? String(it.originalText).trim() : undefined;
+
+  const warnings: string[] = Array.isArray(it.validationWarnings)
+    ? it.validationWarnings.map((w: any) => String(w || '').trim()).filter(Boolean)
+    : [];
+  if (hasInvalidQty) warnings.push('Quantity unclear or missing on source row');
+  if (!rawPart || rawPart === 'PART' || rawPart === 'UNKNOWN') {
+    warnings.push('Part number unclear on source row');
+  }
+
+  const rawConf = String(it.confidence || '').toLowerCase();
+  const confidence: 'high' | 'medium' | 'low' =
+    warnings.length > 0 || rawConf === 'low' ? 'low' : rawConf === 'medium' ? 'medium' : 'high';
+
+  return {
+    cleanNo,
+    pageNumber: Number(it.page) || defaultPage,
+    item: {
+      partNumber,
+      itemNumber: cleanNo || '1',
+      description,
+      revision,
+      rev: revision,
+      material,
+      thickness,
+      dimensions,
+      weight,
+      unit,
+      quantity: qty,
+      palletNumber: 'Pallet 1',
+      pageNumber: Number(it.page) || defaultPage,
+      originalText,
+      confidence,
+      notes: warnings.length > 0 ? warnings.join('; ') : undefined,
+      validationWarnings: warnings.length > 0 ? warnings : undefined,
+      originalOcrValues: {
+        partNumber,
+        itemNumber: cleanNo || '1',
+        description,
+        revision,
+        rev: revision,
+        quantity: qty,
+        material,
+        thickness,
+      },
+    },
+  };
+}
+
 async function callGeminiRestSingleAttempt(
   apiKey: string,
   model: string,
@@ -147,11 +319,7 @@ async function callGeminiRestSingleAttempt(
     systemInstruction: {
       parts: [{ text: systemInstruction }],
     },
-    contents: [
-      {
-        parts,
-      },
-    ],
+    contents: [{ parts }],
     generationConfig,
   };
 
@@ -172,6 +340,7 @@ async function callGeminiRestSingleAttempt(
         `Gemini API request to ${model} timed out after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s (HTTP 504).`
       );
       timeoutErr.status = 504;
+      timeoutErr.isTimeout = true;
       throw timeoutErr;
     }
     throw fetchErr;
@@ -277,13 +446,16 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
     }
 
     const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array. Never invent, guess, or fabricate parts or quantities. If blank, return items: [].`;
+Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array without skipping or merging rows.
+Preserve original part numbers (Laser Central, GCI, J-series), join wrapped multi-line part numbers cleanly, separate supplier from customer/recipient, never invent missing rows, and mark uncertain rows with confidence='low' and validationWarnings.`;
 
-    const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in the table.
+    const pageNumbers = Array.from({ length: totalPages }, (_, idx) => idx + 1);
+    const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order.
 Rules:
-1. Extract every numbered part row from top to bottom.
-2. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
-3. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
+1. Extract every physical part row without duplicating overlap slices or skipping seam rows.
+2. Record 'pageHeaders' for pages [${pageNumbers.join(', ')}] with: page, docketNumber, supplier, customerName, deliveryDate, orderNumber, jobNumber, carrier, palletCount, startsNewDocket.
+3. For each row: page, no (exact printed row number), part, desc, rev, mat, thk, dim, wt, unit (EA/PC/PCS/SET/M), qty (dispatched integer quantity, never price $), originalText, confidence ('high'|'medium'|'low'), validationWarnings.
+4. Exclude phone/fax numbers, ABN numbers, postcodes, header consignment barcodes, and charge/tax summary lines (Freight, GST, Subtotal, Total, Balance Due).`;
 
     parts.push({ text: promptText });
 
@@ -292,10 +464,32 @@ Rules:
       properties: {
         docketNumber: { type: 'STRING' },
         supplier: { type: 'STRING' },
+        customerName: { type: 'STRING' },
         deliveryDate: { type: 'STRING' },
         orderNumber: { type: 'STRING' },
+        jobNumber: { type: 'STRING' },
         carrier: { type: 'STRING' },
         palletCount: { type: 'INTEGER' },
+        validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
+        pageHeaders: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              page: { type: 'INTEGER' },
+              docketNumber: { type: 'STRING' },
+              supplier: { type: 'STRING' },
+              customerName: { type: 'STRING' },
+              deliveryDate: { type: 'STRING' },
+              orderNumber: { type: 'STRING' },
+              jobNumber: { type: 'STRING' },
+              carrier: { type: 'STRING' },
+              palletCount: { type: 'INTEGER' },
+              startsNewDocket: { type: 'BOOLEAN' },
+            },
+            required: ['page'],
+          },
+        },
         items: {
           type: 'ARRAY',
           items: {
@@ -310,7 +504,11 @@ Rules:
               thk: { type: 'STRING' },
               dim: { type: 'STRING' },
               wt: { type: 'STRING' },
+              unit: { type: 'STRING' },
               qty: { type: 'NUMBER' },
+              originalText: { type: 'STRING' },
+              confidence: { type: 'STRING' },
+              validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
             },
             required: ['no', 'part', 'desc', 'qty'],
           },
@@ -320,7 +518,12 @@ Rules:
     };
 
     const { primaryModel, fallbackModels } = resolveConfiguredModels(context.env);
-    const candidateModels = [primaryModel, ...fallbackModels];
+    const allModels = [primaryModel, ...fallbackModels];
+    const nowMs = Date.now();
+    const candidateModels = [
+      ...allModels.filter((m) => (pagesModelCooldownUntil.get(m) || 0) <= nowMs),
+      ...allModels.filter((m) => (pagesModelCooldownUntil.get(m) || 0) > nowMs),
+    ];
 
     let parsed: any = null;
     let lastError: any = null;
@@ -330,15 +533,14 @@ Rules:
 
     for (let mIdx = 0; mIdx < candidateModels.length && !parsed; mIdx++) {
       const model = candidateModels[mIdx];
-      const isFallback = mIdx > 0;
-      const maxRetries = MAX_AUTOMATIC_RETRIES;
+      const isFallback = model !== primaryModel;
 
       logPagesOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
         model,
         isFallback,
       });
 
-      for (let retry = 0; retry <= maxRetries; retry++) {
+      for (let retry = 0; retry <= MAX_AUTOMATIC_RETRIES; retry++) {
         try {
           const rawJsonText = await callGeminiRestSingleAttempt(
             apiKey,
@@ -360,42 +562,50 @@ Rules:
           break;
         } catch (err: any) {
           lastError = err;
-          const status = Number(err?.status || 500);
+          const classification = classifyGeminiError(err);
           const msg = String(err?.message || '');
-          const isRetryable =
-            status === 503 ||
-            status === 429 ||
-            status >= 500 ||
-            /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
+          const isValidationFailure = /Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
 
           logPagesOcrEvent('warn', 'extraction_attempt_failed', {
             model,
             isFallback,
             attempt: retry + 1,
-            maxAttempts: maxRetries + 1,
-            statusCode: status,
-            isRetryable,
-            reason: msg.slice(0, 220),
+            maxAttempts: MAX_AUTOMATIC_RETRIES + 1,
+            statusCode: classification.statusCode,
+            errorCode: classification.errorCode,
+            isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
+            reason: classification.cleanMessage,
           });
 
-          if (!isRetryable && (status === 400 || status === 401 || status === 403)) {
-            throw err;
+          if (!isValidationFailure && (classification.isAuthError || classification.statusCode === 400)) {
+            const permErr: any = new Error(classification.cleanMessage);
+            permErr.status = classification.statusCode;
+            permErr.code = classification.errorCode;
+            throw permErr;
           }
-          if (!isRetryable && status === 404) {
+
+          if (
+            !isValidationFailure &&
+            (classification.isInvalidModel ||
+              classification.isModelDailyQuotaExhausted ||
+              classification.isTimeout)
+          ) {
+            pagesModelCooldownUntil.set(
+              model,
+              Date.now() + (classification.isTimeout ? TRANSIENT_COOLDOWN_MS : MODEL_COOLDOWN_MS)
+            );
             break;
           }
 
-          if (retry < maxRetries) {
+          if ((classification.isRetryableAvailabilityError || isValidationFailure) && retry < MAX_AUTOMATIC_RETRIES) {
             totalRetryAttempts++;
             const waitMs = computeExponentialBackoffWithJitter(retry + 1, INITIAL_BACKOFF_MS);
-            logPagesOcrEvent('info', 'retrying_after_backoff', {
-              model,
-              retryAttempt: retry + 1,
-              maxRetries,
-              waitMs,
-              statusCode: status,
-            });
             await sleep(waitMs);
+            continue;
+          }
+
+          if (classification.isHighDemand503 || classification.isRateLimit) {
+            pagesModelCooldownUntil.set(model, Date.now() + TRANSIENT_COOLDOWN_MS);
           }
         }
       }
@@ -406,57 +616,156 @@ Rules:
     }
 
     const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
+    const rawPageHeaders: any[] = Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [];
+    const topWarnings: string[] = Array.isArray(parsed.validationWarnings)
+      ? parsed.validationWarnings.map((w: any) => String(w || '').trim()).filter(Boolean)
+      : [];
 
-    const items = rawItems.map((it: any, idx: number) => {
-      const cleanNo = parseCleanRowNo(it.no) || String(idx + 1);
-      const rawQty = Number(it.qty);
-      const qty = !Number.isNaN(rawQty) && rawQty >= 1 ? Math.round(rawQty) : 1;
-      const partNumber = String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase();
-      const description = String(it.desc || it.part || '').trim();
-      const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
-      const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
-      const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+    const pageHeaderMap = new Map<number, any>();
+    for (const ph of rawPageHeaders) {
+      const pNo = Number(ph?.page);
+      if (pNo >= 1 && pNo <= totalPages && !pageHeaderMap.has(pNo)) {
+        pageHeaderMap.set(pNo, {
+          docketNumber: ph.docketNumber ? String(ph.docketNumber).trim() : '',
+          supplier: ph.supplier ? String(ph.supplier).trim() : '',
+          customerName: ph.customerName ? String(ph.customerName).trim() : '',
+          deliveryDate: ph.deliveryDate ? String(ph.deliveryDate).trim() : '',
+          carrier: ph.carrier ? String(ph.carrier).trim() : undefined,
+          orderNumber: ph.orderNumber ? String(ph.orderNumber).trim() : undefined,
+          jobNumber: ph.jobNumber ? String(ph.jobNumber).trim() : undefined,
+          palletCount: ph.palletCount ? Math.max(1, Number(ph.palletCount) || 1) : 1,
+          startsNewDocket: Boolean(ph.startsNewDocket),
+        });
+      }
+    }
+
+    const segmentMap = new Map<string, {
+      docketNumber: string;
+      supplier: string;
+      customerName?: string;
+      deliveryDate: string;
+      carrier?: string;
+      orderNumber?: string;
+      jobNumber?: string;
+      palletCount: number;
+      pageNumbers: number[];
+      separationUncertain: boolean;
+      separationReason?: string;
+      rawRows: any[];
+    }>();
+    const segmentOrder: string[] = [];
+    let currentKey = '';
+
+    for (let pNo = 1; pNo <= totalPages; pNo++) {
+      const ph = pageHeaderMap.get(pNo);
+      const dk = (ph?.docketNumber || (pNo === 1 ? String(parsed.docketNumber || '').trim() : '')).trim();
+      const normalizedKey = dk ? dk.replace(/[\s_]+/g, '').toUpperCase() : '';
+      const startsNew = Boolean(ph?.startsNewDocket);
+
+      if (normalizedKey) {
+        if (!segmentMap.has(normalizedKey)) {
+          segmentMap.set(normalizedKey, {
+            docketNumber: dk,
+            supplier: ph?.supplier || String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
+            customerName: ph?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
+            deliveryDate: ph?.deliveryDate || String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
+            carrier: ph?.carrier || (parsed.carrier ? String(parsed.carrier).trim() : undefined),
+            orderNumber: ph?.orderNumber || (parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined),
+            jobNumber: ph?.jobNumber || (parsed.jobNumber ? String(parsed.jobNumber).trim() : undefined),
+            palletCount: ph?.palletCount || Math.max(1, Number(parsed.palletCount) || 1),
+            pageNumbers: [pNo],
+            separationUncertain: false,
+            rawRows: [],
+          });
+          segmentOrder.push(normalizedKey);
+        } else {
+          segmentMap.get(normalizedKey)!.pageNumbers.push(pNo);
+        }
+        currentKey = normalizedKey;
+      } else if (!currentKey || startsNew) {
+        const uncertain = totalPages > 1;
+        const fallbackKey = uncertain ? `REVIEW-P${pNo}` : 'SINGLE';
+        const fallbackDk = uncertain
+          ? `DK-REVIEW-P${pNo}-${Math.floor(100 + Math.random() * 900)}`
+          : `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+        segmentMap.set(fallbackKey, {
+          docketNumber: fallbackDk,
+          supplier: ph?.supplier || String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
+          customerName: ph?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
+          deliveryDate: ph?.deliveryDate || String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
+          carrier: ph?.carrier || (parsed.carrier ? String(parsed.carrier).trim() : undefined),
+          orderNumber: ph?.orderNumber || (parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined),
+          jobNumber: ph?.jobNumber || (parsed.jobNumber ? String(parsed.jobNumber).trim() : undefined),
+          palletCount: ph?.palletCount || Math.max(1, Number(parsed.palletCount) || 1),
+          pageNumbers: [pNo],
+          separationUncertain: uncertain,
+          separationReason: uncertain
+            ? `Page ${pNo} could not be tied to an explicit docket number with certainty. Please confirm.`
+            : undefined,
+          rawRows: [],
+        });
+        segmentOrder.push(fallbackKey);
+        currentKey = fallbackKey;
+      } else {
+        segmentMap.get(currentKey)!.pageNumbers.push(pNo);
+      }
+    }
+
+    for (const raw of rawItems) {
+      const rowPage = Math.max(1, Math.min(totalPages, Number(raw.page) || 1));
+      const targetKey =
+        segmentOrder.find((k) => segmentMap.get(k)!.pageNumbers.includes(rowPage)) || segmentOrder[0];
+      if (targetKey) {
+        segmentMap.get(targetKey)!.rawRows.push(raw);
+      }
+    }
+
+    const builtDockets = segmentOrder.map((segKey) => {
+      const seg = segmentMap.get(segKey)!;
+      const items = seg.rawRows
+        .map((r, idx) => {
+          const norm = normalizePageItem(r, seg.pageNumbers[0] || 1);
+          if (!norm) return null;
+          return {
+            ...norm.item,
+            itemNumber: norm.cleanNo || String(idx + 1),
+          };
+        })
+        .filter((it): it is NonNullable<typeof it> => it !== null);
+      const flaggedRowCount = items.filter((it) => it.confidence === 'low').length;
 
       return {
-        partNumber,
-        itemNumber: cleanNo,
-        description,
-        revision,
-        material,
-        thickness,
-        dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
-        weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
-        quantity: qty,
-        palletNumber: 'Pallet 1',
-        pageNumber: Number(it.page) || 1,
-        confidence: 'high',
-        originalOcrValues: {
-          partNumber,
-          itemNumber: cleanNo,
-          description,
-          revision,
-          quantity: qty,
-          material,
-          thickness,
-        },
+        docketNumber: seg.docketNumber,
+        supplier: seg.supplier,
+        customerName: seg.customerName,
+        deliveryDate: seg.deliveryDate,
+        carrier: seg.carrier,
+        orderNumber: seg.orderNumber,
+        jobNumber: seg.jobNumber,
+        palletCount: seg.palletCount,
+        items,
+        confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedRowCount > 0 ? 80 : 100) : 0,
+        needsManualReview: items.length === 0 || seg.separationUncertain || flaggedRowCount > 0,
+        separationUncertain: seg.separationUncertain,
+        separationReason: seg.separationReason,
+        sourcePageNumbers: seg.pageNumbers,
+        extractionMethod: 'gemini-vision' as const,
+        extractionEngineLabel: `Gemini (${modelUsed})`,
+        aiModelUsed: modelUsed,
+        fallbackUsed,
+        retryAttempts: totalRetryAttempts,
+        pagesScanned: seg.pageNumbers.length,
+        flaggedRowCount,
+        validationFlags: topWarnings.length > 0 ? topWarnings : undefined,
+        validationWarnings: topWarnings.length > 0 ? topWarnings : undefined,
       };
     });
 
+    const primary = builtDockets[0];
     const responsePayload = {
-      docketNumber: String(parsed.docketNumber || `DK-${Math.floor(10000 + Math.random() * 90000)}`).trim(),
-      supplier: String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
-      deliveryDate: String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
-      carrier: parsed.carrier ? String(parsed.carrier).trim() : undefined,
-      orderNumber: parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined,
-      palletCount: Math.max(1, Number(parsed.palletCount) || 1),
-      items,
-      confidenceScore: items.length > 0 ? 100 : 0,
-      needsManualReview: items.length === 0,
-      extractionMethod: 'ai-vision',
-      aiModelUsed: modelUsed,
-      fallbackUsed,
-      retryAttempts: totalRetryAttempts,
+      ...primary,
       pagesScanned: totalPages,
+      separatedDockets: builtDockets,
     };
 
     return new Response(JSON.stringify(responsePayload), {
@@ -464,27 +773,20 @@ Rules:
       headers: corsHeaders,
     });
   } catch (err: any) {
-    const rawMsg = err?.message || String(err || '');
-    const isMissingKey = rawMsg.includes('GEMINI_API_KEY') || rawMsg.includes('API key');
-    const isHighDemand = /503|UNAVAILABLE|high demand|overloaded/i.test(rawMsg);
-    const isRateLimit = /429|RESOURCE_EXHAUSTED|rate limit/i.test(rawMsg);
+    const classification = classifyGeminiError(err);
+    const isMissingKey = String(err?.message || '').includes('GEMINI_API_KEY') || err?.code === 'MISSING_GEMINI_API_KEY';
+    const status = isMissingKey ? 503 : classification.statusCode || 500;
+    const code = isMissingKey ? 'MISSING_GEMINI_API_KEY' : classification.errorCode;
     return new Response(
       JSON.stringify({
         error: isMissingKey
           ? 'Gemini AI API key is not configured in Cloudflare Pages. Please set the GEMINI_API_KEY environment variable in your Cloudflare Pages dashboard.'
-          : isHighDemand
-          ? 'Gemini AI is currently experiencing high demand (HTTP 503) after automatic retries and model fallback. Your uploaded docket has been preserved — please click "Retry Extraction".'
-          : rawMsg || 'Gemini AI invoice extraction failed.',
-        code: isMissingKey
-          ? 'MISSING_GEMINI_API_KEY'
-          : isHighDemand
-          ? 'GEMINI_HIGH_DEMAND_503'
-          : isRateLimit
-          ? 'GEMINI_RATE_LIMIT_429'
-          : 'AI_EXTRACTION_FAILED',
+          : classification.cleanMessage || 'Gemini AI invoice extraction failed.',
+        code,
+        retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
       }),
       {
-        status: isMissingKey || isHighDemand ? 503 : isRateLimit ? 429 : 500,
+        status,
         headers: corsHeaders,
       }
     );

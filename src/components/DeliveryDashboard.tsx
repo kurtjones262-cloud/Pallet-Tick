@@ -1221,7 +1221,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
               <div>
                 <span className="text-[var(--pt-text-muted,#737B94)]">OCR Engine: </span>
                 <span className="text-[var(--pt-primary-light,#C084FC)] font-bold">
-                  {isOnline ? 'Cloud Vision + Local Tesseract' : 'Local Tesseract Offline'}
+                  {isOnline ? 'Gemini 4 Hydrogen Vision' : 'Offline Upload Queue'}
                 </span>
               </div>
             </div>

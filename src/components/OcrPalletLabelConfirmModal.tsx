@@ -200,7 +200,7 @@ export const OcrPalletLabelConfirmModal: React.FC<OcrPalletLabelConfirmModalProp
             <div className="min-w-0 flex-1 text-xs">
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#00D979]/15 text-[#00D979] border border-[#00D979]/30 font-semibold">
-                  On-Device Offline OCR
+                  {extraction.engineUsed === 'mlkit-native' ? 'Native ML Kit OCR' : 'Gemini Vision OCR'}
                 </span>
                 {Math.abs(extraction.detectedSkewDegrees) >= 1 && (
                   <span className="font-mono text-[10px] text-[var(--pt-text-secondary,#A3A8BD)]">

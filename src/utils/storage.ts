@@ -17,6 +17,7 @@ import {
   saveDocketImageToIndexedDb,
   clearAllIndexedDb,
 } from './indexedDb';
+import { processPendingDocketUploads } from './offlineDocketQueue';
 import {
   apiFetchDeliveries,
   apiCreateDelivery,
@@ -440,6 +441,12 @@ export async function reconnectAndSyncWithCentralDb(): Promise<{
     await realtimeClient.flushPendingOfflineScans();
   } catch (e) {
     console.warn('Offline queue flush notice:', e);
+  }
+
+  try {
+    await processPendingDocketUploads();
+  } catch (e) {
+    console.warn('Offline docket upload queue sync notice:', e);
   }
 
   return {

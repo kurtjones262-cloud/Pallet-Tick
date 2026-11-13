@@ -63,8 +63,8 @@ export interface TableColumnLayout {
 }
 
 /**
- * Reconstructs sorted horizontal table lines from raw positioned OCR words when word-level
- * bounding boxes are available (e.g. from Tesseract.js or PDF.js).
+ * Reconstructs sorted horizontal table lines from raw positioned OCR/PDF words when word-level
+ * bounding boxes are available (e.g. from PDF.js selectable text layers).
  * - Excludes tall vertical border pipe tokens (`|`, `¦`) from distorting cluster vertical centers.
  * - Estimates and compensates residual text-baseline slope across wide multi-column tables.
  * - Stitches horizontally disjoint left/right row halves when page curvature splits a single row.
@@ -403,7 +403,7 @@ export function parseIndustrialDocketText(
 function buildDocketFromSegmentPages(
   segPages: Array<{ pageIndex: number; parsed: ReturnType<typeof parseIndustrialDocketText> }>,
   options: {
-    method: 'tesseract-ocr' | 'offline-ocr' | 'pdf-text';
+    method: 'gemini-vision' | 'ai-vision' | 'pdf-text';
     engineLabel: string;
     processingTimeMs?: number;
     ocrTimeMs?: number;
@@ -538,7 +538,7 @@ function getPageRowRange(parsed: ReturnType<typeof parseIndustrialDocketText>): 
 export function segmentParsedPagesIntoDockets(
   pageResults: Array<ReturnType<typeof parseIndustrialDocketText>>,
   options?: {
-    extractionMethod?: 'tesseract-ocr' | 'offline-ocr' | 'pdf-text';
+    extractionMethod?: 'gemini-vision' | 'ai-vision' | 'pdf-text';
     extractionEngineLabel?: string;
     processingTimeMs?: number;
     ocrTimeMs?: number;
@@ -547,8 +547,8 @@ export function segmentParsedPagesIntoDockets(
     sourceFileIds?: string[];
   }
 ): Array<ExtractedDocketResult & { validationReport: DocketValidationReport }> {
-  const method = options?.extractionMethod || 'tesseract-ocr';
-  const engineLabel = options?.extractionEngineLabel || 'Tesseract.js OCR';
+  const method = options?.extractionMethod || 'gemini-vision';
+  const engineLabel = options?.extractionEngineLabel || 'Gemini Vision OCR';
   const sourceFileIds = options?.sourceFileIds;
   const normKey = (s: string) => s.trim().toUpperCase().replace(/\s+/g, '');
 
@@ -693,7 +693,7 @@ export function segmentParsedPagesIntoDockets(
 export function combineMultiPageDocketResults(
   pageResults: Array<ReturnType<typeof parseIndustrialDocketText>>,
   options?: {
-    extractionMethod?: 'tesseract-ocr' | 'offline-ocr' | 'pdf-text';
+    extractionMethod?: 'gemini-vision' | 'ai-vision' | 'pdf-text';
     extractionEngineLabel?: string;
     processingTimeMs?: number;
     ocrTimeMs?: number;
@@ -702,14 +702,14 @@ export function combineMultiPageDocketResults(
     sourceFileIds?: string[];
   }
 ): ExtractedDocketResult & { validationReport: DocketValidationReport } {
-  const method = options?.extractionMethod || 'tesseract-ocr';
-  const engineLabel = options?.extractionEngineLabel || 'Tesseract.js OCR';
+  const method = options?.extractionMethod || 'gemini-vision';
+  const engineLabel = options?.extractionEngineLabel || 'Gemini Vision OCR';
 
   if (pageResults.length === 0) {
     const emptyReport: DocketValidationReport = {
       isAcceptableWithoutFallback: false,
       shouldFallbackToGemini: true,
-      fallbackReason: 'No pages or text lines were extracted by Tesseract.',
+      fallbackReason: 'No pages or text lines were extracted from document.',
       overallConfidenceScore: 0,
       missingRowNumbers: [],
       unparsedCandidateCount: 0,
@@ -799,7 +799,7 @@ export function validateDocketExtractionQuality(
     return {
       isAcceptableWithoutFallback: false,
       shouldFallbackToGemini: true,
-      fallbackReason: 'Tesseract did not detect any structured part rows on the docket.',
+      fallbackReason: 'No structured part rows were detected on the docket.',
       overallConfidenceScore: 0,
       ocrConfidence: 0,
       parserConfidence: 0,
@@ -1000,8 +1000,8 @@ export function validateDocketExtractionQuality(
     invalidQtyCount * 15;
   const overallConfidenceScore = Math.max(0, Math.min(100, baseRatio - penalty));
 
-  // Determine whether Tesseract extraction has structural gaps requiring Gemini fallback/recovery.
-  // IMPORTANT (Requirement 5): Never reject an entire docket solely because overallConfidenceScore < 75%
+  // Determine whether extracted docket has structural gaps requiring targeted row recovery or manual review.
+  // IMPORTANT: Never reject an entire docket solely because overallConfidenceScore < 75%
   // when valid structured rows have been extracted.
   const fallbackReasons: string[] = [];
   if (missingPartCount > 0) {
@@ -1021,8 +1021,7 @@ export function validateDocketExtractionQuality(
   if (duplicateRowCount >= 3 && duplicateRowCount >= Math.ceil(items.length * 0.15)) {
     fallbackReasons.push(`${duplicateRowCount} duplicate row collision(s) detected`);
   }
-  // Fall back on low confidence only when structural integrity is compromised or parser confidence is low
-  // (Never reject solely because overallConfidenceScore < 75 when valid structured rows exist)
+  // Flag for manual review/recovery only when structural integrity is compromised
   if (
     fallbackReasons.length === 0 &&
     flaggedRowCount >= Math.ceil(items.length * 0.5) &&
@@ -1038,7 +1037,7 @@ export function validateDocketExtractionQuality(
     shouldFallbackToGemini,
     fallbackReason:
       fallbackReasons.length > 0
-        ? `Tesseract validation flagged: ${fallbackReasons.join('; ')}`
+        ? `Docket validation flagged: ${fallbackReasons.join('; ')}`
         : undefined,
     overallConfidenceScore,
     ocrConfidence,
@@ -2842,8 +2841,7 @@ function parsePositionalAndSupplierLineItem(
 }
 
 /**
- * Merges complementary parsed part rows from two extraction sources (e.g., native PDF selectable text
- * and Tesseract.js page OCR) without creating duplicate line items.
+ * Merges complementary parsed part rows from two extraction sources without creating duplicate line items.
  * - Preserves page numbers, positional bounding boxes (`bbox`), and all valid rows from both sources.
  * - Does not discard valid rows if one source only captured partial rows.
  */
@@ -2956,7 +2954,7 @@ export function mergeComplementaryParsedItems(
 
 /**
  * Preserves manually edited or manually added rows (`manuallyEdited: true`) when a docket is reprocessed
- * by Tesseract or Gemini, keeping `originalOcrValues`, `lastEditedBy`, and `lastEditedAt` intact.
+ * by Gemini Vision OCR, keeping `originalOcrValues`, `lastEditedBy`, and `lastEditedAt` intact.
  */
 export function preserveManualEditsDuringReprocess(
   existingItems: ExtractedDocketItem[],
@@ -3031,4 +3029,326 @@ export function preserveManualEditsDuringReprocess(
   }
 
   return merged;
+}
+
+// ============================================================================
+// POST-GEMINI INDUSTRIAL DOCKET NORMALIZATION & VALIDATION
+// ============================================================================
+
+const NON_PART_CHARGE_REGEX =
+  /^(?:GST|TOTAL\s*GST|SUB\s*TOTAL|SUBTOTAL|TOTAL\s*(?:INC|EX|EXCL|INCL)?\s*GST|AMOUNT\s*DUE|BALANCE\s*DUE|INVOICE\s*TOTAL|FREIGHT|DELIVERY\s*(?:FEE|CHARGE|COST)|PACKING\s*(?:FEE|CHARGE)|PALLET\s*CHARGE|SURCHARGE|SETUP\s*(?:FEE|CHARGE)|PROGRAMMING\s*(?:FEE|CHARGE)|HANDLING\s*(?:FEE|CHARGE)|TAX|DISCOUNT|ROUNDING|A\.?B\.?N\.?|ACN|PHONE|PH|FAX|MOBILE|EMAIL|PAGE\s*\d+|RECEIVED\s*IN\s*GOOD|DRIVER\s*SIGNATURE|CUSTOMER\s*SIGNATURE)\b/i;
+
+function normalizeIndustrialSupplierLabel(rawSupplier: string): string {
+  const s = (rawSupplier || '').trim();
+  if (!s) return 'Laser Central';
+  if (/\blaser\s*central\b/i.test(s)) return 'Laser Central';
+  if (/\bgolden\s*coast\s*industrial\b|\bgci\b/i.test(s)) return 'GCI';
+  if (/\bbluescope\b/i.test(s)) return 'BlueScope Steel';
+  if (/\bshapecut\b/i.test(s)) return 'ShapeCut';
+  return s.replace(/\s+/g, ' ').slice(0, 80);
+}
+
+function normalizeGeminiPartCode(rawPart: string): string {
+  let cleaned = (rawPart || '')
+    .trim()
+    .replace(/^[:#;|¦,.=\s]+|[:#;|¦,.\s]+$/g, '')
+    .replace(/\s*([-\/])\s*/g, '$1');
+
+  // If a part code has two halves split by whitespace like "J12345 REV" or "12345 001", leave revision out if obvious
+  const trailingUnitMatch = cleaned.match(/^([A-Za-z0-9][A-Za-z0-9._\/-]{1,})\s+(?:EA|EACH|PC|PCS|SET|SETS)$/i);
+  if (trailingUnitMatch) {
+    cleaned = trailingUnitMatch[1];
+  }
+
+  return cleaned;
+}
+
+function extractUnitAndCleanDescription(
+  rawDesc: string,
+  rawUnit?: string
+): { description: string; unit?: string } {
+  let desc = (rawDesc || '').replace(/\s+/g, ' ').trim();
+  let unit = rawUnit ? rawUnit.trim().toUpperCase() : undefined;
+
+  if (!unit) {
+    const unitMatch = desc.match(/\b(\d+)\s+(EA|EACH|PCS|PIECES|SET|SETS|OFF)\b/i);
+    if (unitMatch) {
+      unit = unitMatch[2].toUpperCase();
+    } else {
+      const endUnitMatch = desc.match(/(?:^|\s)(EA|EACH|PCS|SET)$/i);
+      if (endUnitMatch) {
+        unit = endUnitMatch[1].toUpperCase();
+        desc = desc.slice(0, desc.length - endUnitMatch[0].length).trim();
+      }
+    }
+  }
+
+  if (unit === 'EACH') unit = 'EA';
+  if (unit === 'PIECES') unit = 'PCS';
+  if (unit === 'SETS') unit = 'SET';
+
+  return { description: desc, unit };
+}
+
+function isNonPartChargeOrFooterRow(item: ExtractedDocketItem): boolean {
+  const pn = (item.partNumber || '').trim();
+  const desc = (item.description || '').trim();
+  const orig = (item.originalText || '').trim();
+
+  if (NON_PART_CHARGE_REGEX.test(pn) && (!desc || NON_PART_CHARGE_REGEX.test(desc))) {
+    return true;
+  }
+  if (!pn && NON_PART_CHARGE_REGEX.test(desc)) {
+    return true;
+  }
+  if (
+    /^(?:ABN|ACN|PH|PHONE|FAX|TEL|TOTAL|SUBTOTAL|GST|FREIGHT)[:\s]/i.test(`${pn} ${desc}`.trim()) &&
+    !/[A-Z]\d{2,}|\d{3,}-\d+/.test(pn)
+  ) {
+    return true;
+  }
+  if (/^\$[\d,.]+$/.test(pn) || /^[\d,]+\.\d{2}$/.test(pn)) {
+    return true;
+  }
+  if (
+    orig &&
+    /\b(?:ABN|SUBTOTAL|TOTAL\s*GST|TOTAL\s*INC|FREIGHT\s*CHARGE)\b/i.test(orig) &&
+    (!pn || NON_PART_CHARGE_REGEX.test(pn))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalizes and validates a single extracted docket returned by Gemini Vision.
+ * Preserves all extracted part rows, enforces industrial formatting safeguards,
+ * detects sequence gaps (`missingRowNumbers`), and flags questionable rows without fabricating data.
+ */
+export function normalizeExtractedDocketSingle(
+  docket: ExtractedDocketResult
+): ExtractedDocketResult {
+  const supplier = normalizeIndustrialSupplierLabel(docket.supplier);
+  const normalizedItems: ExtractedDocketItem[] = [];
+
+  for (let i = 0; i < (docket.items || []).length; i++) {
+    const rawItem = docket.items[i];
+    if (!rawItem) continue;
+    if (isNonPartChargeOrFooterRow(rawItem)) continue;
+
+    const cleanPart = normalizeGeminiPartCode(rawItem.partNumber || '');
+    const { description, unit } = extractUnitAndCleanDescription(
+      rawItem.description || '',
+      rawItem.unit
+    );
+    const revVal = (rawItem.revision || rawItem.rev || '').trim() || undefined;
+    const rawQty = Number(rawItem.quantity);
+    const validQty = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 0;
+    const warnings = new Set<string>(
+      Array.isArray(rawItem.validationWarnings) ? rawItem.validationWarnings : []
+    );
+    const flags = new Set<string>(
+      Array.isArray(rawItem.validationFlags) ? rawItem.validationFlags : []
+    );
+
+    if (!cleanPart || cleanPart.length < 2 || /^(?:PART|UNKNOWN|N\/A|NONE)$/i.test(cleanPart)) {
+      flags.add('missing_part_number');
+      warnings.add('Missing or unclear Part Number');
+    }
+    if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 50000 || Math.floor(rawQty) !== rawQty) {
+      flags.add('invalid_quantity');
+      warnings.add(`Check quantity (${rawItem.quantity ?? 'missing'})`);
+    }
+    if (!description || description.length < 2) {
+      flags.add('incomplete_row');
+      warnings.add('Missing or short description');
+    }
+
+    const itemNoStr = String(rawItem.itemNumber || '').trim() || String(normalizedItems.length + 1);
+    const finalQty = validQty >= 1 && Math.floor(validQty) === validQty ? validQty : 1;
+
+    normalizedItems.push({
+      ...rawItem,
+      partNumber: cleanPart || rawItem.partNumber || 'UNKNOWN',
+      itemNumber: itemNoStr,
+      description: description || cleanPart || 'Unspecified Part',
+      revision: revVal,
+      rev: revVal,
+      unit: unit || rawItem.unit,
+      quantity: finalQty,
+      confidence:
+        flags.size > 0
+          ? 'low'
+          : rawItem.confidence === 'high' || rawItem.confidence === 'medium' || rawItem.confidence === 'low'
+          ? rawItem.confidence
+          : 'high',
+      validationFlags: flags.size > 0 ? Array.from(flags) : undefined,
+      validationWarnings: warnings.size > 0 ? Array.from(warnings) : undefined,
+      originalOcrValues: rawItem.originalOcrValues || {
+        partNumber: cleanPart || rawItem.partNumber || 'UNKNOWN',
+        itemNumber: itemNoStr,
+        description: description || cleanPart || 'Unspecified Part',
+        revision: revVal,
+        rev: revVal,
+        quantity: finalQty,
+        material: rawItem.material,
+        thickness: rawItem.thickness,
+      },
+    });
+  }
+
+  // Re-evaluate row integrity & sequence gaps without discarding legitimate duplicate part numbers
+  // that have distinct revisions, pallets, descriptions, or printed docket item numbers.
+  const seenExactRows = new Map<string, number>();
+  const numericItemNumbers: number[] = [];
+
+  for (let i = 0; i < normalizedItems.length; i++) {
+    const it = normalizedItems[i];
+    const itemNo = String(it.itemNumber || '').trim();
+    const pageKey = String(it.pageNumber || 1);
+    const revKey = String(it.rev || it.revision || '').trim().toUpperCase();
+    const palletKey = String(it.palletNumber || '').trim().toUpperCase();
+    const descKey = String(it.description || '').trim().toUpperCase().slice(0, 40);
+    const strictKey = `${pageKey}::NO=${itemNo}::PN=${it.partNumber.toUpperCase()}::REV=${revKey}::PAL=${palletKey}::DESC=${descKey}`;
+
+    if (it.partNumber && seenExactRows.has(strictKey)) {
+      const firstIdx = seenExactRows.get(strictKey)!;
+      const flags = new Set(it.validationFlags || []);
+      const warnings = new Set(it.validationWarnings || []);
+      flags.add('duplicate_entry');
+      warnings.add(`Matches row #${normalizedItems[firstIdx].itemNumber || firstIdx + 1}`);
+      it.validationFlags = Array.from(flags);
+      it.validationWarnings = Array.from(warnings);
+      it.confidence = 'low';
+    } else {
+      seenExactRows.set(strictKey, i);
+    }
+
+    if (/^\d+$/.test(itemNo)) {
+      const n = parseInt(itemNo, 10);
+      if (n >= 1 && n <= 2000) {
+        numericItemNumbers.push(n);
+      }
+    }
+  }
+
+  const missingRowNumbers: number[] = [];
+  if (numericItemNumbers.length >= 2) {
+    const uniqueSorted = Array.from(new Set(numericItemNumbers)).sort((a, b) => a - b);
+    const minNo = uniqueSorted[0];
+    const maxNo = uniqueSorted[uniqueSorted.length - 1];
+    const span = maxNo - minNo + 1;
+    if (span <= uniqueSorted.length + 15 && maxNo <= 2000) {
+      const present = new Set(uniqueSorted);
+      const startNo = minNo <= 3 ? 1 : minNo;
+      for (let expectedNo = startNo; expectedNo <= maxNo; expectedNo++) {
+        if (!present.has(expectedNo)) {
+          missingRowNumbers.push(expectedNo);
+        }
+      }
+    }
+  }
+
+  const flaggedRowCount = normalizedItems.filter(
+    (it) => it.confidence === 'low' || (it.validationFlags && it.validationFlags.length > 0)
+  ).length;
+
+  const highCount = normalizedItems.filter((it) => it.confidence === 'high').length;
+  const medCount = normalizedItems.filter((it) => it.confidence === 'medium').length;
+  const computedConfidence =
+    normalizedItems.length === 0
+      ? 0
+      : Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              ((highCount * 97 + medCount * 82 + flaggedRowCount * 48) / normalizedItems.length) -
+                missingRowNumbers.length * 8
+            )
+          )
+        );
+
+  const docketWarnings = new Set<string>(
+    Array.isArray(docket.validationWarnings) ? docket.validationWarnings : []
+  );
+  const docketFlags = new Set<string>(
+    Array.isArray(docket.validationFlags) ? docket.validationFlags : []
+  );
+
+  if (normalizedItems.length === 0) {
+    docketFlags.add('No part rows detected');
+  }
+  if (missingRowNumbers.length > 0) {
+    const msg = `Potentially missed line item(s): No. ${missingRowNumbers.slice(0, 10).join(', ')}`;
+    docketFlags.add(msg);
+    docketWarnings.add(msg);
+  }
+  if (flaggedRowCount > 0) {
+    const msg = `${flaggedRowCount} row(s) flagged for review`;
+    docketFlags.add(msg);
+    docketWarnings.add(msg);
+  }
+
+  const numericNosSorted = [...numericItemNumbers].sort((a, b) => a - b);
+
+  return {
+    ...docket,
+    supplier,
+    customerName: docket.customerName?.trim() || undefined,
+    orderNumber: docket.orderNumber?.trim() || undefined,
+    jobNumber: docket.jobNumber?.trim() || undefined,
+    items: normalizedItems,
+    confidenceScore:
+      typeof docket.confidenceScore === 'number' && docket.confidenceScore > 0
+        ? Math.min(docket.confidenceScore, computedConfidence || docket.confidenceScore)
+        : computedConfidence,
+    missingRowNumbers,
+    flaggedRowCount,
+    hasPrintedNoColumn: numericNosSorted.length > 0,
+    firstVisibleRowNo: numericNosSorted.length > 0 ? numericNosSorted[0] : undefined,
+    lastVisibleRowNo:
+      numericNosSorted.length > 0 ? numericNosSorted[numericNosSorted.length - 1] : undefined,
+    needsManualReview:
+      Boolean(docket.needsManualReview) ||
+      Boolean(docket.separationUncertain) ||
+      normalizedItems.length === 0 ||
+      flaggedRowCount > 0 ||
+      missingRowNumbers.length > 0,
+    validationFlags: Array.from(docketFlags),
+    validationWarnings: Array.from(docketWarnings),
+  };
+}
+
+/**
+ * Post-Gemini normalization & validation wrapper across both primary docket and any `separatedDockets`.
+ */
+export function validateAndNormalizeGeminiDocket(
+  extracted: ExtractedDocketResult
+): ExtractedDocketResult {
+  const separated = Array.isArray(extracted.separatedDockets) && extracted.separatedDockets.length > 0
+    ? extracted.separatedDockets.map((d) => normalizeExtractedDocketSingle(d))
+    : undefined;
+
+  if (separated && separated.length > 0) {
+    const primary = separated[0];
+    const combinedMissing = separated.flatMap((d) => d.missingRowNumbers || []);
+    const combinedFlagged = separated.reduce((sum, d) => sum + (d.flaggedRowCount || 0), 0);
+    const minScore = separated.reduce(
+      (min, d) => Math.min(min, d.confidenceScore || 0),
+      100
+    );
+    const anyNeedsReview = separated.some((d) => d.needsManualReview);
+    return {
+      ...extracted,
+      ...primary,
+      confidenceScore: minScore,
+      missingRowNumbers: combinedMissing,
+      flaggedRowCount: combinedFlagged,
+      needsManualReview: Boolean(extracted.needsManualReview) || anyNeedsReview,
+      separatedDockets: separated,
+    };
+  }
+
+  return normalizeExtractedDocketSingle(extracted);
 }

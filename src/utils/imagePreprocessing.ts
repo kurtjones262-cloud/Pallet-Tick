@@ -1,6 +1,6 @@
 /**
  * Image preprocessing for industrial laser cutting and fabrication delivery dockets.
- * Optimizes photos and scans for on-device Tesseract OCR while guaranteeing:
+ * Prepares high-resolution photos and scans for Gemini AI Vision extraction while guaranteeing:
  * - Accurate first-crossing histogram percentile calculation (never overwriting reached thresholds)
  * - Preservation of sparse dark text (< 1% and 1-2% dark pixels) on white pages
  * - Automatic inversion recovery for predominantly dark documents (white text on dark background)
@@ -27,8 +27,8 @@ export interface ImagePreprocessingDiagnostics {
 }
 
 export interface PreprocessedImageResult {
-  ocrDataUrl: string;       // Clean grayscale, contrast-normalized image for Tesseract LSTM
-  displayDataUrl: string;   // Clean original photo for UI review and IndexedDB storage
+  ocrDataUrl: string;       // Clean contrast-normalized image for vision inspection
+  displayDataUrl: string;   // Clean high-res photo for UI review, Gemini Vision, and IndexedDB storage
   width: number;
   height: number;
   diagnostics: ImagePreprocessingDiagnostics;
@@ -60,7 +60,7 @@ export function computeHistogramPercentile(
 /**
  * Normalizes local illumination gradients, camera shadows, and large background watermarks (such as
  * the large grey "G" watermark on industrial dockets) using a 2D integral image while preserving
- * soft anti-aliased character strokes for Tesseract LSTM recognition.
+ * soft anti-aliased character strokes.
  */
 export function applyLocalIlluminationAndWatermarkNormalization(
   workingLum: Uint8Array,

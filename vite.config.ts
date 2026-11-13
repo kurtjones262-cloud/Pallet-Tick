@@ -69,35 +69,20 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          cacheId: 'parttrack-pwa-v5',
+          cacheId: 'parttrack-pwa-v6',
           cleanupOutdatedCaches: true,
           clientsClaim: true,
           skipWaiting: true,
-          maximumFileSizeToCacheInBytes: 25 * 1024 * 1024, // 25MB for Tesseract wasm and traineddata
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          globIgnores: ['**/assets/aistudio/**', '**/tesseract/**'],
+          globIgnores: ['**/assets/aistudio/**'],
           navigateFallback: '/index.html',
           navigateFallbackDenylist: [
             /^\/api\//,
-            /^\/tesseract\//i,
             /pdf\.worker/i,
-            /\.(?:wasm|gz|traineddata|mjs|zip)$/i,
+            /\.(?:wasm|gz|mjs|zip)$/i,
           ],
           runtimeCaching: [
-            {
-              urlPattern: /^\/tesseract\/.*/i,
-              handler: 'CacheFirst',
-              options: {
-                cacheName: 'tesseract-offline-assets-v3',
-                expiration: {
-                  maxEntries: 60,
-                  maxAgeSeconds: 60 * 60 * 24 * 365, // 1 year
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',

@@ -1,11 +1,13 @@
 /**
  * Cloudflare Pages Function: POST /api/recover-docket-items
  *
- * Dedicated targeted row recovery helper for Cloudflare Pages deployment.
+ * Targeted row recovery helper using Gemini 4 Hydrogen primary and Gemini 3.1 Flash Lite fallback.
  */
 
 interface CloudflareEnv {
   GEMINI_API_KEY?: string;
+  GEMINI_PRIMARY_MODEL?: string;
+  GEMINI_FALLBACK_MODEL?: string;
   [key: string]: unknown;
 }
 
@@ -14,7 +16,8 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const DEFAULT_PRIMARY_MODEL = 'gemini-4-hydrogen';
+const DEFAULT_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 const GEMINI_REQUEST_TIMEOUT_MS = 22000;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
@@ -70,7 +73,7 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
     }
 
     parts.push({
-      text: `TARGETED RECOVERY on Page ${pageNumber}: Locate row numbers [ ${missingNos.join(', ')} ] in the printed No column and transcribe each.`,
+      text: `TARGETED RECOVERY on Page ${pageNumber}: Locate ONLY row numbers [ ${missingNos.join(', ')} ] in the printed No column and transcribe each literally without fabricating missing values.`,
     });
 
     const responseSchema = {
@@ -85,11 +88,16 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
               no: { type: 'STRING' },
               part: { type: 'STRING' },
               desc: { type: 'STRING' },
+              rev: { type: 'STRING' },
               mat: { type: 'STRING' },
               thk: { type: 'STRING' },
               dim: { type: 'STRING' },
               wt: { type: 'STRING' },
+              unit: { type: 'STRING' },
               qty: { type: 'NUMBER' },
+              originalText: { type: 'STRING' },
+              confidence: { type: 'STRING' },
+              validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
             },
             required: ['no', 'part', 'desc', 'qty'],
           },
@@ -98,53 +106,85 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
       required: ['items'],
     };
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${PRIMARY_MODEL}:generateContent?key=${apiKey}`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema,
-            thinkingConfig: { thinkingLevel: 'LOW' },
-          },
-        }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
+    const models = [DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL];
+    let parsed: any = null;
+
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const generationConfig: Record<string, unknown> = {
+        responseMimeType: 'application/json',
+        responseSchema,
+      };
+      if (model.includes('gemini-4-hydrogen')) {
+        generationConfig.thinkingConfig = { thinkingLevel: 'LOW' };
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [
+                {
+                  text: 'You are a precision industrial docket row recovery engine. Locate the exact requested row numbers and transcribe them literally without fabricating parts or quantities.',
+                },
+              ],
+            },
+            contents: [{ parts }],
+            generationConfig,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok) {
+          if (res.status === 401 || res.status === 403 || res.status === 400) break;
+          continue;
+        }
+
+        const resJson: any = await res.json();
+        const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (rawText) {
+          parsed = JSON.parse(rawText);
+          if (Array.isArray(parsed?.items)) break;
+        }
+      } catch {
+        continue;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    if (!res.ok) {
-      return new Response(JSON.stringify({ items: [] }), {
-        status: 200,
-        headers: corsHeaders,
-      });
-    }
-
-    const resJson: any = await res.json();
-    const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
-    const parsed = JSON.parse(rawText || '{}');
     const rawItems: any[] = Array.isArray(parsed?.items) ? parsed.items : [];
-
-    const items = rawItems.map((it: any) => ({
-      partNumber: String(it.part || 'PART').trim().toUpperCase(),
-      itemNumber: String(it.no || '').trim(),
-      description: String(it.desc || it.part || '').trim(),
-      material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined,
-      thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined,
-      dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
-      weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
-      quantity: Math.max(1, Math.round(Number(it.qty) || 1)),
-      palletNumber: 'Pallet 1',
-      pageNumber: Number(pageNumber) || 1,
-      confidence: 'high',
-    }));
+    const items = rawItems.map((it: any) => {
+      const partNumber = String(it.part || 'PART').trim().toUpperCase();
+      const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim().toUpperCase() : undefined;
+      const warnings = Array.isArray(it.validationWarnings)
+        ? it.validationWarnings.map((w: any) => String(w || '').trim()).filter(Boolean)
+        : [];
+      const conf = String(it.confidence || '').toLowerCase() === 'low' || warnings.length > 0 ? 'low' : 'high';
+      return {
+        partNumber,
+        itemNumber: String(it.no || '').trim(),
+        description: String(it.desc || it.part || '').trim(),
+        revision,
+        rev: revision,
+        material: it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined,
+        thickness: it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined,
+        dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
+        weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
+        unit: it.unit && String(it.unit).trim() ? String(it.unit).trim().toUpperCase() : undefined,
+        quantity: Math.max(1, Math.round(Number(it.qty) || 1)),
+        palletNumber: 'Pallet 1',
+        pageNumber: Number(pageNumber) || 1,
+        originalText: it.originalText && String(it.originalText).trim() ? String(it.originalText).trim() : undefined,
+        confidence: conf,
+        notes: warnings.length > 0 ? warnings.join('; ') : undefined,
+        validationWarnings: warnings.length > 0 ? warnings : undefined,
+      };
+    });
 
     return new Response(JSON.stringify({ items }), {
       status: 200,

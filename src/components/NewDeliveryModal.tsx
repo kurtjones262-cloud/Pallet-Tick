@@ -1,16 +1,16 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Camera,
   Images,
   FolderOpen,
-  FileText,
   X,
   AlertCircle,
-  ChevronRight,
   Trash2,
   Sparkles,
   Check,
   ChevronDown,
+  Clock,
+  RefreshCw,
 } from 'lucide-react';
 import { Delivery, SupplierRuleId } from '../types/delivery';
 import {
@@ -22,9 +22,18 @@ import { ExtractedDocketResult } from '../server/docketOcr';
 import {
   performSmartDocketExtraction,
   prepareColorImageForGemini,
+  DocketOfflineError,
   OcrProgressUpdate,
   PageTextHint,
 } from '../utils/offlineOcr';
+import {
+  PendingDocketUpload,
+  enqueuePendingDocketUpload,
+  listPendingDocketUploads,
+  removePendingDocketUpload,
+  retryPendingDocketUpload,
+  PENDING_DOCKET_QUEUE_UPDATED_EVENT,
+} from '../utils/offlineDocketQueue';
 import { isPdfFile, extractPagesFromPdfFile } from '../utils/pdfImport';
 import { DocketOcrReviewModal } from './DocketOcrReviewModal';
 import { apiNotifyDocketProcessing } from '../services/palletTrackApi';
@@ -101,7 +110,33 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [ocrProgress, setOcrProgress] = useState<OcrProgressUpdate | null>(null);
   const [ocrError, setOcrError] = useState<string | null>(null);
+  const [offlineQueueNotice, setOfflineQueueNotice] = useState<string | null>(null);
   const [reviewData, setReviewData] = useState<ExtractedDocketResult | null>(null);
+  const [reviewQueueId, setReviewQueueId] = useState<string | undefined>(undefined);
+  const [reviewAttachedPages, setReviewAttachedPages] = useState<
+    Array<{
+      pageNumber: number;
+      sourceFileId?: string;
+      dataUrl: string;
+      name?: string;
+      textHint?: PageTextHint;
+    }> | null
+  >(null);
+  const [pendingUploads, setPendingUploads] = useState<PendingDocketUpload[]>([]);
+
+  const refreshPendingUploads = useCallback(() => {
+    listPendingDocketUploads()
+      .then((items) => setPendingUploads(items))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshPendingUploads();
+    window.addEventListener(PENDING_DOCKET_QUEUE_UPDATED_EVENT, refreshPendingUploads);
+    return () => {
+      window.removeEventListener(PENDING_DOCKET_QUEUE_UPDATED_EVENT, refreshPendingUploads);
+    };
+  }, [refreshPendingUploads]);
 
   // Three distinct hidden file inputs for Mobile & Desktop:
   // 1. CAMERA: Captures a new photo directly using the rear camera
@@ -291,14 +326,55 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   const handleExtractPartsFromDocket = async () => {
     if (capturedPages.length === 0) return;
 
-    setIsProcessing(true);
     setOcrError(null);
+    setOfflineQueueNotice(null);
+
+    const queueCurrentPagesOffline = async (reason?: string) => {
+      const { record, deduplicated } = await enqueuePendingDocketUpload({
+        supplierHint: selectedSupplierRule,
+        pages: capturedPages.map((p) => ({
+          id: p.id,
+          sourceFileId: p.sourceFileId || p.id,
+          dataUrl: p.dataUrl,
+          name: p.name,
+          sourceType: p.sourceType === 'pdf' ? 'pdf' : 'photo',
+          fileSize: p.fileSize,
+          fileFormat: p.fileFormat,
+          textHint: p.textHint
+            ? {
+                rawText: p.textHint.rawText,
+                hasSelectableText: p.textHint.hasSelectableText,
+              }
+            : undefined,
+        })),
+      });
+      setIsProcessing(false);
+      setCapturedPages([]);
+      refreshPendingUploads();
+      setOfflineQueueNotice(
+        deduplicated
+          ? `These docket pages are already queued offline (${record.pages.length} page${
+              record.pages.length === 1 ? '' : 's'
+            }). They will automatically extract with Gemini 4 Hydrogen when reconnected.`
+          : reason ||
+              `Offline mode: Saved ${record.pages.length} docket page${
+                record.pages.length === 1 ? '' : 's'
+              } locally to IndexedDB. They will automatically process with Gemini 4 Hydrogen once connectivity returns.`
+      );
+    };
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      await queueCurrentPagesOffline();
+      return;
+    }
+
+    setIsProcessing(true);
     setOcrProgress({
       currentPage: 1,
       totalPages: capturedPages.length,
       stage: 'preparing',
       percent: 5,
-      statusText: 'Running Tesseract.js primary docket extraction...',
+      statusText: 'Preparing docket for Gemini 4 Hydrogen Vision...',
     });
 
     apiNotifyDocketProcessing({
@@ -334,12 +410,21 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           ? detectedSupplier
           : SUPPLIER_RULES[selectedSupplierRule].name;
 
+      setReviewQueueId(undefined);
+      setReviewAttachedPages(null);
       setReviewData({
         ...output.extractedData,
         supplier: resolvedSupplier,
       });
     } catch (err: any) {
       console.error('Docket extraction error:', err);
+      if (
+        err instanceof DocketOfflineError ||
+        (typeof navigator !== 'undefined' && navigator.onLine === false)
+      ) {
+        await queueCurrentPagesOffline(err?.message);
+        return;
+      }
       setIsProcessing(false);
       setOcrError(
         err?.message ||
@@ -348,21 +433,45 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
     }
   };
 
+  const handleOpenQueuedForReview = (item: PendingDocketUpload) => {
+    if (!item.extractedData) return;
+    setReviewQueueId(item.id);
+    setReviewAttachedPages(
+      item.pages.map((p, idx) => ({
+        pageNumber: idx + 1,
+        sourceFileId: p.sourceFileId,
+        dataUrl: p.dataUrl,
+        name: p.name,
+        textHint: p.textHint,
+      }))
+    );
+    setReviewData(item.extractedData);
+  };
+
   return (
     <>
       {reviewData ? (
         <DocketOcrReviewModal
           extractedData={reviewData}
           initialSupplierRule={selectedSupplierRule}
-          attachedPages={capturedPages.map((p, idx) => ({
-            pageNumber: idx + 1,
-            sourceFileId: p.sourceFileId,
-            dataUrl: p.dataUrl,
-            name: p.name,
-            textHint: p.textHint,
-          }))}
-          onClose={() => setReviewData(null)}
+          pendingQueueId={reviewQueueId}
+          attachedPages={
+            reviewAttachedPages ||
+            capturedPages.map((p, idx) => ({
+              pageNumber: idx + 1,
+              sourceFileId: p.sourceFileId,
+              dataUrl: p.dataUrl,
+              name: p.name,
+              textHint: p.textHint,
+            }))
+          }
+          onClose={() => {
+            setReviewData(null);
+            setReviewQueueId(undefined);
+            setReviewAttachedPages(null);
+          }}
           onDeliveryCreated={(newDels) => {
+            refreshPendingUploads();
             onDeliveryCreated(newDels);
             onClose();
           }}
@@ -384,7 +493,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 </h3>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--pt-bg,#080B12)] text-[var(--pt-primary-light,#C084FC)] font-mono text-[10px] font-semibold border border-[var(--pt-border,#29243D)]">
                   <Sparkles className="w-2.5 h-2.5" />
-                  <span>Tesseract OCR · Gemini Fallback</span>
+                  <span>Gemini 4 Hydrogen Vision</span>
                 </span>
               </div>
               <button
@@ -447,13 +556,12 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   </div>
 
                   <span className="text-[11px] font-mono uppercase tracking-widest text-[var(--pt-primary-light,#C084FC)] font-semibold mb-1">
-                    Tesseract.js Primary OCR · Gemini AI Fallback
+                    Gemini 4 Hydrogen · Vision Extraction
                   </span>
 
                   <h4
                     className={`text-sm font-bold mb-1 ${
-                      (ocrProgress?.statusText || '').toLowerCase().includes('retrying') ||
-                      (ocrProgress?.statusText || '').toLowerCase().includes('fallback')
+                      (ocrProgress?.statusText || '').toLowerCase().includes('retrying')
                         ? 'text-[#F59E0B] bg-[#F59E0B]/15 border border-[#F59E0B]/40 px-3 py-1 rounded-md'
                         : 'text-[var(--pt-text,#FFFFFF)]'
                     }`}
@@ -462,7 +570,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                   </h4>
 
                   <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] max-w-xs leading-relaxed mb-5">
-                    Extracting positioned words, column coordinates, and supplier table lines (Laser Central &amp; GCI) with automatic Gemini fallback verification.
+                    Reading high-resolution docket tables, part codes, revisions, and quantities with Gemini 4 Hydrogen Vision and automatic row verification.
                   </p>
 
                   {/* Progress Bar */}
@@ -480,6 +588,13 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                 </div>
               ) : (
                 <div className="divide-y divide-[var(--pt-border,#29243D)]">
+                  {offlineQueueNotice && (
+                    <div className="px-4 py-3 bg-[#00D979]/15 border-b border-[#00D979]/30 text-xs text-[#00D979] flex items-start gap-2">
+                      <Clock className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>{offlineQueueNotice}</span>
+                    </div>
+                  )}
+
                   {ocrError && (
                     <div className="px-4 py-3 bg-[#EF4444]/15 text-xs text-[#EF4444] space-y-2">
                       <div className="flex items-start gap-2">
@@ -499,6 +614,102 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                           </button>
                         </div>
                       )}
+                    </div>
+                  )}
+
+                  {/* Offline Queued Dockets awaiting processing or manual review */}
+                  {pendingUploads.length > 0 && (
+                    <div className="p-4 bg-[var(--pt-bg-secondary,#101321)] space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-mono font-semibold uppercase tracking-[0.1em] text-[var(--pt-primary-light,#C084FC)]">
+                          Queued Offline Dockets ({pendingUploads.length})
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        {pendingUploads.map((item) => {
+                          const statusLabel =
+                            item.status === 'awaiting_manual_review'
+                              ? 'Ready for Review'
+                              : item.status === 'processing'
+                              ? 'Processing (Gemini 4 Hydrogen)'
+                              : item.status === 'recovering_rows'
+                              ? 'Recovering Rows'
+                              : item.status === 'failed'
+                              ? 'Failed'
+                              : 'Awaiting Processing (Offline)';
+                          const badgeCls =
+                            item.status === 'awaiting_manual_review'
+                              ? 'bg-[#00D979]/15 text-[#00D979] border-[#00D979]/40'
+                              : item.status === 'failed'
+                              ? 'bg-[#EF4444]/15 text-[#EF4444] border-[#EF4444]/40'
+                              : 'bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/40';
+
+                          return (
+                            <div
+                              key={item.id}
+                              className="p-2.5 rounded-xl bg-[var(--pt-card,#15182A)] border border-[var(--pt-border,#29243D)] flex flex-col gap-2"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="text-xs font-semibold text-white truncate">
+                                    {item.pages[0]?.name || 'Queued Docket'} ({item.pages.length}{' '}
+                                    {item.pages.length === 1 ? 'page' : 'pages'})
+                                  </div>
+                                  <div className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)]">
+                                    {SUPPLIER_RULES[item.supplierHint]?.name} ·{' '}
+                                    {new Date(item.createdAt).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}
+                                  </div>
+                                </div>
+                                <span
+                                  className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold border shrink-0 ${badgeCls}`}
+                                >
+                                  {statusLabel}
+                                </span>
+                              </div>
+                              {item.errorMessage && (
+                                <p className="text-[11px] text-[#EF4444] leading-snug">
+                                  {item.errorMessage}
+                                </p>
+                              )}
+                              <div className="flex items-center justify-end gap-2">
+                                {item.status === 'awaiting_manual_review' && item.extractedData && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenQueuedForReview(item)}
+                                    className="px-2.5 py-1 rounded-lg bg-[#059669] hover:bg-[#047857] text-white font-mono text-[10px] font-bold cursor-pointer"
+                                  >
+                                    Review &amp; Save
+                                  </button>
+                                )}
+                                {item.status === 'failed' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      retryPendingDocketUpload(item.id).catch(() => {});
+                                    }}
+                                    className="px-2.5 py-1 rounded-lg pt-btn-primary font-mono text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <RefreshCw className="w-3 h-3" />
+                                    <span>Retry</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    removePendingDocketUpload(item.id).catch(() => {});
+                                  }}
+                                  className="px-2 py-1 rounded-lg bg-black/30 hover:bg-red-950/60 text-zinc-300 hover:text-[#EF4444] font-mono text-[10px] cursor-pointer"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
 

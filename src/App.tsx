@@ -27,6 +27,7 @@ import {
   commitScanPartAuthoritative,
 } from './utils/storage';
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
+import { isIgnoredNonPartQrPayload } from './utils/ignoredQrCodes';
 import { SplashScreen } from './components/SplashScreen';
 import { OrdersView } from './components/OrdersView';
 import { DocketGroupsView } from './components/DocketGroupsView';
@@ -341,6 +342,7 @@ export function App() {
 
   const handleSimulateScan = async (code: string) => {
     if (!activeDelivery) return;
+    if (isIgnoredNonPartQrPayload(code)) return;
     const { updatedDelivery, result } = processScannedCode(activeDelivery, code);
     const settings = getStoredSettings();
 

@@ -16,6 +16,7 @@ import {
   hashSessionToken,
   verifySetupSecretConstantTime,
 } from '../auth/crypto.ts';
+import { isIgnoredNonPartQrPayload } from '../../utils/ignoredQrCodes.ts';
 
 export interface AuthenticatedUser {
   id: string;
@@ -2397,6 +2398,13 @@ export class PalletTrackDbService {
     const cleanCode = String(input.code || '').trim();
     if (!cleanCode) {
       throw new Error('Scanned code is required.');
+    }
+    if (isIgnoredNonPartQrPayload(cleanCode)) {
+      return {
+        status: 'ignored_non_part_qr',
+        matched: false,
+        message: 'Ignored protective film QR payload.',
+      };
     }
 
     // If operator already selected a specific member docket + part to resolve a multi-docket conflict:

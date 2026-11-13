@@ -72,6 +72,10 @@ import { DuplicateScanModal, DuplicateScanModalData } from './DuplicateScanModal
 import { detectDuplicateScan } from '../utils/duplicateDetection';
 import { playAudio, triggerHaptic, speakAlert } from '../utils/audioFeedback';
 import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
+import {
+  isIgnoredNonPartQrPayload,
+  filterOutIgnoredQrDetections,
+} from '../utils/ignoredQrCodes';
 
 export type ScanInputSource = 'camera_barcode_qr' | 'external_hid' | 'photo_snap' | 'manual';
 
@@ -718,6 +722,11 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       inputSource: ScanInputSource = 'camera_barcode_qr',
       detectedFormat?: string
     ) => {
+      // Silently ignore permanently excluded non-part QR codes (e.g. sheet-metal protective film QR)
+      if (isIgnoredNonPartQrPayload(codeText)) {
+        return;
+      }
+
       // Block scanning if confirmation, conflict allocation, or duplicate warning modal is already open
       if (
         activeScanConfirmationRef.current !== null ||
@@ -1359,7 +1368,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             isMountedRef.current &&
             activeScanConfirmationRef.current === null
           ) {
-            const first = barcodes[0];
+            const validBarcodes = filterOutIgnoredQrDetections(
+              barcodes,
+              (b: any) => b?.rawValue || b?.raw_value || ''
+            );
+            if (validBarcodes.length === 0) {
+              recordDecodeDiagnostics(elapsedMs, false, methodLabel);
+              return;
+            }
+            const first = validBarcodes[0];
             const fmt = (first.format || '').toLowerCase();
             const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
             if (
@@ -1677,6 +1694,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           const nowTs = performance.now();
           const elapsed = Math.max(1, nowTs - lastZxingAttemptTs);
           lastZxingAttemptTs = nowTs;
+          if (isIgnoredNonPartQrPayload(decodedText)) {
+            recordDecodeDiagnostics(elapsed, false, activeDecodeMethodRef.current);
+            return;
+          }
           const currentIsOcr = activeSupplierRuleRef.current?.id === 'ocr_label';
           const formatName = (decodedResult?.result?.format?.formatName || '').toUpperCase();
           const formatEnum = decodedResult?.result?.format?.format;

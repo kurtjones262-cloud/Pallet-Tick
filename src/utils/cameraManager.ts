@@ -11,6 +11,8 @@
  * 6. Application-wide real-time camera & decoder diagnostics telemetry.
  */
 
+import { isIgnoredNonPartQrPayload } from './ignoredQrCodes';
+
 export type ScanMode = 'laser_central' | 'gci' | 'ocr_label';
 
 export interface CameraProfileConfig {
@@ -640,7 +642,7 @@ export async function decodeStillImageOrVideoFrameBarcodes(
     if (Array.isArray(detections)) {
       for (const d of detections) {
         const val = typeof d?.rawValue === 'string' ? d.rawValue.trim() : '';
-        if (val && !rawValues.includes(val)) {
+        if (val && !isIgnoredNonPartQrPayload(val) && !rawValues.includes(val)) {
           rawValues.push(val);
         }
       }

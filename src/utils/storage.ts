@@ -34,6 +34,7 @@ import {
   isBackendOnline,
 } from '../services/palletTrackApi';
 import { realtimeClient, ClientRealtimeEvent } from '../services/realtimeSync';
+import { isIgnoredNonPartQrPayload } from './ignoredQrCodes';
 
 
 const DELIVERIES_KEY = 'parttrack_deliveries_v2';
@@ -1500,6 +1501,7 @@ export function findMatchingPartsInDelivery(
   delivery: Delivery,
   rawCode: string
 ): ScopedPartMatch[] {
+  if (isIgnoredNonPartQrPayload(rawCode)) return [];
   const cleaned = rawCode.trim().replace(/^\*+|\*+$/g, '').trim();
   if (!cleaned || !delivery) return [];
   const normalizedInput = cleaned.toUpperCase();
@@ -1555,6 +1557,17 @@ export function processScannedCode(
   delivery: Delivery,
   rawCode: string
 ): { updatedDelivery: Delivery; result: ProcessScanResult } {
+  if (isIgnoredNonPartQrPayload(rawCode)) {
+    return {
+      updatedDelivery: delivery,
+      result: {
+        status: 'unexpected',
+        message: '',
+        code: rawCode.trim(),
+        detectedType: 'qr',
+      },
+    };
+  }
   const cleaned = rawCode.trim().replace(/^\*+|\*+$/g, '').trim();
   const now = new Date().toISOString();
   const normalizedInput = cleaned.toUpperCase();

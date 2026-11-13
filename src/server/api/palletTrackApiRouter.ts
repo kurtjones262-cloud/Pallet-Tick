@@ -82,6 +82,11 @@ function isAdminRole(role?: string): boolean {
   return role === 'super_admin' || role === 'admin';
 }
 
+function isSupervisorOrAdminRole(role?: string): boolean {
+  const r = (role || '').trim().toLowerCase();
+  return r === 'super_admin' || r === 'admin' || r === 'supervisor';
+}
+
 function isEmployeeRole(role?: string): boolean {
   return role === 'employee' || role === 'operator';
 }
@@ -547,24 +552,78 @@ export async function handlePalletTrackApiRequest(
           return errorResponse('Missing required delivery docketNumber', 400);
         }
         body.createdBy = currentUser.id;
-        const created = await service.createDelivery(body);
-        if (created) {
-          const rtEvent = await realtimeBroker.publishEvent(db, {
-            type: 'delivery:created',
-            deliveryId: created.id,
-            userId: currentUser.id,
-            employeeName: currentUser.employeeName,
-            employeeRole: currentUser.role,
-            deliveryVersion: created.version || 1,
-            payload: {
-              delivery: created,
-              createdByName: currentUser.employeeName,
-            },
-          });
-          return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+        try {
+          const created = await service.createDelivery(body);
+          if (created) {
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'delivery:created',
+              deliveryId: created.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: created.version || 1,
+              payload: {
+                delivery: created,
+                createdByName: currentUser.employeeName,
+              },
+            });
+            return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+          }
+          return jsonResponse(created, 201);
+        } catch (err: any) {
+          if (err?.code === 'DUPLICATE_DOCKET' || err?.status === 409) {
+            return new Response(
+              JSON.stringify({
+                error: err.message,
+                code: 'DUPLICATE_DOCKET',
+                existingDeliveryId: err.existingDeliveryId,
+              }),
+              {
+                status: 409,
+                headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+              }
+            );
+          }
+          throw err;
         }
-        return jsonResponse(created, 201);
       }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5b. Bulk Clear All Dockets (Super Admin, Admin, or Supervisor ONLY)
+    //     Must sit BEFORE /api/deliveries/:id route matcher!
+    // -------------------------------------------------------------------------
+    if (path === '/api/deliveries/clear-all' && method === 'POST') {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+
+      if (!isSupervisorOrAdminRole(currentUser.role)) {
+        return errorResponse(
+          'Forbidden: Only Super Admin, Admin, or Supervisor roles can clear all dockets.',
+          403,
+          'FORBIDDEN'
+        );
+      }
+
+      const cleared = await service.clearAllDeliveries();
+      const rtEvent = await realtimeBroker.publishEvent(db, {
+        type: 'deliveries:cleared',
+        userId: currentUser.id,
+        employeeName: currentUser.employeeName,
+        employeeRole: currentUser.role,
+        payload: {
+          deletedDeliveriesCount: cleared.deletedDeliveriesCount,
+          clearedBy: currentUser.employeeName,
+        },
+      });
+      return jsonResponse({
+        success: true,
+        deletedDeliveries: cleared.deletedDeliveriesCount,
+        deletedGroups: cleared.deletedGroupsCount,
+        ...cleared,
+        sequenceNumber: rtEvent.sequenceNumber,
+      });
     }
 
     // -------------------------------------------------------------------------
@@ -635,21 +694,59 @@ export async function handlePalletTrackApiRequest(
           return jsonResponse(updated);
         }
 
-        // DELETE /api/deliveries/:id
+        // DELETE /api/deliveries/:id (Super Admin, Admin, or Supervisor ONLY)
         if (method === 'DELETE') {
-          if (isEmployeeRole(currentUser.role)) {
+          if (!isSupervisorOrAdminRole(currentUser.role)) {
             return errorResponse(
-              'Forbidden: Employees cannot delete deliveries.',
+              'Forbidden: Only Super Admin, Admin, or Supervisor roles can delete dockets.',
               403,
               'FORBIDDEN'
             );
           }
 
+          if (url.searchParams.get('completedOnly') === '1') {
+            const targetDel = await service.getDeliveryById(deliveryId);
+            if (!targetDel) {
+              return errorResponse(`Delivery not found: ${deliveryId}`, 404, 'NOT_FOUND');
+            }
+            const isDone =
+              targetDel.status === 'completed' ||
+              (targetDel.parts.length > 0 &&
+                targetDel.parts.every(
+                  (p: any) => p.status === 'received' && (p.verificationStatus === 'verified' || (p.receivedQuantity ?? 0) >= Math.max(1, p.quantity ?? 1))
+                ));
+            if (!isDone) {
+              return errorResponse(
+                'Only completed dockets can be deleted individually. Complete all parts or use Clear All Dockets.',
+                409,
+                'INCOMPLETE_DOCKET_DELETE_BLOCKED'
+              );
+            }
+          }
+
           const deleted = await service.deleteDelivery(deliveryId);
-          if (!deleted) {
+          if (!deleted || !deleted.deleted) {
             return errorResponse(`Delivery not found: ${deliveryId}`, 404, 'NOT_FOUND');
           }
-          return jsonResponse({ success: true, id: deliveryId });
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: 'delivery:deleted',
+            deliveryId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: {
+              deliveryId,
+              docketNumber: deleted.docketNumber,
+              deletedBy: currentUser.employeeName,
+            },
+          });
+          return jsonResponse({
+            success: true,
+            deleted: true,
+            id: deliveryId,
+            docketNumber: deleted.docketNumber,
+            sequenceNumber: rtEvent.sequenceNumber,
+          });
         }
       }
 
@@ -922,6 +1019,264 @@ export async function handlePalletTrackApiRequest(
 
           const scan = await service.recordScanEvent(deliveryId, scanPayload);
           return jsonResponse(scan, 201);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Docket Groups Endpoints (/api/groups)
+    // -------------------------------------------------------------------------
+    if (path === '/api/groups') {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+
+      if (method === 'GET') {
+        const groups = await service.listGroups();
+        return jsonResponse(groups);
+      }
+
+      if (method === 'POST') {
+        const body: any = await request.json().catch(() => ({}));
+        if (!body?.name || !String(body.name).trim()) {
+          return errorResponse('Group name is required.', 400);
+        }
+        const created = await service.createGroup({
+          name: String(body.name).trim(),
+          deliveryIds: Array.isArray(body.deliveryIds) ? body.deliveryIds : [],
+          createdBy: currentUser.id,
+        });
+        const rtEvent = await realtimeBroker.publishEvent(db, {
+          type: 'group:created',
+          userId: currentUser.id,
+          employeeName: currentUser.employeeName,
+          employeeRole: currentUser.role,
+          payload: { group: created, actorName: currentUser.employeeName },
+        });
+        return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+      }
+    }
+
+    const groupMatch = path.match(/^\/api\/groups\/([^/]+)(.*)$/);
+    if (groupMatch) {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+      const groupId = decodeURIComponent(groupMatch[1]);
+      const subPath = groupMatch[2] || '';
+
+      if (subPath === '' || subPath === '/') {
+        if (method === 'GET') {
+          const group = await service.getGroupById(groupId);
+          if (!group) {
+            return errorResponse(`Docket group not found: ${groupId}`, 404, 'NOT_FOUND');
+          }
+          return jsonResponse(group);
+        }
+
+        if (method === 'PATCH' || method === 'PUT') {
+          const body: any = await request.json().catch(() => ({}));
+          try {
+            const updated = await service.updateGroup(
+              groupId,
+              {
+                name: body.name,
+                deliveryIds: Array.isArray(body.deliveryIds) ? body.deliveryIds : undefined,
+              },
+              currentUser.id
+            );
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: 'group:updated',
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              payload: { group: updated, actorName: currentUser.employeeName },
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber });
+          } catch (err: any) {
+            return errorResponse(err?.message || 'Failed to update docket group', 404, 'NOT_FOUND');
+          }
+        }
+
+        if (method === 'DELETE') {
+          const deleted = await service.deleteGroup(groupId);
+          if (!deleted.deleted) {
+            return errorResponse(`Docket group not found: ${groupId}`, 404, 'NOT_FOUND');
+          }
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: 'group:deleted',
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { groupId, name: deleted.name, deletedBy: currentUser.employeeName },
+          });
+          return jsonResponse({
+            success: true,
+            id: groupId,
+            sequenceNumber: rtEvent.sequenceNumber,
+          });
+        }
+      }
+
+      if (subPath === '/dockets' && method === 'POST') {
+        const body: any = await request.json().catch(() => ({}));
+        const idsToAdd: string[] = Array.isArray(body?.deliveryIds)
+          ? body.deliveryIds
+          : body?.deliveryId
+          ? [body.deliveryId]
+          : [];
+        if (idsToAdd.length === 0) {
+          return errorResponse('deliveryId or deliveryIds is required.', 400);
+        }
+        try {
+          let updatedGroup = null;
+          for (const dId of idsToAdd) {
+            updatedGroup = await service.addDeliveryToGroup(groupId, String(dId), currentUser.id);
+          }
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: 'group:updated',
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { group: updatedGroup, actorName: currentUser.employeeName },
+          });
+          return jsonResponse({ ...updatedGroup, sequenceNumber: rtEvent.sequenceNumber });
+        } catch (err: any) {
+          return errorResponse(err?.message || 'Failed to add docket to group', 404, 'NOT_FOUND');
+        }
+      }
+
+      const removeMemberMatch = subPath.match(/^\/dockets\/([^/]+)\/?$/);
+      if (removeMemberMatch && method === 'DELETE') {
+        const deliveryIdToRemove = decodeURIComponent(removeMemberMatch[1]);
+        try {
+          const updatedGroup = await service.removeDeliveryFromGroup(groupId, deliveryIdToRemove);
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: 'group:updated',
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { group: updatedGroup, actorName: currentUser.employeeName },
+          });
+          return jsonResponse({ ...updatedGroup, sequenceNumber: rtEvent.sequenceNumber });
+        } catch (err: any) {
+          return errorResponse(err?.message || 'Failed to remove docket from group', 404, 'NOT_FOUND');
+        }
+      }
+
+      if (subPath === '/scan' && method === 'POST') {
+        const body: any = await request.json().catch(() => ({}));
+        const scannedCode = String(body?.code ?? body?.scannedCode ?? '').trim();
+        if (!scannedCode) {
+          return errorResponse('Scanned part code is required.', 400);
+        }
+        try {
+          // CRITICAL: User attribution MUST always be derived from the authenticated server session
+          const result: any = await service.scanGroupPart(groupId, {
+            code: scannedCode,
+            scannedVia: body.scannedVia || body.scanType || 'qr',
+            receivedQuantity:
+              body.receivedQuantity !== undefined ? Number(body.receivedQuantity) : undefined,
+            mode: body.mode,
+            targetDeliveryId:
+              typeof body.targetDeliveryId === 'string' ? body.targetDeliveryId : undefined,
+            targetPartId:
+              typeof body.targetPartId === 'string' ? body.targetPartId : undefined,
+            idempotencyKey:
+              typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined,
+            notes: typeof body.notes === 'string' ? body.notes : undefined,
+            rawOcrText: typeof body.rawOcrText === 'string' ? body.rawOcrText : undefined,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+          });
+
+          if (result.status === 'not_found') {
+            return new Response(
+              JSON.stringify({
+                ...result,
+                code: 'PART_NOT_IN_GROUP',
+                error: result.message,
+              }),
+              {
+                status: 404,
+                headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+              }
+            );
+          }
+
+          if (result.status === 'ambiguous') {
+            return new Response(
+              JSON.stringify({
+                ...result,
+                candidates: result.conflictCandidates || result.candidates || [],
+                code: 'AMBIGUOUS_GROUP_PART',
+                error: result.message,
+              }),
+              {
+                status: 409,
+                headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+              }
+            );
+          }
+
+          if (result.duplicate) {
+            await realtimeBroker.publishEvent(db, {
+              type: 'part:duplicate_rejected',
+              deliveryId: result.deliveryId,
+              partId: result.part?.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              payload: {
+                part: result.part,
+                alreadyScannedBy: result.alreadyScannedBy,
+                alreadyScannedAt: result.alreadyScannedAt,
+                attemptedBy: currentUser.employeeName,
+                message: result.message,
+              },
+            });
+            return jsonResponse(result, 409);
+          }
+
+          if (!result.idempotentReplay && result.part && result.deliveryId) {
+            const eventType =
+              body.scannedVia === 'manual' ||
+              (result.part.verificationStatus === 'quantity_mismatch' &&
+                Number(result.part.receivedQuantity) < Number(result.part.quantity))
+                ? 'quantity:updated'
+                : 'part:scanned';
+
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: eventType,
+              deliveryId: result.deliveryId,
+              partId: result.part.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: result.deliveryVersion || 1,
+              payload: {
+                part: result.part,
+                scanEvent: result.scanEvent,
+                scannedByName: currentUser.employeeName,
+                receivedQuantity: result.part.receivedQuantity,
+                requiredQuantity: result.part.quantity,
+                deliveryStats: result.deliveryStats,
+                deliveryVersion: result.deliveryVersion || 1,
+                groupId,
+              },
+            });
+            return jsonResponse({ ...result, sequenceNumber: rtEvent.sequenceNumber }, 200);
+          }
+
+          return jsonResponse(result, 200);
+        } catch (err: any) {
+          const isForbidden = String(err?.message || '').startsWith('Forbidden:');
+          return errorResponse(
+            err?.message || 'Group scan failed',
+            isForbidden ? 403 : 400,
+            isForbidden ? 'FORBIDDEN' : 'BAD_REQUEST'
+          );
         }
       }
     }

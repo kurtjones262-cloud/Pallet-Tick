@@ -8,13 +8,9 @@ import {
   PendingQuantityConfirmation,
   SupplierRuleId,
   SupplierRuleDefinition,
+  PartScanAttribution,
 } from '../types/delivery';
-import {
-  generate200PartDelivery,
-  generate45PartDelivery,
-  generate15PartDelivery,
-  DEFAULT_APP_SETTINGS,
-} from './sampleData';
+import { DEFAULT_APP_SETTINGS } from './sampleData';
 import {
   saveDeliveryToIndexedDb,
   deleteDeliveryFromIndexedDb,
@@ -25,6 +21,8 @@ import {
   apiFetchDeliveries,
   apiCreateDelivery,
   apiUpdateDelivery,
+  apiDeleteDelivery,
+  apiClearAllDeliveries,
   apiReceivePart,
   apiMigrateDeliveries,
   apiAddDeliveryPart,
@@ -198,19 +196,13 @@ export function getStoredDeliveries(): Delivery[] {
   try {
     const raw = localStorage.getItem(DELIVERIES_KEY);
     if (!raw) {
-      const initial = [generate200PartDelivery(), generate45PartDelivery(), generate15PartDelivery()];
-      saveStoredDeliveries(initial);
-      setActiveDeliveryId(initial[0].id);
-      return initial;
+      return [];
     }
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) {
+    if (Array.isArray(parsed)) {
       return parsed.map(normalizeDeliveryDocketNumbers);
     }
-    const initial = [generate200PartDelivery(), generate45PartDelivery(), generate15PartDelivery()];
-    saveStoredDeliveries(initial);
-    setActiveDeliveryId(initial[0].id);
-    return initial;
+    return [];
   } catch (e) {
     console.error('Failed to load deliveries from storage:', e);
     return [];
@@ -222,7 +214,8 @@ let isSyncingCentralDb = false;
 /**
  * Synchronises local deliveries with the centralised Cloudflare D1 / Worker backend.
  * Retains IndexedDB and localStorage as local cache, flushes pending offline scans first,
- * preserves newer local versions, preserves docket photo attachments, and prevents duplicates.
+ * trusts empty central DB arrays (0 dockets stays 0 dockets), and preserves only genuine
+ * offline-created pendingSync records rather than resurrecting deleted/sample dockets.
  */
 export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
   if (isSyncingCentralDb || typeof localStorage === 'undefined') return getStoredDeliveries();
@@ -252,13 +245,14 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
 
     let centralList = await apiFetchDeliveries();
 
-    // 2. Ensure any locally created deliveries (e.g. uploaded while offline) are migrated to central D1
-    if (locals.length > 0) {
+    // 2. Only upload locally created deliveries that were explicitly queued offline (`pendingSync === true`)
+    const pendingLocalCreations = locals.filter((loc: any) => Boolean(loc?.pendingSync));
+    if (pendingLocalCreations.length > 0) {
       const centralIds = new Set((centralList || []).map((d) => d.id));
       const centralDockets = new Set(
         (centralList || []).map((d) => (d.docketNumber || '').trim().toLowerCase())
       );
-      const unmigratedLocals = locals.filter(
+      const unmigratedLocals = pendingLocalCreations.filter(
         (loc) =>
           !centralIds.has(loc.id) &&
           !centralDockets.has((loc.docketNumber || '').trim().toLowerCase())
@@ -273,7 +267,7 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
       }
     }
 
-    if (Array.isArray(centralList) && centralList.length > 0) {
+    if (Array.isArray(centralList)) {
       const seenMergedIds = new Set<string>();
       const seenMergedDockets = new Set<string>();
       const mergedList: Delivery[] = [];
@@ -304,7 +298,6 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
           localVersion > centralVersion ||
           (localVersion === centralVersion && localTime > centralTime);
 
-        // Merge parts: preserve newer part versions or pendingSync flags
         const localPartsById = new Map(matchingLocal.parts.map((p) => [p.id, p]));
         const localPartsByKey = new Map(
           matchingLocal.parts.map((p) => [
@@ -335,7 +328,6 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
           return cPart;
         });
 
-        // Preserve any locally added parts that have not yet appeared in central
         const centralPartIds = new Set(mergedParts.map((p) => p.id));
         for (const lPart of matchingLocal.parts) {
           if (!centralPartIds.has(lPart.id) && (lPart.manuallyEdited || lPart.pendingSync)) {
@@ -343,7 +335,6 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
           }
         }
 
-        // Merge scanHistory without duplicates
         const historyMap = new Map<string, any>();
         for (const ev of normalized.scanHistory || []) {
           if (ev?.id) historyMap.set(ev.id, ev);
@@ -375,8 +366,8 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
         });
       }
 
-      // Keep any local deliveries that still haven't been pushed (e.g. if user is unauthenticated)
-      for (const loc of locals) {
+      // Preserve ONLY unsynced offline-created deliveries (not already-deleted server dockets!)
+      for (const loc of pendingLocalCreations) {
         const locDocket = (loc.docketNumber || '').trim().toLowerCase();
         if (
           !seenMergedIds.has(loc.id) &&
@@ -386,6 +377,18 @@ export async function syncDeliveriesFromCentralDatabase(): Promise<Delivery[]> {
           if (locDocket) seenMergedDockets.add(locDocket);
           mergedList.push(normalizeDeliveryDocketNumbers(loc));
         }
+      }
+
+      if (mergedList.length === 0) {
+        saveStoredDeliveries([]);
+        localStorage.removeItem(ACTIVE_DELIVERY_KEY);
+        if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
+          clearAllIndexedDb().catch(() => {});
+        }
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('parttrack_active_delivery_changed', { detail: null }));
+        }
+        return [];
       }
 
       saveStoredDeliveries(mergedList);
@@ -662,6 +665,56 @@ export function updateDelivery(updated: Delivery): void {
 }
 
 
+/**
+ * Authoritatively creates a delivery in the central DB first so duplicate docket checks (409)
+ * are enforced immediately; falls back to queued offline creation ONLY if offline/network error.
+ */
+export async function addDeliveryAuthoritative(newDelivery: Delivery): Promise<Delivery> {
+  const deliveries = getStoredDeliveries();
+  const normDocket = (newDelivery.docketNumber || '').trim().toUpperCase();
+  const localDuplicate = deliveries.find(
+    (d) => (d.docketNumber || '').trim().toUpperCase() === normDocket
+  );
+  if (localDuplicate) {
+    const err: any = new Error(
+      `Duplicate docket: Docket "${newDelivery.docketNumber}" already exists.`
+    );
+    err.status = 409;
+    err.code = 'DUPLICATE_DOCKET';
+    throw err;
+  }
+
+  let saved: Delivery;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw Object.assign(new Error('Offline'), { isOffline: true });
+    }
+    const created = await apiCreateDelivery(newDelivery);
+    saved = normalizeDeliveryDocketNumbers({
+      ...newDelivery,
+      ...created,
+      docketAttachments:
+        newDelivery.docketAttachments?.length > 0
+          ? newDelivery.docketAttachments
+          : created.docketAttachments || [],
+    });
+  } catch (err: any) {
+    if (err?.status === 409 || err?.status === 400 || err?.status === 403 || err?.code === 'DUPLICATE_DOCKET') {
+      throw err;
+    }
+    saved = normalizeDeliveryDocketNumbers({
+      ...newDelivery,
+      pendingSync: true,
+    } as any);
+  }
+
+  const current = getStoredDeliveries().filter((d) => d.id !== saved.id);
+  const next = [saved, ...current];
+  saveStoredDeliveries(next);
+  saveDeliveryToIndexedDb(saved).catch(console.error);
+  return saved;
+}
+
 export function deleteDelivery(id: string): void {
   const deliveries = getStoredDeliveries();
   const filtered = deliveries.filter((d) => d.id !== id);
@@ -673,8 +726,25 @@ export function deleteDelivery(id: string): void {
       setActiveDeliveryId(filtered[0].id);
     } else {
       localStorage.removeItem(ACTIVE_DELIVERY_KEY);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('parttrack_active_delivery_changed', { detail: null }));
+      }
     }
   }
+}
+
+export async function deleteDeliveryAuthoritative(id: string): Promise<void> {
+  await apiDeleteDelivery(id);
+  deleteDelivery(id);
+}
+
+export async function clearAllDocketsAuthoritative(): Promise<{
+  deletedDeliveries: number;
+  deletedGroups: number;
+}> {
+  const res = await apiClearAllDeliveries();
+  clearAllDeliveries();
+  return res;
 }
 
 /**
@@ -743,6 +813,23 @@ export function setPartStatus(
         : requiredQty
       : 0;
 
+  const updatedUser = getStoredUser();
+  const actorName = updatedUser
+    ? updatedUser.employeeName
+    : 'Workshop Operator';
+  const actorId = updatedUser?.id || 'usr_operator';
+
+  const nextAttributions =
+    status === 'received' && resolvedReceivedQty && resolvedReceivedQty > 0
+      ? mergePartAttributionList(part.scannedByUsers, {
+          userId: actorId,
+          employeeName: actorName,
+          quantityScanned: resolvedReceivedQty,
+          lastScannedAt: now,
+          scanCount: 1,
+        }, 'set')
+      : [];
+
   const updatedPart: DeliveryPart = {
     ...part,
     status,
@@ -754,6 +841,9 @@ export function setPartStatus(
           : 'quantity_mismatch'
         : 'unscanned',
     scannedAt: status === 'received' ? now : undefined,
+    lastScannedById: status === 'received' ? actorId : undefined,
+    lastScannedByName: status === 'received' ? actorName : undefined,
+    scannedByUsers: nextAttributions,
     scannedVia: status === 'received' ? method : undefined,
     scannedCode: status === 'received' ? scannedCode || part.scannedCode : undefined,
   };
@@ -781,6 +871,8 @@ export function setPartStatus(
     receivedQuantity: resolvedReceivedQty,
     previousReceivedQuantity,
     previousStatus,
+    employeeName: actorName,
+    employeeRole: updatedUser?.role,
     message:
       status === 'received'
         ? isQtyMatch
@@ -984,12 +1076,29 @@ export function confirmOcrPalletLabelScan(
   const newTotalScannedQty = existingScannedQty + addedPalletQty;
   const isExactQuantityMatch = newTotalScannedQty === expectedQty;
 
+  const currentUser = getStoredUser();
+  const actorName = currentUser?.employeeName || 'Workshop Operator';
+  const actorId = currentUser?.id || 'usr_operator';
+
   const updatedPart: DeliveryPart = {
     ...targetPart,
     status: 'received',
     receivedQuantity: newTotalScannedQty,
     verificationStatus: isExactQuantityMatch ? 'verified' : 'quantity_mismatch',
     scannedAt: now,
+    lastScannedById: actorId,
+    lastScannedByName: actorName,
+    scannedByUsers: mergePartAttributionList(
+      targetPart.scannedByUsers,
+      {
+        userId: actorId,
+        employeeName: actorName,
+        quantityScanned: addedPalletQty,
+        lastScannedAt: now,
+        scanCount: 1,
+      },
+      'increment'
+    ),
     scannedVia: 'ocr_label',
     scannedCode: params.recognizedPartNumber.trim(),
   };
@@ -1341,6 +1450,105 @@ function doesPartMatchScannedCode(
   }
 
   return { matched: false, matchMode: 'exact-item' };
+}
+
+export function mergePartAttributionList(
+  existing: PartScanAttribution[] | undefined,
+  addition: PartScanAttribution,
+  mode: 'set' | 'increment'
+): PartScanAttribution[] {
+  const list = Array.isArray(existing) ? existing.map((a) => ({ ...a })) : [];
+  if (mode === 'set' && list.length === 0) {
+    return [addition];
+  }
+  const idx = list.findIndex(
+    (a) =>
+      (a.userId && addition.userId && a.userId === addition.userId) ||
+      a.employeeName.toLowerCase() === addition.employeeName.toLowerCase()
+  );
+  if (idx >= 0) {
+    list[idx] = {
+      ...list[idx],
+      quantityScanned:
+        mode === 'increment'
+          ? (list[idx].quantityScanned || 0) + addition.quantityScanned
+          : Math.max(list[idx].quantityScanned || 0, addition.quantityScanned),
+      lastScannedAt: addition.lastScannedAt,
+      scanCount: (list[idx].scanCount || 0) + Math.max(1, addition.scanCount || 1),
+    };
+  } else {
+    list.push({
+      ...addition,
+      scanCount: Math.max(1, addition.scanCount || 1),
+    });
+  }
+  return list;
+}
+
+export interface ScopedPartMatch {
+  delivery: Delivery;
+  part: DeliveryPart;
+  matchMode: 'exact-part' | 'docket-no' | 'exact-item';
+  detectedType: 'qr' | 'barcode';
+  alreadyFullyScanned: boolean;
+}
+
+/**
+ * Matches a scanned barcode or QR code strictly within a single delivery.
+ */
+export function findMatchingPartsInDelivery(
+  delivery: Delivery,
+  rawCode: string
+): ScopedPartMatch[] {
+  const cleaned = rawCode.trim().replace(/^\*+|\*+$/g, '').trim();
+  if (!cleaned || !delivery) return [];
+  const normalizedInput = cleaned.toUpperCase();
+  const parsedBarcode = parseBarcodeDocketNo(cleaned);
+  const supplierRule = getDeliverySupplierRule(delivery);
+  const matches: ScopedPartMatch[] = [];
+
+  for (const part of delivery.parts) {
+    const check = doesPartMatchScannedCode(
+      part,
+      normalizedInput,
+      parsedBarcode,
+      supplierRule.id
+    );
+    if (check.matched) {
+      const detectedType: 'qr' | 'barcode' =
+        check.matchMode === 'exact-part' ? 'qr' : 'barcode';
+      const req = Math.max(1, part.quantity ?? 1);
+      const rec =
+        part.status === 'received'
+          ? typeof part.receivedQuantity === 'number'
+            ? part.receivedQuantity
+            : req
+          : 0;
+      matches.push({
+        delivery,
+        part,
+        matchMode: check.matchMode,
+        detectedType,
+        alreadyFullyScanned: part.status === 'received' && rec >= req,
+      });
+    }
+  }
+  return matches;
+}
+
+/**
+ * Matches a scanned barcode or QR code strictly within the dockets belonging to a Docket Group.
+ */
+export function findMatchingPartsInGroup(
+  groupDeliveries: Delivery[],
+  rawCode: string
+): ScopedPartMatch[] {
+  const results: ScopedPartMatch[] = [];
+  for (const del of groupDeliveries) {
+    const sub = findMatchingPartsInDelivery(del, rawCode);
+    results.push(...sub);
+  }
+  return results;
 }
 
 export function processScannedCode(
@@ -1791,6 +1999,24 @@ export async function commitScanPartAuthoritative(
         : enteredQty;
     const isCorrectQuantity = committedRecQty === requiredQuantity;
 
+    const currentUser = getStoredUser();
+    const fallbackActorName = currentUser?.employeeName || 'Workshop Operator';
+    const fallbackActorId = currentUser?.id || 'usr_operator';
+    const resolvedAttributions =
+      Array.isArray(res.part?.scannedByUsers) && res.part!.scannedByUsers!.length > 0
+        ? res.part!.scannedByUsers
+        : mergePartAttributionList(
+            pending.part.scannedByUsers,
+            {
+              userId: fallbackActorId,
+              employeeName: res.scanEvent?.employeeName || fallbackActorName,
+              quantityScanned: mode === 'increment' ? enteredQty : committedRecQty,
+              lastScannedAt: now,
+              scanCount: 1,
+            },
+            mode
+          );
+
     const updatedPart: DeliveryPart = {
       ...pending.part,
       ...(res.part || {}),
@@ -1798,6 +2024,9 @@ export async function commitScanPartAuthoritative(
       receivedQuantity: committedRecQty,
       verificationStatus: isCorrectQuantity ? 'verified' : 'quantity_mismatch',
       scannedAt: res.part?.scannedAt || now,
+      lastScannedById: res.part?.lastScannedById || fallbackActorId,
+      lastScannedByName: res.part?.lastScannedByName || res.scanEvent?.employeeName || fallbackActorName,
+      scannedByUsers: resolvedAttributions,
       scannedVia: pending.detectedType,
       scannedCode: pending.code,
       pendingSync: false,
@@ -2168,6 +2397,50 @@ export function applyRealtimeEventToDeliveries(
           message: `Updated by ${actor}`,
           deliveryId,
           partId: event.partId,
+        },
+      };
+    }
+
+    case 'delivery:deleted': {
+      const targetId = event.deliveryId || event.payload?.deliveryId;
+      if (!targetId) {
+        return { deliveries: currentDeliveries, changed: false };
+      }
+      const exists = currentDeliveries.some((d) => d.id === targetId);
+      const nextDeliveries = currentDeliveries.filter((d) => d.id !== targetId);
+      if (exists) {
+        saveStoredDeliveries(nextDeliveries);
+        deleteDeliveryFromIndexedDb(targetId).catch(() => {});
+        if (getActiveDeliveryId() === targetId) {
+          if (nextDeliveries.length > 0) {
+            setActiveDeliveryId(nextDeliveries[0].id);
+          } else {
+            localStorage.removeItem(ACTIVE_DELIVERY_KEY);
+          }
+        }
+      }
+      return {
+        deliveries: nextDeliveries,
+        changed: exists,
+        notification: exists
+          ? {
+              type: 'warning',
+              title: `Docket Deleted`,
+              message: `${actor} removed a completed docket`,
+            }
+          : undefined,
+      };
+    }
+
+    case 'deliveries:cleared': {
+      clearAllDeliveries();
+      return {
+        deliveries: [],
+        changed: currentDeliveries.length > 0,
+        notification: {
+          type: 'warning',
+          title: 'All Dockets Cleared',
+          message: `${actor} cleared all dockets across the system`,
         },
       };
     }

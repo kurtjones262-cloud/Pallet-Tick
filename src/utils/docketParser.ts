@@ -165,6 +165,7 @@ export function parseIndustrialDocketText(
     supplier: string;
     supplierProfile: SupplierRuleId;
     docketNumber: string;
+    hasExplicitDocketNumber: boolean;
     deliveryDate: string;
     carrier?: string;
     palletCount?: number;
@@ -181,6 +182,9 @@ export function parseIndustrialDocketText(
   }));
   const fullText = normalizedLines.map((l) => l.text).join('\n');
 
+  const detectedLayout = detectTableColumnLayout(normalizedLines);
+  const tableHeaderIdx = detectedLayout?.headerLineIndex;
+
   // 1. Supplier & Profile Detection
   const detectedSupplier = extractSupplier(normalizedLines, supplierHint);
   const supplierProfile: SupplierRuleId =
@@ -189,8 +193,12 @@ export function parseIndustrialDocketText(
       ? 'gci'
       : 'laser_central');
 
-  // 2. Docket Number / Packing Slip Reference Extraction
-  const docketNumber = extractDocketNumber(normalizedLines, supplierProfile);
+  // 2. Docket Number / Packing Slip Reference Extraction (strictly above table rows when header exists)
+  const { docketNumber, hasExplicitDocketNumber } = extractDocketNumberWithConfidence(
+    normalizedLines,
+    supplierProfile,
+    tableHeaderIdx
+  );
 
   // 3. Delivery Date
   const deliveryDate = extractDate(normalizedLines);
@@ -218,6 +226,7 @@ export function parseIndustrialDocketText(
       supplier: detectedSupplier,
       supplierProfile,
       docketNumber,
+      hasExplicitDocketNumber,
       deliveryDate,
       carrier,
       palletCount,
@@ -230,9 +239,291 @@ export function parseIndustrialDocketText(
   };
 }
 
+function buildDocketFromSegmentPages(
+  segPages: Array<{ pageIndex: number; parsed: ReturnType<typeof parseIndustrialDocketText> }>,
+  options: {
+    method: 'tesseract-ocr' | 'offline-ocr' | 'pdf-text';
+    engineLabel: string;
+    processingTimeMs?: number;
+    ocrTimeMs?: number;
+    parseTimeMs?: number;
+    pagesFromCache?: number;
+    explicitDocketNumber: string;
+    separationUncertain: boolean;
+    separationReason?: string;
+  }
+): ExtractedDocketResult & { validationReport: DocketValidationReport } {
+  const primaryHeader =
+    segPages.find((p) => p.parsed.header.hasExplicitDocketNumber)?.parsed.header ||
+    segPages[0].parsed.header;
+
+  const combinedItems: ExtractedDocketItem[] = [];
+  let itemCounter = 1;
+  let totalUnparsedCandidates = 0;
+
+  for (const { parsed } of segPages) {
+    totalUnparsedCandidates += parsed.unparsedCandidateCount || 0;
+    for (const it of parsed.items) {
+      const resolvedItemNo = it.itemNumber || String(itemCounter);
+      const revVal = it.revision || it.rev || undefined;
+      combinedItems.push({
+        ...it,
+        itemNumber: resolvedItemNo,
+        revision: revVal,
+        rev: revVal,
+        originalOcrValues: it.originalOcrValues || {
+          partNumber: it.partNumber,
+          itemNumber: resolvedItemNo,
+          description: it.description,
+          revision: revVal,
+          rev: revVal,
+          quantity: Math.max(1, it.quantity || 1),
+          material: it.material,
+          thickness: it.thickness,
+        },
+      });
+      itemCounter++;
+    }
+  }
+
+  const validationReport = validateDocketExtractionQuality(
+    combinedItems,
+    totalUnparsedCandidates
+  );
+
+  let maxPalletNum = primaryHeader.palletCount || 1;
+  for (const it of combinedItems) {
+    const m = String(it.palletNumber || '').match(/(\d+)/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (!Number.isNaN(n) && n > maxPalletNum && n <= 50) {
+        maxPalletNum = n;
+      }
+    }
+  }
+
+  const numericNos = combinedItems
+    .map((it) => parseInt(String(it.itemNumber || '').replace(/\D+/g, ''), 10))
+    .filter((n) => !Number.isNaN(n) && n > 0 && n <= 2000)
+    .sort((a, b) => a - b);
+
+  const sourcePageNumbers = segPages.map((p) => p.pageIndex + 1);
+
+  return {
+    docketNumber: options.explicitDocketNumber || primaryHeader.docketNumber,
+    supplier: primaryHeader.supplier,
+    deliveryDate: primaryHeader.deliveryDate,
+    carrier: primaryHeader.carrier,
+    palletCount: maxPalletNum,
+    orderNumber: primaryHeader.orderNumber,
+    items: combinedItems,
+    confidenceScore: options.separationUncertain
+      ? Math.min(79, validationReport.overallConfidenceScore)
+      : validationReport.overallConfidenceScore,
+    needsManualReview:
+      options.separationUncertain ||
+      !validationReport.isAcceptableWithoutFallback ||
+      validationReport.flaggedRowCount > 0,
+    separationUncertain: options.separationUncertain,
+    separationReason: options.separationReason,
+    sourcePageNumbers,
+    rawTextSummary: segPages.map((p) => p.parsed.rawText).join('\n--- PAGE BREAK ---\n'),
+    extractionMethod: options.method,
+    extractionEngineLabel: options.engineLabel,
+    pagesScanned: segPages.length,
+    pagesFromCache: options.pagesFromCache,
+    processingTimeMs: options.processingTimeMs,
+    ocrTimeMs: options.ocrTimeMs,
+    parseTimeMs: options.parseTimeMs,
+    validationFlags: [
+      ...(options.separationUncertain && options.separationReason ? [options.separationReason] : []),
+      ...validationReport.flagsSummary,
+    ],
+    missingRowNumbers: validationReport.missingRowNumbers,
+    flaggedRowCount: validationReport.flaggedRowCount,
+    hasPrintedNoColumn: numericNos.length > 0,
+    firstVisibleRowNo: numericNos.length > 0 ? numericNos[0] : undefined,
+    lastVisibleRowNo: numericNos.length > 0 ? numericNos[numericNos.length - 1] : undefined,
+    validationReport,
+  };
+}
+
+function getPageRowRange(parsed: ReturnType<typeof parseIndustrialDocketText>): {
+  minNo?: number;
+  maxNo?: number;
+} {
+  let minNo: number | undefined;
+  let maxNo: number | undefined;
+  for (const it of parsed.items) {
+    const n = parseInt(String(it.itemNumber || '').replace(/\D+/g, ''), 10);
+    if (!Number.isNaN(n) && n > 0 && n <= 2000) {
+      minNo = minNo === undefined ? n : Math.min(minNo, n);
+      maxNo = maxNo === undefined ? n : Math.max(maxNo, n);
+    }
+  }
+  return { minNo, maxNo };
+}
+
 /**
- * Combines parsed results across multiple docket pages into a unified compiled list
- * and runs strict row completeness and sequence validation.
+ * Segments parsed pages into independent delivery dockets.
+ * - Pages sharing the same explicit docket number stay grouped together.
+ * - Distinct explicit docket numbers are NEVER auto-merged.
+ * - Multi-file uploads without explicit docket numbers split conservatively and flag for manual review.
+ */
+export function segmentParsedPagesIntoDockets(
+  pageResults: Array<ReturnType<typeof parseIndustrialDocketText>>,
+  options?: {
+    extractionMethod?: 'tesseract-ocr' | 'offline-ocr' | 'pdf-text';
+    extractionEngineLabel?: string;
+    processingTimeMs?: number;
+    ocrTimeMs?: number;
+    parseTimeMs?: number;
+    pagesFromCache?: number;
+    sourceFileIds?: string[];
+  }
+): Array<ExtractedDocketResult & { validationReport: DocketValidationReport }> {
+  const method = options?.extractionMethod || 'tesseract-ocr';
+  const engineLabel = options?.extractionEngineLabel || 'Tesseract.js OCR';
+  const sourceFileIds = options?.sourceFileIds;
+  const normKey = (s: string) => s.trim().toUpperCase().replace(/\s+/g, '');
+
+  interface PageSegment {
+    docketKey: string;
+    explicitDocketNumber: string;
+    hasExplicitDocketNumber: boolean;
+    supplier: string;
+    supplierProfile: SupplierRuleId;
+    orderNumber?: string;
+    sourceFileId?: string;
+    maxRowSeen: number;
+    separationUncertain: boolean;
+    separationReason?: string;
+    pages: Array<{ pageIndex: number; parsed: ReturnType<typeof parseIndustrialDocketText> }>;
+  }
+
+  const segments: PageSegment[] = [];
+
+  for (let idx = 0; idx < pageResults.length; idx++) {
+    const page = pageResults[idx];
+    const hasExplicit = Boolean(page.header.hasExplicitDocketNumber);
+    const key = hasExplicit ? normKey(page.header.docketNumber) : '';
+    const fileId = sourceFileIds?.[idx];
+    const { minNo, maxNo } = getPageRowRange(page);
+
+    if (segments.length === 0) {
+      segments.push({
+        docketKey: hasExplicit ? key : page.header.docketNumber,
+        explicitDocketNumber: page.header.docketNumber,
+        hasExplicitDocketNumber: hasExplicit,
+        supplier: page.header.supplier,
+        supplierProfile: page.header.supplierProfile,
+        orderNumber: page.header.orderNumber,
+        sourceFileId: fileId,
+        maxRowSeen: maxNo || 0,
+        separationUncertain: !hasExplicit && pageResults.length > 1,
+        separationReason:
+          !hasExplicit && pageResults.length > 1
+            ? 'Docket number could not be confidently read on Page 1 — please verify page boundaries.'
+            : undefined,
+        pages: [{ pageIndex: idx, parsed: page }],
+      });
+      continue;
+    }
+
+    if (hasExplicit) {
+      const existingSame = segments.find(
+        (seg) => seg.hasExplicitDocketNumber && seg.docketKey === key
+      );
+      if (existingSame) {
+        existingSame.pages.push({ pageIndex: idx, parsed: page });
+        existingSame.maxRowSeen = Math.max(existingSame.maxRowSeen, maxNo || 0);
+        if (!existingSame.orderNumber && page.header.orderNumber) {
+          existingSame.orderNumber = page.header.orderNumber;
+        }
+      } else {
+        segments.push({
+          docketKey: key,
+          explicitDocketNumber: page.header.docketNumber,
+          hasExplicitDocketNumber: true,
+          supplier: page.header.supplier,
+          supplierProfile: page.header.supplierProfile,
+          orderNumber: page.header.orderNumber,
+          sourceFileId: fileId,
+          maxRowSeen: maxNo || 0,
+          separationUncertain: false,
+          pages: [{ pageIndex: idx, parsed: page }],
+        });
+      }
+      continue;
+    }
+
+    // Current page has NO explicit docket number
+    const prevSeg = segments[segments.length - 1];
+    const rowResetDetected = minNo !== undefined && minNo <= 2 && prevSeg.maxRowSeen >= 3;
+    const orderChanged = Boolean(
+      page.header.orderNumber && prevSeg.orderNumber && page.header.orderNumber !== prevSeg.orderNumber
+    );
+    const supplierChanged = Boolean(
+      page.header.supplierProfile &&
+        prevSeg.supplierProfile &&
+        page.header.supplierProfile !== prevSeg.supplierProfile
+    );
+    const distinctSourceFile = Boolean(fileId && prevSeg.sourceFileId && fileId !== prevSeg.sourceFileId);
+
+    const shouldSplitUncertain =
+      rowResetDetected || orderChanged || supplierChanged || distinctSourceFile;
+
+    if (shouldSplitUncertain) {
+      const reason = distinctSourceFile
+        ? `Page ${idx + 1} came from a separate uploaded file without a clear docket number. Please confirm whether it is a separate docket or merge it.`
+        : `Page ${idx + 1} appears to start a new docket (${
+            rowResetDetected
+              ? 'row numbering restarted at 1'
+              : orderChanged
+              ? 'order number changed'
+              : 'supplier header changed'
+          }), but no docket number was detected. Please verify.`;
+      prevSeg.separationUncertain = true;
+      prevSeg.separationReason =
+        prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+      const reviewDk = `DK-REVIEW-P${idx + 1}-${Math.floor(100 + Math.random() * 900)}`;
+      segments.push({
+        docketKey: reviewDk,
+        explicitDocketNumber: reviewDk,
+        hasExplicitDocketNumber: false,
+        supplier: page.header.supplier,
+        supplierProfile: page.header.supplierProfile,
+        orderNumber: page.header.orderNumber,
+        sourceFileId: fileId,
+        maxRowSeen: maxNo || 0,
+        separationUncertain: true,
+        separationReason: reason,
+        pages: [{ pageIndex: idx, parsed: page }],
+      });
+    } else {
+      prevSeg.pages.push({ pageIndex: idx, parsed: page });
+      prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, maxNo || 0);
+    }
+  }
+
+  return segments.map((seg) =>
+    buildDocketFromSegmentPages(seg.pages, {
+      method,
+      engineLabel,
+      processingTimeMs: options?.processingTimeMs,
+      ocrTimeMs: options?.ocrTimeMs,
+      parseTimeMs: options?.parseTimeMs,
+      pagesFromCache: options?.pagesFromCache,
+      explicitDocketNumber: seg.explicitDocketNumber,
+      separationUncertain: seg.separationUncertain,
+      separationReason: seg.separationReason,
+    })
+  );
+}
+
+/**
+ * Combines parsed results across multiple docket pages into independent separated docket records
+ * (never auto-merging separate docket numbers) and runs strict validation.
  */
 export function combineMultiPageDocketResults(
   pageResults: Array<ReturnType<typeof parseIndustrialDocketText>>,
@@ -243,6 +534,7 @@ export function combineMultiPageDocketResults(
     ocrTimeMs?: number;
     parseTimeMs?: number;
     pagesFromCache?: number;
+    sourceFileIds?: string[];
   }
 ): ExtractedDocketResult & { validationReport: DocketValidationReport } {
   const method = options?.extractionMethod || 'tesseract-ocr';
@@ -277,92 +569,41 @@ export function combineMultiPageDocketResults(
     };
   }
 
-  const primaryHeader =
-    pageResults.find(
-      (p) =>
-        p.header.docketNumber &&
-        !p.header.docketNumber.startsWith('DK-AUTO') &&
-        !/^DK-\d{5}$/.test(p.header.docketNumber)
-    )?.header || pageResults[0].header;
+  const segmented = segmentParsedPagesIntoDockets(pageResults, options);
+  const primary = segmented[0];
 
-  const combinedItems: ExtractedDocketItem[] = [];
-  let itemCounter = 1;
-  let totalUnparsedCandidates = 0;
-
-  for (const page of pageResults) {
-    totalUnparsedCandidates += page.unparsedCandidateCount || 0;
-    for (const it of page.items) {
-      const resolvedItemNo = it.itemNumber || String(itemCounter);
-      const revVal = it.revision || it.rev || undefined;
-      combinedItems.push({
-        ...it,
-        itemNumber: resolvedItemNo,
-        revision: revVal,
-        rev: revVal,
-        originalOcrValues: it.originalOcrValues || {
-          partNumber: it.partNumber,
-          itemNumber: resolvedItemNo,
-          description: it.description,
-          revision: revVal,
-          rev: revVal,
-          quantity: Math.max(1, it.quantity || 1),
-          material: it.material,
-          thickness: it.thickness,
-        },
-      });
-      itemCounter++;
-    }
-  }
-
-  // Run comprehensive row & document validation
-  const validationReport = validateDocketExtractionQuality(
-    combinedItems,
-    totalUnparsedCandidates
+  // Aggregate validation report across all separated dockets so fallback decision sees overall quality
+  const allMissing = segmented.flatMap((s) => s.validationReport.missingRowNumbers);
+  const allFlaggedCount = segmented.reduce((sum, s) => sum + s.validationReport.flaggedRowCount, 0);
+  const totalUnparsed = segmented.reduce((sum, s) => sum + s.validationReport.unparsedCandidateCount, 0);
+  const minScore = segmented.reduce(
+    (min, s) => Math.min(min, s.validationReport.overallConfidenceScore),
+    100
   );
+  const anyFallback = segmented.some((s) => s.validationReport.shouldFallbackToGemini);
+  const combinedFallbackReason = segmented
+    .map((s) => s.validationReport.fallbackReason)
+    .filter(Boolean)
+    .join('; ');
+  const anyUncertainSplit = segmented.some((s) => s.separationUncertain);
 
-  // Compute max pallet number referenced across items
-  let maxPalletNum = primaryHeader.palletCount || 1;
-  for (const it of combinedItems) {
-    const m = String(it.palletNumber || '').match(/(\d+)/);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (!Number.isNaN(n) && n > maxPalletNum && n <= 50) {
-        maxPalletNum = n;
-      }
-    }
-  }
-
-  const numericNos = combinedItems
-    .map((it) => parseInt(String(it.itemNumber || '').replace(/\D+/g, ''), 10))
-    .filter((n) => !Number.isNaN(n) && n > 0 && n <= 2000)
-    .sort((a, b) => a - b);
+  const aggregatedReport: DocketValidationReport = {
+    isAcceptableWithoutFallback: !anyFallback,
+    shouldFallbackToGemini: anyFallback,
+    fallbackReason: combinedFallbackReason || undefined,
+    overallConfidenceScore: minScore,
+    missingRowNumbers: allMissing,
+    unparsedCandidateCount: totalUnparsed,
+    flaggedRowCount: allFlaggedCount,
+    flagsSummary: Array.from(new Set(segmented.flatMap((s) => s.validationReport.flagsSummary))),
+  };
 
   return {
-    docketNumber: primaryHeader.docketNumber,
-    supplier: primaryHeader.supplier,
-    deliveryDate: primaryHeader.deliveryDate,
-    carrier: primaryHeader.carrier,
-    palletCount: maxPalletNum,
-    orderNumber: primaryHeader.orderNumber,
-    items: combinedItems,
-    confidenceScore: validationReport.overallConfidenceScore,
-    needsManualReview:
-      !validationReport.isAcceptableWithoutFallback || validationReport.flaggedRowCount > 0,
-    rawTextSummary: pageResults.map((p) => p.rawText).join('\n--- PAGE BREAK ---\n'),
-    extractionMethod: method,
-    extractionEngineLabel: engineLabel,
+    ...primary,
     pagesScanned: pageResults.length,
-    pagesFromCache: options?.pagesFromCache,
-    processingTimeMs: options?.processingTimeMs,
-    ocrTimeMs: options?.ocrTimeMs,
-    parseTimeMs: options?.parseTimeMs,
-    validationFlags: validationReport.flagsSummary,
-    missingRowNumbers: validationReport.missingRowNumbers,
-    flaggedRowCount: validationReport.flaggedRowCount,
-    hasPrintedNoColumn: numericNos.length > 0,
-    firstVisibleRowNo: numericNos.length > 0 ? numericNos[0] : undefined,
-    lastVisibleRowNo: numericNos.length > 0 ? numericNos[numericNos.length - 1] : undefined,
-    validationReport,
+    needsManualReview: primary.needsManualReview || anyUncertainSplit,
+    separatedDockets: segmented.map(({ validationReport: _vr, ...docket }) => docket),
+    validationReport: aggregatedReport,
   };
 }
 
@@ -659,8 +900,16 @@ function extractSupplier(lines: RawOcrLine[], supplierHint?: SupplierRuleId): st
   return 'Laser Central';
 }
 
-function extractDocketNumber(lines: RawOcrLine[], supplierProfile: SupplierRuleId): string {
-  const topLines = lines.slice(0, 22);
+function extractDocketNumberWithConfidence(
+  lines: RawOcrLine[],
+  supplierProfile: SupplierRuleId,
+  tableHeaderLineIndex?: number
+): { docketNumber: string; hasExplicitDocketNumber: boolean } {
+  const headerLimit =
+    typeof tableHeaderLineIndex === 'number' && tableHeaderLineIndex >= 0
+      ? Math.min(22, tableHeaderLineIndex)
+      : Math.min(lines.length, 22);
+  const topLines = lines.slice(0, headerLimit);
   const topText = topLines.map((l) => l.text).join(' \n ');
 
   // 1. Line-by-line explicit labeled docket / delivery note / packing slip / invoice number
@@ -679,7 +928,7 @@ function extractDocketNumber(lines: RawOcrLine[], supplierProfile: SupplierRuleI
           candidate
         )
       ) {
-        return candidate;
+        return { docketNumber: candidate, hasExplicitDocketNumber: true };
       }
     }
   }
@@ -688,28 +937,37 @@ function extractDocketNumber(lines: RawOcrLine[], supplierProfile: SupplierRuleI
   for (const ln of topLines) {
     const jobMatch = ln.text.match(/(?:^|\||\s)(\d{5,8})\s*\|\s*(?:20\d{2}|\d{1,2}[/-]\d{1,2})/);
     if (jobMatch && jobMatch[1]) {
-      return jobMatch[1];
+      return { docketNumber: jobMatch[1], hasExplicitDocketNumber: true };
     }
   }
 
-  // 2. Prefixed docket / invoice / Laser Central / GCI reference
+  // 2. Prefixed docket / invoice / Laser Central / GCI reference (header block only)
   const standaloneMatch = topText.match(
     /\b((?:DK|DN|PS|DEL|INV|LC|GCI|SO)-[A-Z0-9\-]{3,16})\b/i
   );
   if (standaloneMatch) {
-    return standaloneMatch[1].toUpperCase();
+    return { docketNumber: standaloneMatch[1].toUpperCase(), hasExplicitDocketNumber: true };
   }
 
-  // 3. Laser Central 6-digit docket barcode prefix if visible in lines (e.g. "894201-1" -> "894201")
+  // 3. Laser Central 6-digit docket barcode prefix if visible in header or standalone barcode lines (e.g. "894201-1" -> "894201")
   if (supplierProfile === 'laser_central') {
-    const fullText = lines.map((l) => l.text).join(' ');
-    const lcBarcodePrefix = fullText.match(/\b(\d{5,8})-0*1\b/);
+    const barcodeSearchText =
+      headerLimit > 0
+        ? lines.map((l) => l.text).join(' ')
+        : lines
+            .filter((l) => /^\s*\*?\d{5,8}-0*1\*?\s*$/i.test(l.text.trim()))
+            .map((l) => l.text)
+            .join(' ');
+    const lcBarcodePrefix = barcodeSearchText.match(/\b(\d{5,8})-0*1\b/);
     if (lcBarcodePrefix) {
-      return `DK-${lcBarcodePrefix[1]}`;
+      return { docketNumber: `DK-${lcBarcodePrefix[1]}`, hasExplicitDocketNumber: true };
     }
   }
 
-  return `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+  return {
+    docketNumber: `DK-${Math.floor(10000 + Math.random() * 90000)}`,
+    hasExplicitDocketNumber: false,
+  };
 }
 
 function extractDate(lines: RawOcrLine[]): string {

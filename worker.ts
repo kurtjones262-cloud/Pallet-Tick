@@ -363,13 +363,15 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   }
 
   const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array. Never invent, guess, or fabricate parts or quantities. If blank, return items: [].`;
+Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array. Never invent, guess, or fabricate parts or quantities. If blank, return items: [].
+CRITICAL MULTI-DOCKET RULE: Uploaded pages may contain MULTIPLE SEPARATE delivery dockets OR a multi-page single docket. Populate 'pageHeaders' for EVERY page (${pageDescriptions.join(', ')}) with the exact printed docketNumber / delivery note / packing slip / invoice # visible on that page.`;
 
   const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in the table.
 Rules:
-1. Extract every numbered part row from top to bottom.
-2. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
-3. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
+1. For EVERY page 1..${totalPages}, record an entry in 'pageHeaders' with: page, docketNumber (exact printed docket/delivery/invoice number if visible on that page, else ""), supplier, deliveryDate (YYYY-MM-DD if visible), orderNumber, and startsNewDocket (true if this page clearly begins a new docket/header).
+2. Extract every numbered part row from top to bottom.
+3. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
+4. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
 
   parts.push({ text: promptText });
 
@@ -382,6 +384,23 @@ Rules:
       orderNumber: { type: 'STRING' },
       carrier: { type: 'STRING' },
       palletCount: { type: 'INTEGER' },
+      pageHeaders: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            page: { type: 'INTEGER' },
+            docketNumber: { type: 'STRING' },
+            supplier: { type: 'STRING' },
+            deliveryDate: { type: 'STRING' },
+            orderNumber: { type: 'STRING' },
+            carrier: { type: 'STRING' },
+            palletCount: { type: 'INTEGER' },
+            startsNewDocket: { type: 'BOOLEAN' },
+          },
+          required: ['page'],
+        },
+      },
       items: {
         type: 'ARRAY',
         items: {
@@ -414,57 +433,266 @@ Rules:
   );
 
   const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
+  const rawPageHeaders: any[] = Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [];
 
-  const items = rawItems.map((it: any, idx: number) => {
-    const cleanNo = parseCleanRowNo(it.no) || String(idx + 1);
-    const rawQty = Number(it.qty);
-    const qty = !Number.isNaN(rawQty) && rawQty >= 1 ? Math.round(rawQty) : 1;
-    const partNumber = String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase();
-    const description = String(it.desc || it.part || '').trim();
-    const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
-    const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
-    const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+  interface WorkerPageMeta {
+    pageNumber: number;
+    explicitDocketNumber: string;
+    supplier?: string;
+    deliveryDate?: string;
+    orderNumber?: string;
+    carrier?: string;
+    palletCount?: number;
+    startsNewDocket?: boolean;
+    rawItems: any[];
+    minRowNo?: number;
+    maxRowNo?: number;
+  }
 
-    return {
-      partNumber,
-      itemNumber: cleanNo,
-      description,
-      revision,
-      material,
-      thickness,
-      dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
-      weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
-      quantity: qty,
-      palletNumber: 'Pallet 1',
-      pageNumber: Number(it.page) || 1,
-      confidence: 'high',
-      originalOcrValues: {
+  const pageMetaMap = new Map<number, WorkerPageMeta>();
+  for (let p = 1; p <= totalPages; p++) {
+    pageMetaMap.set(p, { pageNumber: p, explicitDocketNumber: '', rawItems: [] });
+  }
+
+  for (const ph of rawPageHeaders) {
+    const pNum = Math.min(totalPages, Math.max(1, Number(ph?.page) || 1));
+    const meta = pageMetaMap.get(pNum)!;
+    const dn = String(ph?.docketNumber || '').trim();
+    if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
+    if (ph?.supplier && String(ph.supplier).trim() && !meta.supplier) {
+      meta.supplier = String(ph.supplier).trim();
+    }
+    if (ph?.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(ph.deliveryDate).trim()) && !meta.deliveryDate) {
+      meta.deliveryDate = String(ph.deliveryDate).trim();
+    }
+    if (ph?.orderNumber && String(ph.orderNumber).trim() && !meta.orderNumber) {
+      meta.orderNumber = String(ph.orderNumber).trim();
+    }
+    if (ph?.carrier && String(ph.carrier).trim() && !meta.carrier) {
+      meta.carrier = String(ph.carrier).trim();
+    }
+    if (ph?.palletCount && Number(ph.palletCount) > 0 && !meta.palletCount) {
+      meta.palletCount = Number(ph.palletCount);
+    }
+    if (ph?.startsNewDocket) meta.startsNewDocket = true;
+  }
+
+  const firstMeta = pageMetaMap.get(1)!;
+  if (!firstMeta.explicitDocketNumber && totalPages === 1 && parsed.docketNumber?.trim()) {
+    firstMeta.explicitDocketNumber = String(parsed.docketNumber).trim();
+  } else if (!firstMeta.explicitDocketNumber && rawPageHeaders.length === 0 && parsed.docketNumber?.trim()) {
+    firstMeta.explicitDocketNumber = String(parsed.docketNumber).trim();
+  }
+  if (!firstMeta.supplier && parsed.supplier?.trim()) firstMeta.supplier = String(parsed.supplier).trim();
+  if (!firstMeta.deliveryDate && parsed.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(parsed.deliveryDate).trim())) {
+    firstMeta.deliveryDate = String(parsed.deliveryDate).trim();
+  }
+  if (!firstMeta.orderNumber && parsed.orderNumber?.trim()) firstMeta.orderNumber = String(parsed.orderNumber).trim();
+  if (!firstMeta.carrier && parsed.carrier?.trim()) firstMeta.carrier = String(parsed.carrier).trim();
+
+  for (const rawIt of rawItems) {
+    const pNum = Math.min(totalPages, Math.max(1, Number(rawIt?.page) || 1));
+    const meta = pageMetaMap.get(pNum)!;
+    meta.rawItems.push({ ...rawIt, page: pNum });
+    const nVal = parseInt(parseCleanRowNo(rawIt?.no), 10);
+    if (!Number.isNaN(nVal) && nVal > 0 && nVal <= 1500) {
+      meta.minRowNo = meta.minRowNo === undefined ? nVal : Math.min(meta.minRowNo, nVal);
+      meta.maxRowNo = meta.maxRowNo === undefined ? nVal : Math.max(meta.maxRowNo, nVal);
+    }
+  }
+
+  interface WorkerSegment {
+    docketKey: string;
+    explicitDocketNumber: string;
+    hasExplicitDocketNumber: boolean;
+    supplier: string;
+    deliveryDate: string;
+    carrier?: string;
+    orderNumber?: string;
+    palletCount: number;
+    pageNumbers: number[];
+    maxRowSeen: number;
+    rawItems: any[];
+    separationUncertain: boolean;
+    separationReason?: string;
+  }
+
+  const segments: WorkerSegment[] = [];
+  const normDocketKey = (s: string) => s.trim().toUpperCase().replace(/\s+/g, '');
+
+  for (let p = 1; p <= totalPages; p++) {
+    const meta = pageMetaMap.get(p)!;
+    const explicitKey = normDocketKey(meta.explicitDocketNumber);
+    const hasExplicit = explicitKey.length > 0;
+
+    if (segments.length === 0) {
+      const fallbackDk = `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+      segments.push({
+        docketKey: hasExplicit ? explicitKey : fallbackDk,
+        explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
+        hasExplicitDocketNumber: hasExplicit,
+        supplier: meta.supplier || 'Steel Fabrication Supplier',
+        deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: !hasExplicit && totalPages > 1,
+        separationReason:
+          !hasExplicit && totalPages > 1
+            ? 'Docket number not detected on page 1 — verify page boundaries.'
+            : undefined,
+      });
+      continue;
+    }
+
+    if (hasExplicit) {
+      const existingSameDocket = segments.find(
+        (seg) => seg.hasExplicitDocketNumber && seg.docketKey === explicitKey
+      );
+      if (existingSameDocket) {
+        existingSameDocket.pageNumbers.push(p);
+        existingSameDocket.rawItems.push(...meta.rawItems);
+        existingSameDocket.maxRowSeen = Math.max(existingSameDocket.maxRowSeen, meta.maxRowNo || 0);
+        if (!existingSameDocket.carrier && meta.carrier) existingSameDocket.carrier = meta.carrier;
+        if (!existingSameDocket.orderNumber && meta.orderNumber) existingSameDocket.orderNumber = meta.orderNumber;
+        existingSameDocket.palletCount = Math.max(existingSameDocket.palletCount, meta.palletCount || 1);
+      } else {
+        segments.push({
+          docketKey: explicitKey,
+          explicitDocketNumber: meta.explicitDocketNumber,
+          hasExplicitDocketNumber: true,
+          supplier: meta.supplier || 'Steel Fabrication Supplier',
+          deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          separationUncertain: false,
+        });
+      }
+      continue;
+    }
+
+    const prevSeg = segments[segments.length - 1];
+    const rowResetDetected =
+      meta.minRowNo !== undefined && meta.minRowNo <= 2 && prevSeg.maxRowSeen >= 3;
+    const orderChanged =
+      Boolean(meta.orderNumber && prevSeg.orderNumber && meta.orderNumber !== prevSeg.orderNumber);
+    const shouldSplitUncertain = Boolean(meta.startsNewDocket || rowResetDetected || orderChanged);
+
+    if (shouldSplitUncertain) {
+      const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
+      const reason = `Page ${p} appears to start a new docket (${
+        rowResetDetected ? 'row numbering restarted at 1' : orderChanged ? 'order number changed' : 'new header detected'
+      }), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
+      prevSeg.separationUncertain = true;
+      prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+      segments.push({
+        docketKey: fallbackDk,
+        explicitDocketNumber: fallbackDk,
+        hasExplicitDocketNumber: false,
+        supplier: meta.supplier || prevSeg.supplier,
+        deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: true,
+        separationReason: reason,
+      });
+    } else {
+      prevSeg.pageNumbers.push(p);
+      prevSeg.rawItems.push(...meta.rawItems);
+      prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, meta.maxRowNo || 0);
+      prevSeg.palletCount = Math.max(prevSeg.palletCount, meta.palletCount || 1);
+    }
+  }
+
+  const builtDockets = segments.map((seg) => {
+    const items = seg.rawItems.map((it: any, idx: number) => {
+      const cleanNo = parseCleanRowNo(it.no) || String(idx + 1);
+      const rawQty = Number(it.qty);
+      const qty = !Number.isNaN(rawQty) && rawQty >= 1 ? Math.round(rawQty) : 1;
+      const partNumber = String(it.part || it.desc?.slice(0, 24) || 'PART').trim().toUpperCase();
+      const description = String(it.desc || it.part || '').trim();
+      const revision = it.rev && String(it.rev).trim() ? String(it.rev).trim() : undefined;
+      const material = it.mat && String(it.mat).trim() ? String(it.mat).trim() : undefined;
+      const thickness = it.thk && String(it.thk).trim() ? String(it.thk).trim() : undefined;
+
+      return {
         partNumber,
         itemNumber: cleanNo,
         description,
         revision,
-        quantity: qty,
         material,
         thickness,
-      },
+        dimensions: it.dim && String(it.dim).trim() ? String(it.dim).trim() : undefined,
+        weight: it.wt && String(it.wt).trim() ? String(it.wt).trim() : undefined,
+        quantity: qty,
+        palletNumber: 'Pallet 1',
+        pageNumber: Number(it.page) || seg.pageNumbers[0],
+        confidence: 'high',
+        originalOcrValues: {
+          partNumber,
+          itemNumber: cleanNo,
+          description,
+          revision,
+          quantity: qty,
+          material,
+          thickness,
+        },
+      };
+    });
+
+    return {
+      docketNumber: seg.explicitDocketNumber,
+      supplier: seg.supplier,
+      deliveryDate: seg.deliveryDate,
+      carrier: seg.carrier,
+      orderNumber: seg.orderNumber,
+      palletCount: seg.palletCount,
+      items,
+      confidenceScore: items.length > 0 ? (seg.separationUncertain ? 75 : 100) : 0,
+      needsManualReview: items.length === 0 || seg.separationUncertain,
+      separationUncertain: seg.separationUncertain,
+      separationReason: seg.separationReason,
+      sourcePageNumbers: [...seg.pageNumbers],
+      extractionMethod: 'ai-vision',
+      aiModelUsed: modelUsed,
+      fallbackUsed,
+      retryAttempts,
+      pagesScanned: seg.pageNumbers.length,
     };
   });
 
-  const responsePayload = {
+  const primary = builtDockets[0] || {
     docketNumber: String(parsed.docketNumber || `DK-${Math.floor(10000 + Math.random() * 90000)}`).trim(),
     supplier: String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
     deliveryDate: String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
     carrier: parsed.carrier ? String(parsed.carrier).trim() : undefined,
     orderNumber: parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined,
     palletCount: Math.max(1, Number(parsed.palletCount) || 1),
-    items,
-    confidenceScore: items.length > 0 ? 100 : 0,
-    needsManualReview: items.length === 0,
+    items: [],
+    confidenceScore: 0,
+    needsManualReview: true,
     extractionMethod: 'ai-vision',
     aiModelUsed: modelUsed,
     fallbackUsed,
     retryAttempts,
     pagesScanned: totalPages,
+  };
+
+  const responsePayload = {
+    ...primary,
+    pagesScanned: totalPages,
+    separatedDockets: builtDockets,
   };
 
   return new Response(JSON.stringify(responsePayload), {
@@ -679,6 +907,7 @@ export default {
     if (
       url.pathname.startsWith('/api/auth') ||
       url.pathname.startsWith('/api/deliveries') ||
+      url.pathname.startsWith('/api/groups') ||
       url.pathname.startsWith('/api/users') ||
       url.pathname.startsWith('/api/realtime')
     ) {

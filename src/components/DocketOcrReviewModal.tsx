@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Plus,
@@ -12,11 +12,14 @@ import {
   Sparkles,
   FileText,
   RefreshCw,
+  GitMerge,
+  ShieldAlert,
 } from 'lucide-react';
 import { Delivery, DeliveryPart, DocketAttachment, SupplierRuleId } from '../types/delivery';
 import { ExtractedDocketResult, ExtractedDocketItem } from '../server/docketOcr';
 import {
-  updateDelivery,
+  addDeliveryAuthoritative,
+  getStoredDeliveries,
   setActiveDeliveryId,
   saveDocketImages,
   SUPPLIER_RULES,
@@ -29,6 +32,7 @@ import {
 
 interface AttachedPage {
   pageNumber: number;
+  sourceFileId?: string;
   dataUrl: string;
   name?: string;
   textHint?: PageTextHint;
@@ -39,7 +43,78 @@ interface DocketOcrReviewModalProps {
   initialSupplierRule?: SupplierRuleId;
   attachedPages?: AttachedPage[];
   onClose: () => void;
-  onDeliveryCreated: (delivery: Delivery) => void;
+  onDeliveryCreated: (delivery: Delivery | Delivery[]) => void;
+}
+
+interface DocketReviewDraft {
+  draftId: string;
+  docketNumber: string;
+  supplierRule: SupplierRuleId;
+  supplier: string;
+  deliveryDate: string;
+  carrier: string;
+  palletCount: number;
+  orderNumber: string;
+  notes: string;
+  separationUncertain: boolean;
+  separationReason?: string;
+  sourcePageNumbers: number[];
+  items: ExtractedDocketItem[];
+}
+
+function buildInitialDrafts(
+  extractedData: ExtractedDocketResult,
+  initialSupplierRule: SupplierRuleId,
+  attachedPagesCount: number
+): DocketReviewDraft[] {
+  const sourceList =
+    Array.isArray(extractedData.separatedDockets) && extractedData.separatedDockets.length > 0
+      ? extractedData.separatedDockets
+      : [extractedData];
+
+  return sourceList.map((src, idx) => {
+    const rule: SupplierRuleId = /\bgci\b/i.test(src.supplier || '')
+      ? 'gci'
+      : /\bocr\b/i.test(src.supplier || '')
+      ? 'ocr_label'
+      : initialSupplierRule;
+    const defaultPages =
+      Array.isArray(src.sourcePageNumbers) && src.sourcePageNumbers.length > 0
+        ? src.sourcePageNumbers
+        : attachedPagesCount > 0
+        ? Array.from({ length: attachedPagesCount }, (_, i) => i + 1)
+        : [1];
+
+    return {
+      draftId: `draft_${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+      docketNumber: src.docketNumber || `DK-${1001 + idx}`,
+      supplierRule: rule,
+      supplier:
+        src.supplier &&
+        src.supplier !== 'Laser Cutting Supplier' &&
+        src.supplier !== 'Steel Processing Supplier'
+          ? src.supplier
+          : SUPPLIER_RULES[rule].name,
+      deliveryDate: src.deliveryDate || new Date().toISOString().slice(0, 10),
+      carrier: src.carrier || '',
+      palletCount: src.palletCount || 1,
+      orderNumber: src.orderNumber || '',
+      notes: src.notes || '',
+      separationUncertain: Boolean(src.separationUncertain),
+      separationReason: src.separationReason,
+      sourcePageNumbers: defaultPages,
+      items: (src.items || []).map((it) => ({
+        ...it,
+        originalOcrValues: it.originalOcrValues || {
+          partNumber: it.partNumber,
+          itemNumber: it.itemNumber,
+          description: it.description,
+          revision: it.rev || it.revision,
+          quantity: Math.max(1, it.quantity || 1),
+        },
+      })),
+    };
+  });
 }
 
 export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
@@ -49,42 +124,19 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   onClose,
   onDeliveryCreated,
 }) => {
-  const [supplierRule, setSupplierRule] = useState<SupplierRuleId>(
-    /\bgci\b/i.test(extractedData.supplier || '') ? 'gci' : initialSupplierRule
+  const [drafts, setDrafts] = useState<DocketReviewDraft[]>(() =>
+    buildInitialDrafts(extractedData, initialSupplierRule, attachedPages.length)
   );
-  const [docketNumber, setDocketNumber] = useState(extractedData.docketNumber || 'DK-0001');
-  const [supplier, setSupplier] = useState(
-    extractedData.supplier &&
-      extractedData.supplier !== 'Laser Cutting Supplier' &&
-      extractedData.supplier !== 'Steel Processing Supplier'
-      ? extractedData.supplier
-      : SUPPLIER_RULES[initialSupplierRule].name
-  );
-  const [deliveryDate, setDeliveryDate] = useState(
-    extractedData.deliveryDate || new Date().toISOString().slice(0, 10)
-  );
-  const [carrier, setCarrier] = useState(extractedData.carrier || '');
-  const [palletCount, setPalletCount] = useState<number>(extractedData.palletCount || 1);
-  const [orderNumber, setOrderNumber] = useState(extractedData.orderNumber || '');
-  const [notes, setNotes] = useState(extractedData.notes || '');
+  const [activeDraftIdx, setActiveDraftIdx] = useState(0);
+  const safeDraftIdx = Math.min(activeDraftIdx, Math.max(0, drafts.length - 1));
+  const activeDraft = drafts[safeDraftIdx];
 
-  const [items, setItems] = useState<ExtractedDocketItem[]>(() =>
-    (extractedData.items || []).map((it) => ({
-      ...it,
-      originalOcrValues: it.originalOcrValues || {
-        partNumber: it.partNumber,
-        itemNumber: it.itemNumber,
-        description: it.description,
-        revision: it.rev,
-        quantity: Math.max(1, it.quantity || 1),
-      },
-    }))
-  );
   const [filterMode, setFilterMode] = useState<'all' | 'flagged'>('all');
   const [expandQuantities, setExpandQuantities] = useState(false);
 
   const [showPhotoViewer, setShowPhotoViewer] = useState(false);
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
+  const [isSaving, setIsSaving] = useState(false);
 
   // Add Part Modal State inside Review Screen
   const [showAddPartForm, setShowAddPartForm] = useState(false);
@@ -119,21 +171,36 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     validationFlags: extractedData.validationFlags || [],
   });
 
+  const existingStoredDockets = useMemo(() => {
+    const existing = new Set<string>();
+    for (const d of getStoredDeliveries()) {
+      if (d.docketNumber) existing.add(d.docketNumber.trim().toUpperCase());
+    }
+    return existing;
+  }, []);
+
+  const updateActiveDraft = (updater: (draft: DocketReviewDraft) => DocketReviewDraft) => {
+    setDrafts((prev) => prev.map((d, idx) => (idx === safeDraftIdx ? updater(d) : d)));
+  };
+
   const getActorLabel = () => {
     const u = getStoredUser();
     return u ? `${u.employeeName} (${u.employeeCode})` : 'Workshop Operator';
   };
 
   const handleSelectSupplierRule = (ruleId: SupplierRuleId) => {
-    setSupplierRule(ruleId);
-    setSupplier(SUPPLIER_RULES[ruleId].name);
+    updateActiveDraft((d) => ({
+      ...d,
+      supplierRule: ruleId,
+      supplier: SUPPLIER_RULES[ruleId].name,
+    }));
   };
 
   const handleItemChange = (index: number, field: keyof ExtractedDocketItem, value: any) => {
     const actor = getActorLabel();
     const now = new Date().toISOString();
-    setItems((prev) => {
-      const next = [...prev];
+    updateActiveDraft((d) => {
+      const next = [...d.items];
       const current = next[index];
       const origOcr = current.originalOcrValues || {
         partNumber: current.partNumber,
@@ -153,13 +220,13 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       if (field === 'partNumber' || field === 'itemNumber') {
         next[index].confidence = 'high';
       }
-      return next;
+      return { ...d, items: next };
     });
   };
 
   const handleOpenAddPartModal = () => {
     setAddPartError(null);
-    const maxItemNo = items.reduce((max, it, idx) => {
+    const maxItemNo = activeDraft.items.reduce((max, it, idx) => {
       const parsed = parseInt(String(it.itemNumber || '').replace(/\D+/g, ''), 10);
       return Number.isNaN(parsed) ? Math.max(max, idx + 1) : Math.max(max, parsed);
     }, 0);
@@ -194,7 +261,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
 
     const actor = getActorLabel();
     const now = new Date().toISOString();
-    const cleanItemNo = newPartDraft.itemNumber.trim() || String(items.length + 1);
+    const cleanItemNo =
+      newPartDraft.itemNumber.trim() || String(activeDraft.items.length + 1);
 
     const newItem: ExtractedDocketItem = {
       partNumber: cleanPartNo,
@@ -212,13 +280,13 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       lastEditedAt: now,
     };
 
-    const updatedItems = [...items, newItem];
-    setItems(updatedItems);
+    const nextLen = activeDraft.items.length + 1;
+    updateActiveDraft((d) => ({ ...d, items: [...d.items, newItem] }));
 
     if (keepOpenForAnother) {
       const nextNo = parseInt(cleanItemNo.replace(/\D+/g, ''), 10);
       setNewPartDraft({
-        itemNumber: Number.isNaN(nextNo) ? String(updatedItems.length + 1) : String(nextNo + 1),
+        itemNumber: Number.isNaN(nextNo) ? String(nextLen + 1) : String(nextNo + 1),
         partNumber: '',
         description: '',
         rev: '',
@@ -234,15 +302,44 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
 
   const handleConfirmRemoveItem = () => {
     if (pendingDeleteIdx === null) return;
-    setItems((prev) => prev.filter((_, i) => i !== pendingDeleteIdx));
+    const removeIdx = pendingDeleteIdx;
+    updateActiveDraft((d) => ({
+      ...d,
+      items: d.items.filter((_, i) => i !== removeIdx),
+    }));
     setPendingDeleteIdx(null);
   };
 
-  /**
-   * Re-runs docket extraction (Tesseract-first by default, or forced Gemini AI fallback)
-   * on the attached docket pages while preserving any rows that were manually edited
-   * or added by the user (`manuallyEdited: true`).
-   */
+  const handleMergeWithPreviousDraft = () => {
+    if (safeDraftIdx <= 0) return;
+    setDrafts((prev) => {
+      const current = prev[safeDraftIdx];
+      const previous = prev[safeDraftIdx - 1];
+      if (!current || !previous) return prev;
+      const mergedPages = Array.from(
+        new Set([...previous.sourcePageNumbers, ...current.sourcePageNumbers])
+      ).sort((a, b) => a - b);
+      const merged: DocketReviewDraft = {
+        ...previous,
+        sourcePageNumbers: mergedPages,
+        items: [...previous.items, ...current.items],
+        palletCount: Math.max(previous.palletCount, current.palletCount),
+        separationUncertain: false,
+        separationReason: undefined,
+      };
+      const next = prev.filter((_, idx) => idx !== safeDraftIdx);
+      next[safeDraftIdx - 1] = merged;
+      return next;
+    });
+    setActiveDraftIdx(Math.max(0, safeDraftIdx - 1));
+  };
+
+  const handleRemoveDraft = (idxToRemove: number) => {
+    if (drafts.length <= 1) return;
+    setDrafts((prev) => prev.filter((_, i) => i !== idxToRemove));
+    setActiveDraftIdx((prevIdx) => Math.max(0, Math.min(prevIdx, drafts.length - 2)));
+  };
+
   const handleRerunOcrPreservingManualEdits = async (forceGemini = false) => {
     if (attachedPages.length === 0 || isRetryingOcr) return;
     setIsRetryingOcr(true);
@@ -256,6 +353,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     try {
       const imagesToProcess = attachedPages.map((p) => p.dataUrl);
       const pageTextHints = attachedPages.map((p) => p.textHint || {});
+      const sourceFileIds = attachedPages.map((p) => p.sourceFileId || `p_${p.pageNumber}`);
       const output = await performSmartDocketExtraction(
         imagesToProcess,
         (update) => {
@@ -264,53 +362,50 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         false,
         pageTextHints,
         {
-          supplierHint: supplierRule,
+          supplierHint: activeDraft.supplierRule,
+          sourceFileIds,
           forceGemini,
         }
       );
 
-      const freshItems = output.extractedData.items || [];
-      const manualRows = items.filter((it) => it.manuallyEdited);
-      const manualByItemNo = new Map<string, ExtractedDocketItem>();
-      const extraManualRows: ExtractedDocketItem[] = [];
+      // Preserve any manual rows in current single active view if single-docket, else refresh drafts cleanly
+      const rebuilt = buildInitialDrafts(
+        output.extractedData,
+        activeDraft.supplierRule,
+        attachedPages.length
+      );
 
-      for (const m of manualRows) {
-        const key = String(m.itemNumber || '').trim();
-        if (key && !manualByItemNo.has(key)) {
-          manualByItemNo.set(key, m);
-        } else {
-          extraManualRows.push(m);
+      if (rebuilt.length === 1 && drafts.length === 1) {
+        const freshItems = rebuilt[0].items;
+        const manualRows = activeDraft.items.filter((it) => it.manuallyEdited);
+        const manualByItemNo = new Map<string, ExtractedDocketItem>();
+        const extraManualRows: ExtractedDocketItem[] = [];
+
+        for (const m of manualRows) {
+          const key = String(m.itemNumber || '').trim();
+          if (key && !manualByItemNo.has(key)) {
+            manualByItemNo.set(key, m);
+          } else {
+            extraManualRows.push(m);
+          }
         }
+
+        const merged: ExtractedDocketItem[] = freshItems.map((fresh) => {
+          const key = String(fresh.itemNumber || '').trim();
+          if (key && manualByItemNo.has(key)) {
+            const preserved = manualByItemNo.get(key)!;
+            manualByItemNo.delete(key);
+            return preserved;
+          }
+          return fresh;
+        });
+        for (const remaining of manualByItemNo.values()) merged.push(remaining);
+        for (const extra of extraManualRows) merged.push(extra);
+        rebuilt[0].items = merged;
       }
 
-      const merged: ExtractedDocketItem[] = freshItems.map((fresh) => {
-        const key = String(fresh.itemNumber || '').trim();
-        if (key && manualByItemNo.has(key)) {
-          const preserved = manualByItemNo.get(key)!;
-          manualByItemNo.delete(key);
-          return preserved;
-        }
-        return {
-          ...fresh,
-          originalOcrValues: {
-            partNumber: fresh.partNumber,
-            itemNumber: fresh.itemNumber,
-            description: fresh.description,
-            revision: fresh.rev,
-            quantity: Math.max(1, fresh.quantity || 1),
-          },
-        };
-      });
-
-      // Append any remaining manually added rows that didn't match an OCR item number
-      for (const remainingManual of manualByItemNo.values()) {
-        merged.push(remainingManual);
-      }
-      for (const extra of extraManualRows) {
-        merged.push(extra);
-      }
-
-      setItems(merged);
+      setDrafts(rebuilt);
+      setActiveDraftIdx(0);
       setActiveExtractionMeta({
         extractionMethod: output.extractedData.extractionMethod,
         extractionEngineLabel: output.extractedData.extractionEngineLabel,
@@ -325,7 +420,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       setRetryOcrStatus(null);
     } catch (err: any) {
       setRetryOcrError(
-        err?.message || 'Docket OCR retry failed. Your existing parts and manual edits are preserved.'
+        err?.message ||
+          'Docket OCR retry failed. Your existing parts and manual edits are preserved.'
       );
       setRetryOcrStatus(null);
     } finally {
@@ -333,6 +429,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     }
   };
 
+  const items = activeDraft.items;
   const totalExpandedParts = items.reduce((acc, it) => acc + Math.max(1, it.quantity || 1), 0);
   const lowConfidenceCount = items.filter((i) => i.confidence === 'low').length;
   const manuallyEditedCount = items.filter((i) => i.manuallyEdited).length;
@@ -342,98 +439,172 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
     return true;
   });
 
+  const duplicateInBatchSet = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const d of drafts) {
+      const key = d.docketNumber.trim().toUpperCase();
+      if (key) counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const dups = new Set<string>();
+    for (const [k, c] of counts.entries()) {
+      if (c > 1) dups.add(k);
+    }
+    return dups;
+  }, [drafts]);
+
+  const activeDocketKey = activeDraft.docketNumber.trim().toUpperCase();
+  const isDuplicateExisting = existingStoredDockets.has(activeDocketKey);
+  const isDuplicateInBatch = duplicateInBatchSet.has(activeDocketKey);
+
   const handleConfirmImport = async () => {
-    // Validate required fields before importing
-    for (let i = 0; i < items.length; i++) {
-      const row = items[i];
-      if (!String(row.partNumber || '').trim()) {
-        setRetryOcrError(`Row ${i + 1} (No. ${row.itemNumber || i + 1}) is missing a Part Number.`);
+    setRetryOcrError(null);
+
+    // Validate all separated dockets before committing any
+    const seenBatchDockets = new Set<string>();
+    for (let dIdx = 0; dIdx < drafts.length; dIdx++) {
+      const draft = drafts[dIdx];
+      const cleanDk = draft.docketNumber.trim().toUpperCase();
+      if (!cleanDk) {
+        setActiveDraftIdx(dIdx);
+        setRetryOcrError(`Docket ${dIdx + 1} is missing a Docket Number.`);
         return;
       }
+      if (existingStoredDockets.has(cleanDk)) {
+        setActiveDraftIdx(dIdx);
+        setRetryOcrError(
+          `Duplicate Docket # "${cleanDk}": This docket already exists in PalletTrack. Rename or delete the duplicate before saving.`
+        );
+        return;
+      }
+      if (seenBatchDockets.has(cleanDk)) {
+        setActiveDraftIdx(dIdx);
+        setRetryOcrError(
+          `Duplicate Docket # "${cleanDk}" across uploaded tabs. Separate dockets must have unique docket numbers (or click "Merge with Previous" if they are pages of the same docket).`
+        );
+        return;
+      }
+      seenBatchDockets.add(cleanDk);
+
+      if (draft.items.length === 0) {
+        setActiveDraftIdx(dIdx);
+        setRetryOcrError(`Docket "${cleanDk}" has 0 parts. Add at least one part or remove the empty tab.`);
+        return;
+      }
+      for (let i = 0; i < draft.items.length; i++) {
+        if (!String(draft.items[i].partNumber || '').trim()) {
+          setActiveDraftIdx(dIdx);
+          setRetryOcrError(
+            `Docket "${cleanDk}", Row ${i + 1} is missing a Part Number.`
+          );
+          return;
+        }
+      }
     }
 
-    const deliveryId = `del_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const finalParts: DeliveryPart[] = [];
-    let lineIdx = 1;
+    setIsSaving(true);
+    const createdDeliveries: Delivery[] = [];
+    try {
+      for (let dIdx = 0; dIdx < drafts.length; dIdx++) {
+        const draft = drafts[dIdx];
+        const deliveryId = `del_${Date.now()}_${dIdx}_${Math.random().toString(36).slice(2, 6)}`;
+        const finalParts: DeliveryPart[] = [];
+        let lineIdx = 1;
 
-    items.forEach((it, rowIdx) => {
-      const qty = expandQuantities ? Math.max(1, it.quantity || 1) : 1;
-      const isMultiple = qty > 1;
-      const cleanDocketNo =
-        it.itemNumber.trim().replace(/^(?:ITM|LINE|POS|NO\.?)\s*[-:]?\s*0*/i, '') ||
-        String(rowIdx + 1);
+        draft.items.forEach((it, rowIdx) => {
+          const qty = expandQuantities ? Math.max(1, it.quantity || 1) : 1;
+          const isMultiple = qty > 1;
+          const cleanDocketNo =
+            it.itemNumber.trim().replace(/^(?:ITM|LINE|POS|NO\.?)\s*[-:]?\s*0*/i, '') ||
+            String(rowIdx + 1);
 
-      for (let q = 1; q <= qty; q++) {
-        finalParts.push({
-          id: `part_${deliveryId}_${lineIdx}`,
-          docketLineIndex: rowIdx + 1,
-          partNumber: it.partNumber.trim().toUpperCase(),
-          itemNumber: cleanDocketNo.toUpperCase(),
-          description: isMultiple
-            ? `${it.description} (Piece ${q} of ${qty})`
-            : it.description,
-          revision: it.rev?.trim() || undefined,
-          material: it.material?.trim() || undefined,
-          thickness: it.thickness?.trim() || undefined,
-          dimensions: it.dimensions?.trim() || undefined,
-          weight: it.weight?.trim() || undefined,
-          quantity: expandQuantities ? 1 : Math.max(1, it.quantity || 1),
-          palletNumber: it.palletNumber || `Pallet 1`,
-          status: 'outstanding',
-          ocrConfidence: it.confidence,
-          flaggedForReview: it.confidence === 'low',
-          notes: it.notes,
-          manuallyEdited: Boolean(it.manuallyEdited),
-          lastEditedBy: it.lastEditedBy,
-          lastEditedAt: it.lastEditedAt,
-          originalOcrValues: it.originalOcrValues || {
-            partNumber: it.partNumber.trim().toUpperCase(),
-            itemNumber: cleanDocketNo.toUpperCase(),
-            description: it.description,
-            revision: it.rev?.trim() || undefined,
-            quantity: expandQuantities ? 1 : Math.max(1, it.quantity || 1),
-          },
+          for (let q = 1; q <= qty; q++) {
+            finalParts.push({
+              id: `part_${deliveryId}_${lineIdx}`,
+              docketLineIndex: rowIdx + 1,
+              partNumber: it.partNumber.trim().toUpperCase(),
+              itemNumber: cleanDocketNo.toUpperCase(),
+              description: isMultiple
+                ? `${it.description} (Piece ${q} of ${qty})`
+                : it.description,
+              revision: it.rev?.trim() || it.revision?.trim() || undefined,
+              material: it.material?.trim() || undefined,
+              thickness: it.thickness?.trim() || undefined,
+              dimensions: it.dimensions?.trim() || undefined,
+              weight: it.weight?.trim() || undefined,
+              quantity: expandQuantities ? 1 : Math.max(1, it.quantity || 1),
+              palletNumber: it.palletNumber || `Pallet 1`,
+              status: 'outstanding',
+              ocrConfidence: it.confidence,
+              flaggedForReview: it.confidence === 'low',
+              notes: it.notes,
+              manuallyEdited: Boolean(it.manuallyEdited),
+              lastEditedBy: it.lastEditedBy,
+              lastEditedAt: it.lastEditedAt,
+              originalOcrValues: it.originalOcrValues || {
+                partNumber: it.partNumber.trim().toUpperCase(),
+                itemNumber: cleanDocketNo.toUpperCase(),
+                description: it.description,
+                revision: it.rev?.trim() || undefined,
+                quantity: expandQuantities ? 1 : Math.max(1, it.quantity || 1),
+              },
+            });
+            lineIdx++;
+          }
         });
 
-        lineIdx++;
+        const pageSet = new Set(draft.sourcePageNumbers);
+        const draftPages = attachedPages.filter((p) => pageSet.has(p.pageNumber));
+        const pagesForDocket = draftPages.length > 0 ? draftPages : attachedPages;
+
+        const attachments: DocketAttachment[] = pagesForDocket.map((p, idx) => ({
+          id: `att_${deliveryId}_${idx + 1}`,
+          name: p.name || `docket_${draft.docketNumber}_p${p.pageNumber}.jpg`,
+          uploadedAt: new Date().toISOString(),
+          dataUrl: p.dataUrl,
+        }));
+
+        const newDelivery: Delivery = {
+          id: deliveryId,
+          docketNumber: draft.docketNumber.trim().toUpperCase(),
+          supplier: draft.supplier.trim() || SUPPLIER_RULES[draft.supplierRule].name,
+          supplierProfile: draft.supplierRule,
+          deliveryDate: draft.deliveryDate,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          carrier: draft.carrier.trim() || undefined,
+          orderNumber: draft.orderNumber.trim() || undefined,
+          palletCount: draft.palletCount,
+          notes: draft.notes.trim() || undefined,
+          needsReview: draft.separationUncertain,
+          separationReason: draft.separationReason,
+          status: 'receiving',
+          docketAttachments: attachments,
+          parts: finalParts,
+          unexpectedParts: [],
+          scanHistory: [],
+        };
+
+        const persisted = await addDeliveryAuthoritative(newDelivery);
+        if (pagesForDocket.length > 0) {
+          await saveDocketImages(persisted.id, pagesForDocket);
+        }
+        createdDeliveries.push(persisted);
       }
-    });
 
-    const attachments: DocketAttachment[] = attachedPages.map((p, idx) => ({
-      id: `att_${deliveryId}_${idx + 1}`,
-      name: p.name || `docket_${docketNumber}_p${idx + 1}.jpg`,
-      uploadedAt: new Date().toISOString(),
-      dataUrl: p.dataUrl,
-    }));
-
-    const newDelivery: Delivery = {
-      id: deliveryId,
-      docketNumber: docketNumber.trim().toUpperCase(),
-      supplier: supplier.trim() || SUPPLIER_RULES[supplierRule].name,
-      supplierProfile: supplierRule,
-      deliveryDate,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      carrier: carrier.trim() || undefined,
-      orderNumber: orderNumber.trim() || undefined,
-      palletCount,
-      notes: notes.trim() || undefined,
-      status: 'receiving',
-      docketAttachments: attachments,
-      parts: finalParts,
-      unexpectedParts: [],
-      scanHistory: [],
-    };
-
-    updateDelivery(newDelivery);
-    setActiveDeliveryId(newDelivery.id);
-
-    if (attachedPages.length > 0) {
-      await saveDocketImages(newDelivery.id, attachedPages);
+      if (createdDeliveries.length > 0) {
+        setActiveDeliveryId(createdDeliveries[0].id);
+        onDeliveryCreated(
+          createdDeliveries.length === 1 ? createdDeliveries[0] : createdDeliveries
+        );
+      }
+      onClose();
+    } catch (err: any) {
+      setRetryOcrError(
+        err?.message || 'Failed to save one or more separated dockets. Please check docket numbers.'
+      );
+    } finally {
+      setIsSaving(false);
     }
-
-    onDeliveryCreated(newDelivery);
-    onClose();
   };
 
   return (
@@ -444,21 +615,16 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <h3 className="font-bold text-sm text-[#18181B]">
-                Compiled Docket Parts List ({items.length} Part Rows · {totalExpandedParts} Total Quantities)
+                {drafts.length > 1
+                  ? `Separated Delivery Dockets (${drafts.length} Independent Dockets Detected)`
+                  : `Compiled Docket Parts List (${items.length} Part Rows · ${totalExpandedParts} Total Quantities)`}
               </h3>
               {activeExtractionMeta.extractionMethod === 'ai-vision' ? (
                 <span className="font-mono text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
                   <Sparkles className="w-2.5 h-2.5 text-amber-600" />
                   <span>
                     {activeExtractionMeta.extractionEngineLabel ||
-                      `Gemini AI Fallback (${activeExtractionMeta.aiModelUsed || 'gemini-3.8-flash'})`}
-                  </span>
-                </span>
-              ) : activeExtractionMeta.extractionMethod === 'pdf-text' ? (
-                <span className="font-mono text-[10px] font-semibold text-[#059669] bg-emerald-50 border border-emerald-200/60 px-2 py-0.5 rounded-[3px] inline-flex items-center gap-1">
-                  <FileText className="w-2.5 h-2.5" />
-                  <span>
-                    {activeExtractionMeta.extractionEngineLabel || 'Tesseract.js OCR + PDF Layout'}
+                      `Gemini AI (${activeExtractionMeta.aiModelUsed || 'gemini-3.8-flash'})`}
                   </span>
                 </span>
               ) : (
@@ -467,22 +633,14 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   <span>{activeExtractionMeta.extractionEngineLabel || 'Tesseract.js OCR'}</span>
                 </span>
               )}
-              {typeof activeExtractionMeta.processingTimeMs === 'number' && (
-                <span className="font-mono text-[10px] text-zinc-500 bg-zinc-100 border border-zinc-200 px-1.5 py-0.5 rounded-[3px]">
-                  {activeExtractionMeta.processingTimeMs}ms
-                  {activeExtractionMeta.pagesFromCache
-                    ? ` · ${activeExtractionMeta.pagesFromCache} cached`
-                    : ''}
-                </span>
-              )}
               {manuallyEditedCount > 0 && (
                 <span className="font-mono text-[10px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-[3px]">
-                  {manuallyEditedCount} Manually Edited / Added
+                  {manuallyEditedCount} Edited
                 </span>
               )}
             </div>
             <p className="text-[11px] text-zinc-500 mt-0.5">
-              Edit any part row, add missing parts, or remove unwanted rows before saving the docket.
+              Each distinct docket number creates an independent delivery docket record. Review parts and metadata before saving.
             </p>
           </div>
 
@@ -493,28 +651,24 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   type="button"
                   onClick={() => handleRerunOcrPreservingManualEdits(false)}
                   disabled={isRetryingOcr}
-                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-                  title="Re-run Tesseract.js OCR extraction while preserving any rows you have manually edited or added"
+                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <RefreshCw className={`w-3 h-3 ${isRetryingOcr ? 'animate-spin text-[#059669]' : ''}`} />
-                  <span className="hidden sm:inline">Re-run OCR (Keep Edits)</span>
+                  <span className="hidden sm:inline">Re-run OCR</span>
                 </button>
-
                 <button
                   type="button"
                   onClick={() => handleRerunOcrPreservingManualEdits(true)}
                   disabled={isRetryingOcr}
-                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-emerald-50 border border-emerald-200 text-[#059669] hover:bg-emerald-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-                  title="Run Gemini AI fallback extraction while preserving any rows you have manually edited or added"
+                  className="h-7 px-2.5 rounded-[4px] text-xs font-medium bg-emerald-50 border border-emerald-200 text-[#059669] hover:bg-emerald-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <Sparkles className="w-3 h-3" />
-                  <span className="hidden md:inline">Use Gemini AI (Keep Edits)</span>
+                  <span className="hidden md:inline">Use Gemini AI</span>
                 </button>
-
                 <button
                   type="button"
                   onClick={() => setShowPhotoViewer(!showPhotoViewer)}
-                  className={`h-7 px-2.5 rounded-[4px] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                  className={`h-7 px-2.5 rounded-[4px] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer ${
                     showPhotoViewer
                       ? 'bg-[#18181B] text-white'
                       : 'bg-white border border-[#E4E3DE] text-zinc-700 hover:bg-zinc-50'
@@ -525,121 +679,110 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                 </button>
               </>
             )}
-
-            <button
-              onClick={onClose}
-              className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer"
-            >
+            <button onClick={onClose} className="p-1 text-zinc-400 hover:text-[#18181B] cursor-pointer">
               <X className="w-4 h-4" />
             </button>
           </div>
         </div>
 
-        {/* Gemini Fallback Notice Banner */}
-        {activeExtractionMeta.geminiFallbackReason && (
-          <div className="px-4 py-2 bg-amber-50/90 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 shrink-0">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-              <span>
-                <strong>Gemini AI Fallback Used:</strong> {activeExtractionMeta.geminiFallbackReason}
-              </span>
+        {/* Separated Dockets Tab Strip */}
+        {drafts.length > 1 && (
+          <div className="px-4 py-2 bg-[#F6F5F2] border-b border-[#E4E3DE] flex items-center justify-between gap-2 overflow-x-auto shrink-0">
+            <div className="flex items-center gap-1.5">
+              {drafts.map((d, idx) => {
+                const isActive = idx === safeDraftIdx;
+                const dKey = d.docketNumber.trim().toUpperCase();
+                const hasIssue =
+                  d.separationUncertain ||
+                  existingStoredDockets.has(dKey) ||
+                  duplicateInBatchSet.has(dKey);
+                return (
+                  <button
+                    key={d.draftId}
+                    type="button"
+                    onClick={() => {
+                      setActiveDraftIdx(idx);
+                      if (d.sourcePageNumbers[0]) {
+                        setActivePhotoIdx(Math.max(0, d.sourcePageNumbers[0] - 1));
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded-[4px] text-xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer transition-colors whitespace-nowrap ${
+                      isActive
+                        ? 'bg-[#18181B] text-white border-[#18181B]'
+                        : 'bg-white text-zinc-700 border-[#E4E3DE] hover:border-zinc-400'
+                    }`}
+                  >
+                    <FileText className="w-3 h-3" />
+                    <span>{d.docketNumber || `Docket ${idx + 1}`}</span>
+                    <span className="text-[10px] opacity-75">
+                      ({d.items.length} parts · P{d.sourcePageNumbers.join(',')})
+                    </span>
+                    {hasIssue && <AlertTriangle className="w-3 h-3 text-amber-500" />}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              {safeDraftIdx > 0 && (
+                <button
+                  type="button"
+                  onClick={handleMergeWithPreviousDraft}
+                  className="px-2 py-1 rounded-[4px] bg-white border border-amber-300 text-amber-800 hover:bg-amber-50 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                  title="Combine these pages with the previous docket if they actually belong to the same docket"
+                >
+                  <GitMerge className="w-3 h-3" />
+                  <span>Merge with Prev</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => handleRemoveDraft(safeDraftIdx)}
+                className="px-2 py-1 rounded-[4px] bg-white border border-red-200 text-red-600 hover:bg-red-50 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>Drop Tab</span>
+              </button>
             </div>
           </div>
         )}
 
-        {/* Tesseract Runtime Pipeline Diagnostics Banner */}
-        {extractedData.tesseractDiagnostics && (
-          <details className="bg-zinc-50 border-b border-[#E4E3DE] text-[11px] text-zinc-700 shrink-0">
-            <summary className="px-4 py-1.5 cursor-pointer select-none flex items-center justify-between gap-2 font-mono hover:bg-zinc-100/80">
+        {/* Uncertain Separation / Duplicate Warning Banners */}
+        {activeDraft.separationUncertain && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex flex-wrap items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
               <span>
-                <strong>Tesseract Diagnostics:</strong>{' '}
-                {extractedData.tesseractDiagnostics.outcomeLabel} (
-                {extractedData.tesseractDiagnostics.totalElapsedMs}ms total ·{' '}
-                {extractedData.tesseractDiagnostics.totalWordsCount} words ·{' '}
-                {extractedData.tesseractDiagnostics.totalLinesCount} lines ·{' '}
-                {extractedData.tesseractDiagnostics.itemsParsedCount} items)
+                <strong>Needs Review:</strong>{' '}
+                {activeDraft.separationReason ||
+                  'Page boundaries or docket number could not be separated with 100% certainty. Confirm docket number before saving.'}
               </span>
-              <span className="text-[10px] text-zinc-500">Click to inspect stage timestamps</span>
-            </summary>
-            <div className="px-4 py-2 border-t border-[#E4E3DE] bg-white space-y-1.5 font-mono text-[10px]">
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                <div>
-                  worker.min.js:{' '}
-                  <strong className={extractedData.tesseractDiagnostics.workerScriptLoaded ? 'text-emerald-700' : 'text-red-600'}>
-                    {extractedData.tesseractDiagnostics.workerScriptLoaded ? 'LOADED' : 'FAILED'}
-                  </strong>
-                </div>
-                <div>
-                  WASM Core:{' '}
-                  <strong className={extractedData.tesseractDiagnostics.wasmCoreLoaded ? 'text-emerald-700' : 'text-red-600'}>
-                    {extractedData.tesseractDiagnostics.wasmCoreLoaded ? 'LOADED' : 'FAILED'}
-                  </strong>
-                </div>
-                <div>
-                  eng.traineddata.gz:{' '}
-                  <strong className={extractedData.tesseractDiagnostics.trainedDataLoaded ? 'text-emerald-700' : 'text-red-600'}>
-                    {extractedData.tesseractDiagnostics.trainedDataLoaded ? 'LOADED' : 'FAILED'}
-                  </strong>
-                </div>
-                <div>
-                  recognize() called:{' '}
-                  <strong className={extractedData.tesseractDiagnostics.recognizeCalled ? 'text-emerald-700' : 'text-amber-600'}>
-                    {extractedData.tesseractDiagnostics.recognizeCalled ? 'YES' : 'NO'}
-                  </strong>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 pt-1 border-t border-zinc-100 text-zinc-600">
-                <div>
-                  Preprocess: <strong>{extractedData.tesseractDiagnostics.preprocessDurationMs ?? 0}ms</strong>
-                </div>
-                <div>
-                  Worker Init: <strong>{extractedData.tesseractDiagnostics.workerInitDurationMs ?? 0}ms</strong>
-                </div>
-                <div>
-                  OCR Recognize: <strong>{extractedData.tesseractDiagnostics.ocrDurationMs ?? 0}ms</strong>
-                </div>
-                <div>
-                  Supplier Parse: <strong>{extractedData.tesseractDiagnostics.parseDurationMs ?? 0}ms</strong>
-                </div>
-                <div>
-                  Validation:{' '}
-                  <strong className={extractedData.tesseractDiagnostics.validationAccepted ? 'text-emerald-700' : 'text-amber-600'}>
-                    {extractedData.tesseractDiagnostics.validationAccepted ? 'ACCEPTED' : 'FALLBACK'}
-                  </strong>
-                </div>
-              </div>
-              {extractedData.tesseractDiagnostics.exactTriggerCondition && (
-                <div className="text-amber-800 bg-amber-50 px-2 py-1 rounded">
-                  Fallback Reason: {extractedData.tesseractDiagnostics.exactTriggerCondition}
-                </div>
-              )}
-              <div className="max-h-28 overflow-y-auto divide-y divide-zinc-100 border border-zinc-200 rounded p-1.5">
-                {extractedData.tesseractDiagnostics.stages.map((st, sIdx) => (
-                  <div key={sIdx} className="py-0.5 flex items-start justify-between gap-2">
-                    <span>
-                      <strong className="text-zinc-900">[{st.elapsedMs}ms]</strong> {st.stage}: {st.detail}
-                    </span>
-                    <span className="text-zinc-400 shrink-0">{st.timestampIso.slice(11, 23)}</span>
-                  </div>
-                ))}
-              </div>
             </div>
-          </details>
+            <button
+              type="button"
+              onClick={() =>
+                updateActiveDraft((d) => ({
+                  ...d,
+                  separationUncertain: false,
+                  separationReason: undefined,
+                }))
+              }
+              className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-700 text-white font-semibold text-[11px] cursor-pointer"
+            >
+              Mark Verified
+            </button>
+          </div>
         )}
 
-        {/* Missing Row Sequence Warning Banner */}
-        {activeExtractionMeta.missingRowNumbers.length > 0 && (
-          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2 shrink-0">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-              <span>
-                <strong>Sequence Check:</strong> Potential missing docket row number(s):{' '}
-                <span className="font-mono font-bold">
-                  {activeExtractionMeta.missingRowNumbers.map((n) => `#${n}`).join(', ')}
-                </span>
-                . Please verify against the docket or click <strong>+ Add Part</strong>.
-              </span>
-            </div>
+        {(isDuplicateExisting || isDuplicateInBatch) && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 flex items-center gap-2 shrink-0">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>
+              <strong>Duplicate Docket Number:</strong>{' '}
+              {isDuplicateExisting
+                ? `Docket "${activeDocketKey}" already exists in PalletTrack. Rename the docket number or cancel to avoid duplicate docket creation.`
+                : `Another separated tab already uses Docket "${activeDocketKey}". Use unique docket numbers or click "Merge with Prev".`}
+            </span>
           </div>
         )}
 
@@ -673,8 +816,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <Trash2 className="w-4 h-4 shrink-0" />
               <span>
                 Confirm delete part row <strong>No. {items[pendingDeleteIdx].itemNumber}</strong> —{' '}
-                <strong className="font-mono">{items[pendingDeleteIdx].partNumber}</strong> (
-                {items[pendingDeleteIdx].description}, Qty {items[pendingDeleteIdx].quantity})?
+                <strong className="font-mono">{items[pendingDeleteIdx].partNumber}</strong>?
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -696,9 +838,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           </div>
         )}
 
-        {/* Content Area: Table Review + Optional Side-by-Side Docket Photo */}
+        {/* Content Area */}
         <div className="flex-1 flex overflow-hidden">
-          {/* Left / Main Section: Metadata & Compiled Parts Table */}
           <div className="flex-1 flex flex-col overflow-y-auto">
             {/* Header Metadata Form */}
             <div className="p-3.5 bg-white border-b border-[#E4E3DE] space-y-2.5 text-xs">
@@ -709,9 +850,15 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   </label>
                   <input
                     type="text"
-                    value={docketNumber}
-                    onChange={(e) => setDocketNumber(e.target.value)}
-                    className="w-full h-8 px-2.5 font-mono text-xs font-bold bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
+                    value={activeDraft.docketNumber}
+                    onChange={(e) =>
+                      updateActiveDraft((d) => ({ ...d, docketNumber: e.target.value }))
+                    }
+                    className={`w-full h-8 px-2.5 font-mono text-xs font-bold bg-white border rounded-[3px] text-[#18181B] uppercase outline-none ${
+                      isDuplicateExisting || isDuplicateInBatch
+                        ? 'border-red-500 focus:border-red-600'
+                        : 'border-[#E4E3DE] focus:border-zinc-500'
+                    }`}
                   />
                 </div>
 
@@ -720,7 +867,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                     Supplier
                   </label>
                   <select
-                    value={supplierRule}
+                    value={activeDraft.supplierRule}
                     onChange={(e) =>
                       handleSelectSupplierRule(e.target.value as SupplierRuleId)
                     }
@@ -738,8 +885,10 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   </label>
                   <input
                     type="text"
-                    value={orderNumber}
-                    onChange={(e) => setOrderNumber(e.target.value)}
+                    value={activeDraft.orderNumber}
+                    onChange={(e) =>
+                      updateActiveDraft((d) => ({ ...d, orderNumber: e.target.value }))
+                    }
                     placeholder="Optional"
                     className="w-full h-8 px-2.5 font-mono text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] uppercase outline-none"
                   />
@@ -751,8 +900,10 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   </label>
                   <input
                     type="date"
-                    value={deliveryDate}
-                    onChange={(e) => setDeliveryDate(e.target.value)}
+                    value={activeDraft.deliveryDate}
+                    onChange={(e) =>
+                      updateActiveDraft((d) => ({ ...d, deliveryDate: e.target.value }))
+                    }
                     className="w-full h-8 px-2.5 text-xs bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
                   />
                 </div>
@@ -765,8 +916,13 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                     type="number"
                     min="1"
                     max="50"
-                    value={palletCount}
-                    onChange={(e) => setPalletCount(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                    value={activeDraft.palletCount}
+                    onChange={(e) =>
+                      updateActiveDraft((d) => ({
+                        ...d,
+                        palletCount: Math.max(1, parseInt(e.target.value, 10) || 1),
+                      }))
+                    }
                     className="w-full h-8 px-2.5 text-xs font-mono bg-white border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] text-[#18181B] outline-none"
                   />
                 </div>
@@ -778,7 +934,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setFilterMode('all')}
-                  className={`px-2.5 py-1 rounded-[3px] font-medium transition-colors cursor-pointer ${
+                  className={`px-2.5 py-1 rounded-[3px] font-medium cursor-pointer ${
                     filterMode === 'all'
                       ? 'bg-[#18181B] text-white'
                       : 'bg-white border border-[#E4E3DE] text-zinc-600 hover:text-[#18181B]'
@@ -786,11 +942,10 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                 >
                   All Part Rows ({items.length})
                 </button>
-
                 {lowConfidenceCount > 0 && (
                   <button
                     onClick={() => setFilterMode('flagged')}
-                    className={`px-2.5 py-1 rounded-[3px] font-medium flex items-center gap-1 cursor-pointer transition-colors ${
+                    className={`px-2.5 py-1 rounded-[3px] font-medium flex items-center gap-1 cursor-pointer ${
                       filterMode === 'flagged'
                         ? 'bg-amber-600 text-white'
                         : 'bg-amber-50 border border-amber-200 text-amber-800'
@@ -810,7 +965,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                     onChange={(e) => setExpandQuantities(e.target.checked)}
                     className="accent-[#059669] rounded-[2px]"
                   />
-                  <span>Expand multi-qty rows into individual checkable pieces ({totalExpandedParts} total)</span>
+                  <span>Expand multi-qty rows ({totalExpandedParts} pieces)</span>
                 </label>
 
                 <button
@@ -824,7 +979,6 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               </div>
             </div>
 
-            {/* Inline / Modal Add Part Form */}
             {showAddPartForm && (
               <form
                 onSubmit={(e) => handleConfirmAddPart(e, false)}
@@ -832,7 +986,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               >
                 <div className="flex items-center justify-between">
                   <span className="font-mono text-[11px] font-bold uppercase text-[#059669]">
-                    + Add Missing Part to Docket
+                    + Add Missing Part to Docket {activeDraft.docketNumber}
                   </span>
                   <button
                     type="button"
@@ -842,97 +996,71 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                     <X className="w-4 h-4" />
                   </button>
                 </div>
-
                 {addPartError && (
                   <div className="p-2 rounded bg-red-50 border border-red-200 text-red-700 font-medium">
                     {addPartError}
                   </div>
                 )}
-
                 <div className="grid grid-cols-2 sm:grid-cols-8 gap-2">
                   <div>
-                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
-                      No
-                    </label>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">No</label>
                     <input
                       type="text"
                       value={newPartDraft.itemNumber}
-                      onChange={(e) =>
-                        setNewPartDraft((p) => ({ ...p, itemNumber: e.target.value }))
-                      }
+                      onChange={(e) => setNewPartDraft((p) => ({ ...p, itemNumber: e.target.value }))}
                       className="w-full h-8 px-2 font-mono text-xs font-bold text-[#059669] bg-white border border-emerald-300 rounded-[3px] outline-none"
                     />
                   </div>
-                  <div className=" sm:col-span-2">
-                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">
-                      Part Number *
-                    </label>
+                  <div className="sm:col-span-2">
+                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">Part Number *</label>
                     <input
                       type="text"
                       required
                       placeholder="e.g. PLT-2048"
                       value={newPartDraft.partNumber}
-                      onChange={(e) =>
-                        setNewPartDraft((p) => ({ ...p, partNumber: e.target.value }))
-                      }
+                      onChange={(e) => setNewPartDraft((p) => ({ ...p, partNumber: e.target.value }))}
                       className="w-full h-8 px-2 font-mono text-xs font-bold uppercase bg-white border border-emerald-300 rounded-[3px] outline-none"
                     />
                   </div>
                   <div className="col-span-2 sm:col-span-2">
-                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
-                      Description
-                    </label>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">Description</label>
                     <input
                       type="text"
                       placeholder="Part description"
                       value={newPartDraft.description}
-                      onChange={(e) =>
-                        setNewPartDraft((p) => ({ ...p, description: e.target.value }))
-                      }
+                      onChange={(e) => setNewPartDraft((p) => ({ ...p, description: e.target.value }))}
                       className="w-full h-8 px-2 text-xs bg-white border border-emerald-300 rounded-[3px] outline-none"
                     />
                   </div>
                   <div>
-                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">
-                      Rev
-                    </label>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-600 mb-0.5">Rev</label>
                     <input
                       type="text"
                       placeholder="e.g. A"
                       value={newPartDraft.rev}
-                      onChange={(e) =>
-                        setNewPartDraft((p) => ({ ...p, rev: e.target.value }))
-                      }
+                      onChange={(e) => setNewPartDraft((p) => ({ ...p, rev: e.target.value }))}
                       className="w-full h-8 px-2 font-mono text-xs uppercase bg-white border border-emerald-300 rounded-[3px] outline-none"
                     />
                   </div>
                   <div>
-                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">
-                      Qty *
-                    </label>
+                    <label className="block text-[10px] font-mono uppercase text-zinc-800 font-bold mb-0.5">Qty *</label>
                     <input
                       type="number"
                       min="1"
                       required
                       value={newPartDraft.quantity}
-                      onChange={(e) =>
-                        setNewPartDraft((p) => ({ ...p, quantity: e.target.value }))
-                      }
+                      onChange={(e) => setNewPartDraft((p) => ({ ...p, quantity: e.target.value }))}
                       className="w-full h-8 px-2 font-mono text-xs font-bold text-center bg-white border border-emerald-300 rounded-[3px] outline-none"
                     />
                   </div>
                   <div className="flex items-end gap-1.5">
-                    <button
-                      type="submit"
-                      className="h-8 px-3 bg-[#059669] hover:bg-[#047857] text-white font-bold rounded-[3px] cursor-pointer whitespace-nowrap"
-                    >
-                      Save Part
+                    <button type="submit" className="h-8 px-3 bg-[#059669] text-white font-bold rounded-[3px] cursor-pointer">
+                      Save
                     </button>
                     <button
                       type="button"
                       onClick={(e) => handleConfirmAddPart(e, true)}
-                      className="h-8 px-2.5 bg-white border border-[#059669] text-[#059669] hover:bg-emerald-50 font-semibold rounded-[3px] cursor-pointer whitespace-nowrap"
-                      title="Save this part and immediately add another"
+                      className="h-8 px-2.5 bg-white border border-[#059669] text-[#059669] font-semibold rounded-[3px] cursor-pointer"
                     >
                       + Next
                     </button>
@@ -941,17 +1069,12 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
               </form>
             )}
 
-            {/* Extracted Individual Parts Table with ALL Details */}
+            {/* Parts Table */}
             <div className="flex-1 overflow-x-auto bg-white">
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="bg-[#F6F5F2] text-[10px] font-mono uppercase text-zinc-500 sticky top-0 border-b border-[#E4E3DE] z-10">
                   <tr>
-                    <th
-                      className="py-2 px-2.5 w-20 text-center text-[#059669] font-bold"
-                      title="The 'No' column on the delivery docket (matched by the numbers after '-' in ######-No barcodes)"
-                    >
-                      No (######-No)
-                    </th>
+                    <th className="py-2 px-2.5 w-20 text-center text-[#059669] font-bold">No</th>
                     <th className="py-2 px-2.5 min-w-[130px]">Part #</th>
                     <th className="py-2 px-2.5 min-w-[190px]">Part Description</th>
                     <th className="py-2 px-2 w-16 text-center">Rev</th>
@@ -967,122 +1090,84 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   {filteredItems.map((item) => {
                     const originalIdx = items.indexOf(item);
                     const isFlagged = item.confidence === 'low';
-
                     return (
                       <tr
                         key={originalIdx}
                         className={`hover:bg-zinc-50/80 transition-colors ${
-                          isFlagged
-                            ? 'bg-amber-50/30'
-                            : item.manuallyEdited
-                            ? 'bg-blue-50/20'
-                            : ''
+                          isFlagged ? 'bg-amber-50/30' : item.manuallyEdited ? 'bg-blue-50/20' : ''
                         }`}
                       >
-                        {/* Docket "No" Column */}
                         <td className="py-1.5 px-2 text-center">
                           <div className="flex items-center gap-1">
                             {attachedPages.length > 1 && item.pageNumber && (
-                              <span
-                                className="px-1 py-0.5 rounded-[2px] bg-zinc-100 border border-zinc-200 font-mono text-[9px] text-zinc-500 shrink-0"
-                                title={`Extracted from Page ${item.pageNumber}`}
-                              >
+                              <span className="px-1 py-0.5 rounded-[2px] bg-zinc-100 border border-zinc-200 font-mono text-[9px] text-zinc-500 shrink-0">
                                 P{item.pageNumber}
                               </span>
                             )}
                             <input
                               type="text"
                               value={item.itemNumber}
-                              onChange={(e) =>
-                                handleItemChange(originalIdx, 'itemNumber', e.target.value)
-                              }
-                              title="Part 'No' on the delivery docket / invoice"
-                              className="w-full h-7 px-1.5 text-center font-mono text-xs font-bold text-[#059669] bg-emerald-50/70 border border-emerald-200 hover:border-emerald-400 focus:border-[#059669] rounded-[3px] outline-none"
+                              onChange={(e) => handleItemChange(originalIdx, 'itemNumber', e.target.value)}
+                              className="w-full h-7 px-1.5 text-center font-mono text-xs font-bold text-[#059669] bg-emerald-50/70 border border-emerald-200 rounded-[3px] outline-none"
                             />
                           </div>
                         </td>
-
-                        {/* Part Number */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
                             value={item.partNumber}
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'partNumber', e.target.value)
-                            }
+                            onChange={(e) => handleItemChange(originalIdx, 'partNumber', e.target.value)}
                             className={`w-full h-7 px-2 font-mono text-xs font-bold uppercase rounded-[3px] outline-none ${
                               isFlagged
-                                ? 'bg-amber-50 border border-amber-300 text-amber-900 focus:border-amber-500'
-                                : 'bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 text-[#18181B]'
+                                ? 'bg-amber-50 border border-amber-300 text-amber-900'
+                                : 'bg-transparent border border-transparent hover:border-[#E4E3DE] text-[#18181B]'
                             }`}
                           />
                         </td>
-
-                        {/* Description */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
                             value={item.description}
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'description', e.target.value)
-                            }
-                            className="w-full h-7 px-2 text-xs text-zinc-800 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            onChange={(e) => handleItemChange(originalIdx, 'description', e.target.value)}
+                            className="w-full h-7 px-2 text-xs text-zinc-800 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Revision (Rev) */}
                         <td className="py-1.5 px-2 text-center">
                           <input
                             type="text"
-                            value={item.rev || ''}
+                            value={item.rev || item.revision || ''}
                             placeholder="—"
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'rev', e.target.value)
-                            }
-                            className="w-full h-7 px-1.5 text-center font-mono text-xs uppercase text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            onChange={(e) => handleItemChange(originalIdx, 'rev', e.target.value)}
+                            className="w-full h-7 px-1.5 text-center font-mono text-xs uppercase text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Material */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
                             value={item.material || ''}
                             placeholder="—"
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'material', e.target.value)
-                            }
-                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            onChange={(e) => handleItemChange(originalIdx, 'material', e.target.value)}
+                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Thickness */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
                             value={item.thickness || ''}
                             placeholder="—"
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'thickness', e.target.value)
-                            }
-                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            onChange={(e) => handleItemChange(originalIdx, 'thickness', e.target.value)}
+                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-700 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Dimensions / Weight */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
                             value={item.dimensions || item.weight || ''}
                             placeholder="—"
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'dimensions', e.target.value)
-                            }
-                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-600 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            onChange={(e) => handleItemChange(originalIdx, 'dimensions', e.target.value)}
+                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-600 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Quantity */}
                         <td className="py-1.5 px-2 text-center">
                           <input
                             type="number"
@@ -1096,28 +1181,22 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                                 Math.max(1, parseInt(e.target.value, 10) || 1)
                               )
                             }
-                            className="w-14 h-7 px-1 text-center font-mono text-xs font-bold bg-zinc-50 border border-[#E4E3DE] focus:border-zinc-500 rounded-[3px] outline-none"
+                            className="w-14 h-7 px-1 text-center font-mono text-xs font-bold bg-zinc-50 border border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Pallet */}
                         <td className="py-1.5 px-2">
                           <input
                             type="text"
-                            value={item.palletNumber || `Pallet 1`}
-                            onChange={(e) =>
-                              handleItemChange(originalIdx, 'palletNumber', e.target.value)
-                            }
-                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-500 bg-transparent border border-transparent hover:border-[#E4E3DE] focus:border-zinc-400 rounded-[3px] outline-none"
+                            value={item.palletNumber || 'Pallet 1'}
+                            onChange={(e) => handleItemChange(originalIdx, 'palletNumber', e.target.value)}
+                            className="w-full h-7 px-2 font-mono text-[11px] text-zinc-500 bg-transparent border border-transparent hover:border-[#E4E3DE] rounded-[3px] outline-none"
                           />
                         </td>
-
-                        {/* Delete action with confirmation */}
                         <td className="py-1.5 px-2 text-center">
                           <button
                             type="button"
                             onClick={() => setPendingDeleteIdx(originalIdx)}
-                            className="p-1 text-zinc-300 hover:text-red-600 transition-colors cursor-pointer"
+                            className="p-1 text-zinc-300 hover:text-red-600 cursor-pointer"
                             title="Delete part row"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
@@ -1128,36 +1207,15 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   })}
                 </tbody>
               </table>
-
-              {filteredItems.length === 0 && (
-                <div className="py-12 px-4 text-center text-xs text-zinc-500">
-                  <p className="font-semibold text-[#18181B] mb-1">
-                    No individual parts in this view
-                  </p>
-                  <p className="text-[11px] text-zinc-400 mb-3">
-                    Click &quot;+ Add Part&quot; above to add parts manually or re-run OCR extraction.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleOpenAddPartModal}
-                    className="h-8 px-3 bg-[#059669] text-white rounded-[4px] font-bold text-xs inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>+ Add Part</span>
-                  </button>
-                </div>
-              )}
             </div>
           </div>
 
-          {/* Right Section: Original Photographed Docket Image Viewer */}
           {showPhotoViewer && attachedPages.length > 0 && (
             <div className="w-80 sm:w-96 border-l border-[#E4E3DE] bg-[#141413] flex flex-col shrink-0">
               <div className="px-3 py-2 bg-black/60 border-b border-white/10 flex items-center justify-between text-xs text-white">
                 <span className="font-mono text-[11px]">
-                  Page {activePhotoIdx + 1} of {attachedPages.length}
+                  Page {Math.min(activePhotoIdx + 1, attachedPages.length)} of {attachedPages.length}
                 </span>
-
                 <div className="flex items-center gap-1">
                   {attachedPages.length > 1 && (
                     <>
@@ -1168,7 +1226,6 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                           )
                         }
                         className="p-1 hover:bg-white/10 rounded cursor-pointer"
-                        title="Previous page"
                       >
                         <ChevronLeft className="w-3.5 h-3.5 text-white" />
                       </button>
@@ -1179,7 +1236,6 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                           )
                         }
                         className="p-1 hover:bg-white/10 rounded cursor-pointer"
-                        title="Next page"
                       >
                         <ChevronRight className="w-3.5 h-3.5 text-white" />
                       </button>
@@ -1193,10 +1249,9 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   </button>
                 </div>
               </div>
-
               <div className="flex-1 overflow-auto p-2 flex items-center justify-center">
                 <img
-                  src={attachedPages[activePhotoIdx].dataUrl}
+                  src={attachedPages[Math.min(activePhotoIdx, attachedPages.length - 1)].dataUrl}
                   alt={`Docket Page ${activePhotoIdx + 1}`}
                   className="max-w-full max-h-full object-contain rounded-[2px]"
                 />
@@ -1205,34 +1260,42 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           )}
         </div>
 
-        {/* Footer Confirmation Bar */}
+        {/* Footer */}
         <div className="px-4 py-3 bg-white border-t border-[#E4E3DE] flex items-center justify-between gap-3 shrink-0">
           <div className="text-xs text-zinc-500 font-mono">
-            <span>
-              <strong className="text-[#18181B]">{items.length}</strong> part rows
-            </span>
-            <span className="mx-1.5 text-zinc-300">·</span>
-            <span className="font-semibold text-[#059669]">
-              {totalExpandedParts} total quantities
-            </span>
+            {drafts.length > 1 ? (
+              <span>
+                Saving <strong className="text-[#18181B]">{drafts.length}</strong> independent dockets · Active tab:{' '}
+                <strong className="text-[#059669]">{items.length}</strong> rows
+              </span>
+            ) : (
+              <span>
+                <strong className="text-[#18181B]">{items.length}</strong> part rows ·{' '}
+                <strong className="text-[#059669]">{totalExpandedParts}</strong> total quantities
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
+              disabled={isSaving}
               className="h-9 px-3.5 rounded-[4px] border border-[#E4E3DE] bg-white hover:bg-zinc-50 text-zinc-700 text-xs font-medium cursor-pointer"
             >
               Cancel
             </button>
-
             <button
               onClick={handleConfirmImport}
-              disabled={items.length === 0}
+              disabled={isSaving || items.length === 0 || isDuplicateExisting || isDuplicateInBatch}
               className="h-9 px-4 rounded-[4px] bg-[#059669] hover:bg-[#047857] disabled:opacity-50 text-white font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs"
             >
               <Check className="w-3.5 h-3.5 stroke-[2.5]" />
               <span>
-                Save &amp; Open Scanner ({expandQuantities ? totalExpandedParts : items.length} Parts)
+                {isSaving
+                  ? 'Saving...'
+                  : drafts.length > 1
+                  ? `Save All ${drafts.length} Dockets`
+                  : `Save & Open Docket (${expandQuantities ? totalExpandedParts : items.length} Parts)`}
               </span>
             </button>
           </div>

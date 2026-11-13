@@ -6,6 +6,8 @@ import {
   UserRow,
   SessionRow,
   UserRole,
+  DocketGroupRow,
+  DocketGroupItemRow,
 } from '../db/types.ts';
 import {
   hashPin,
@@ -36,6 +38,8 @@ export interface CreateDeliveryInput {
   palletCount?: number;
   supplierProfile?: string;
   notes?: string;
+  needsReview?: boolean;
+  separationReason?: string;
   createdBy?: string;
   parts: Array<{
     id?: string;
@@ -94,6 +98,8 @@ export interface UpdateDeliveryInput {
   carrier?: string;
   palletCount?: number;
   notes?: string;
+  needsReview?: boolean;
+  separationReason?: string | null;
 }
 
 export interface ReceivePartInput {
@@ -210,12 +216,101 @@ export class PalletTrackDbService {
   }
 
   /**
+   * Build chronological multi-user scan attributions for a specific part from scan_events.
+   * Ensures subsequent scans by another user NEVER erase prior scanners' attribution.
+   */
+  private buildPartScanAttributions(
+    partId: string,
+    deliveryScans: ScanEventRow[],
+    partRow?: DeliveryPartRow
+  ): Array<{
+    userId?: string;
+    employeeName: string;
+    quantityScanned: number;
+    lastScannedAt: string;
+    scanCount: number;
+  }> {
+    const relevant = deliveryScans
+      .filter(
+        (s) =>
+          s.part_id === partId &&
+          s.scan_status !== 'part_added' &&
+          s.scan_status !== 'part_edited' &&
+          s.scan_status !== 'part_deleted' &&
+          s.scan_status !== 'duplicate_blocked'
+      )
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    const byUser = new Map<
+      string,
+      {
+        userId?: string;
+        employeeName: string;
+        quantityScanned: number;
+        lastScannedAt: string;
+        scanCount: number;
+      }
+    >();
+
+    for (const s of relevant) {
+      if (s.scan_status === 'undo_performed' || Number(s.received_quantity_after) === 0) {
+        if (Number(s.received_quantity_after || 0) === 0) {
+          byUser.clear();
+        }
+        continue;
+      }
+      const empName = (s.employee_name || '').trim() || 'Worker';
+      const key = s.user_id ? `uid:${s.user_id}` : `name:${empName.toLowerCase()}`;
+      const qtyAdded =
+        Number(s.quantity_added) > 0
+          ? Number(s.quantity_added)
+          : Number(s.received_quantity_after) > 0 && byUser.size === 0
+          ? Number(s.received_quantity_after)
+          : 0;
+      const existing = byUser.get(key);
+      if (existing) {
+        existing.quantityScanned += qtyAdded;
+        existing.lastScannedAt = s.timestamp;
+        existing.scanCount += 1;
+      } else {
+        byUser.set(key, {
+          userId: s.user_id || undefined,
+          employeeName: empName,
+          quantityScanned: qtyAdded,
+          lastScannedAt: s.timestamp,
+          scanCount: 1,
+        });
+      }
+    }
+
+    if (
+      byUser.size === 0 &&
+      partRow &&
+      (partRow.status === 'received' || Number(partRow.received_quantity) > 0) &&
+      partRow.last_scanned_by_name
+    ) {
+      return [
+        {
+          userId: partRow.last_scanned_by_id || undefined,
+          employeeName: partRow.last_scanned_by_name,
+          quantityScanned: Number(partRow.received_quantity) || 0,
+          lastScannedAt: partRow.scanned_at || partRow.updated_at,
+          scanCount: 1,
+        },
+      ];
+    }
+
+    return Array.from(byUser.values());
+  }
+
+  /**
    * Helper to format delivery header from DB row
    */
   private mapDeliveryRow(
     row: DeliveryRow,
     stats?: { totalParts: number; receivedParts: number; verifiedParts: number },
-    parts: any[] = []
+    parts: any[] = [],
+    scanHistory: any[] = []
   ) {
     return {
       id: row.id,
@@ -230,6 +325,8 @@ export class PalletTrackDbService {
       palletCount: row.pallet_count,
       supplierProfile: (row.supplier_profile as any) || 'laser_central',
       notes: row.notes || undefined,
+      needsReview: Boolean(row.needs_review),
+      separationReason: row.review_reason || undefined,
       version: Number(row.version || 1),
       createdBy: row.created_by || undefined,
       createdAt: row.created_at,
@@ -239,14 +336,14 @@ export class PalletTrackDbService {
       verifiedParts: stats?.verifiedParts ?? parts.filter((p) => p.verificationStatus === 'verified').length,
       stats: stats || { totalParts: parts.length, receivedParts: 0, verifiedParts: 0 },
       parts,
-      scanHistory: [] as any[],
+      scanHistory,
       unexpectedParts: [] as any[],
       docketAttachments: [] as any[],
     };
   }
 
   /**
-   * List all deliveries with aggregated stats and full parts array
+   * List all deliveries with aggregated stats, full parts array, and scan attribution
    */
   async listDeliveries() {
     const deliveriesQuery = `
@@ -267,15 +364,32 @@ export class PalletTrackDbService {
       .prepare('SELECT * FROM delivery_parts ORDER BY docket_line_index ASC')
       .all<DeliveryPartRow>();
 
+    const allScansRes = await this.db
+      .prepare('SELECT * FROM scan_events ORDER BY timestamp DESC LIMIT 5000')
+      .all<ScanEventRow>();
+
+    const rawScansByDelivery = new Map<string, ScanEventRow[]>();
+    for (const s of allScansRes.results || []) {
+      const arr = rawScansByDelivery.get(s.delivery_id) || [];
+      arr.push(s);
+      rawScansByDelivery.set(s.delivery_id, arr);
+    }
+
     const partsByDelivery = new Map<string, any[]>();
     for (const p of allPartsRes.results || []) {
+      const delScans = rawScansByDelivery.get(p.delivery_id) || [];
+      const mapped = {
+        ...this.mapPartRow(p),
+        scannedByUsers: this.buildPartScanAttributions(p.id, delScans, p),
+      };
       const arr = partsByDelivery.get(p.delivery_id) || [];
-      arr.push(this.mapPartRow(p));
+      arr.push(mapped);
       partsByDelivery.set(p.delivery_id, arr);
     }
 
     return (res.results || []).map((row) => {
       const parts = partsByDelivery.get(row.id) || [];
+      const delScans = (rawScansByDelivery.get(row.id) || []).slice(0, 300).map((s) => this.mapScanRow(s));
       return this.mapDeliveryRow(
         row,
         {
@@ -286,14 +400,14 @@ export class PalletTrackDbService {
             Number(row.verified_parts) ||
             parts.filter((p) => p.verificationStatus === 'verified').length,
         },
-        parts
+        parts,
+        delScans
       );
     });
   }
 
-
   /**
-   * Get single delivery by ID, including parts and scan history
+   * Get single delivery by ID, including parts, attribution, and scan history
    */
   async getDeliveryById(id: string) {
     const delivery = await this.db
@@ -309,25 +423,28 @@ export class PalletTrackDbService {
       .all<DeliveryPartRow>();
 
     const scansRes = await this.db
-      .prepare('SELECT * FROM scan_events WHERE delivery_id = ? ORDER BY timestamp DESC LIMIT 300')
+      .prepare('SELECT * FROM scan_events WHERE delivery_id = ? ORDER BY timestamp DESC LIMIT 500')
       .bind(id)
       .all<ScanEventRow>();
 
-    const parts = (partsRes.results || []).map((p) => this.mapPartRow(p));
-    const scanHistory = (scansRes.results || []).map((s) => this.mapScanRow(s));
+    const rawScans = scansRes.results || [];
+    const parts = (partsRes.results || []).map((p) => ({
+      ...this.mapPartRow(p),
+      scannedByUsers: this.buildPartScanAttributions(p.id, rawScans, p),
+    }));
+    const scanHistory = rawScans.map((s) => this.mapScanRow(s));
 
     const totalParts = parts.length;
     const receivedParts = parts.filter((p) => p.status === 'received').length;
     const verifiedParts = parts.filter((p) => p.verificationStatus === 'verified').length;
 
     return {
-      ...this.mapDeliveryRow(delivery, { totalParts, receivedParts, verifiedParts }, parts),
+      ...this.mapDeliveryRow(delivery, { totalParts, receivedParts, verifiedParts }, parts, scanHistory),
       parts,
       scanHistory,
       unexpectedParts: [],
       docketAttachments: [],
     };
-
   }
 
   /**
@@ -350,7 +467,25 @@ export class PalletTrackDbService {
       throw new Error('docketNumber is required');
     }
 
+    // Prevent duplicate docket creation (case-insensitive trimmed check)
+    const duplicateDocket = await this.db
+      .prepare('SELECT id, docket_number FROM deliveries WHERE LOWER(TRIM(docket_number)) = LOWER(TRIM(?)) LIMIT 1')
+      .bind(docketNumber)
+      .first<{ id: string; docket_number: string }>();
+
+    if (duplicateDocket) {
+      const dupErr: any = new Error(
+        `Docket #${docketNumber} already exists in the system. Duplicate docket creation is blocked.`
+      );
+      dupErr.code = 'DUPLICATE_DOCKET';
+      dupErr.status = 409;
+      dupErr.existingDeliveryId = duplicateDocket.id;
+      throw dupErr;
+    }
+
     const stmts: any[] = [];
+    const needsReviewFlag = input.needsReview ? 1 : 0;
+    const reviewReason = input.separationReason ? String(input.separationReason).trim() : null;
 
     // 1. Insert delivery header
     stmts.push(
@@ -359,8 +494,9 @@ export class PalletTrackDbService {
           `INSERT INTO deliveries (
             id, docket_number, supplier, purchase_order_number, delivery_date,
             delivery_status, carrier, pallet_count, supplier_profile, notes,
+            needs_review, review_reason,
             created_by, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
           id,
@@ -373,6 +509,8 @@ export class PalletTrackDbService {
           palletCount,
           supplierProfile,
           notes,
+          needsReviewFlag,
+          reviewReason,
           createdBy,
           now,
           now
@@ -510,12 +648,19 @@ export class PalletTrackDbService {
     const palletCount =
       updates.palletCount !== undefined ? updates.palletCount : existing.pallet_count;
     const notes = updates.notes !== undefined ? updates.notes : existing.notes;
+    const needsReview =
+      updates.needsReview !== undefined ? (updates.needsReview ? 1 : 0) : Number(existing.needs_review || 0);
+    const reviewReason =
+      updates.separationReason !== undefined
+        ? updates.separationReason
+        : existing.review_reason ?? null;
 
     await this.db
       .prepare(
         `UPDATE deliveries
          SET docket_number = ?, supplier = ?, purchase_order_number = ?, delivery_date = ?,
              delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?,
+             needs_review = ?, review_reason = ?,
              version = COALESCE(version, 1) + 1, updated_at = ?
          WHERE id = ?`
       )
@@ -528,6 +673,8 @@ export class PalletTrackDbService {
         carrier,
         palletCount,
         notes,
+        needsReview,
+        reviewReason,
         now,
         id
       )
@@ -1576,27 +1723,64 @@ export class PalletTrackDbService {
   }
 
   /**
-   * Delete a delivery and its associated parts/scans atomically
+   * Delete a delivery and its associated parts, scan events, M1 sync rows, and docket group links atomically
    */
   async deleteDelivery(id: string) {
     await this.ensureSchemaReady();
     const existing = await this.db
-      .prepare('SELECT id, docket_number FROM deliveries WHERE id = ?')
+      .prepare('SELECT id, docket_number, delivery_status FROM deliveries WHERE id = ?')
       .bind(id)
-      .first<{ id: string; docket_number: string }>();
+      .first<{ id: string; docket_number: string; delivery_status: string }>();
 
     if (!existing) {
       return { deleted: false, id };
     }
 
     await this.db.batch([
+      this.db.prepare('DELETE FROM docket_group_items WHERE delivery_id = ?').bind(id),
       this.db.prepare('DELETE FROM scan_events WHERE delivery_id = ?').bind(id),
       this.db.prepare('DELETE FROM delivery_parts WHERE delivery_id = ?').bind(id),
       this.db.prepare('DELETE FROM m1_synchronisations WHERE delivery_id = ?').bind(id),
       this.db.prepare('DELETE FROM deliveries WHERE id = ?').bind(id),
     ]);
 
-    return { deleted: true, id, docketNumber: existing.docket_number };
+    return {
+      deleted: true,
+      id,
+      docketNumber: existing.docket_number,
+      previousStatus: existing.delivery_status,
+    };
+  }
+
+  /**
+   * Clear ALL delivery dockets, parts, scan events, M1 sync records, and docket groups
+   * while preserving users, active sessions, and configuration.
+   */
+  async clearAllDeliveries() {
+    await this.ensureSchemaReady();
+
+    const countRow = await this.db
+      .prepare('SELECT COUNT(*) as count FROM deliveries')
+      .first<{ count: number }>();
+
+    const groupCountRow = await this.db
+      .prepare('SELECT COUNT(*) as count FROM docket_groups')
+      .first<{ count: number }>();
+
+    await this.db.batch([
+      this.db.prepare('DELETE FROM docket_group_items'),
+      this.db.prepare('DELETE FROM docket_groups'),
+      this.db.prepare('DELETE FROM scan_events'),
+      this.db.prepare('DELETE FROM delivery_parts'),
+      this.db.prepare('DELETE FROM m1_synchronisations'),
+      this.db.prepare('DELETE FROM deliveries'),
+    ]);
+
+    return {
+      cleared: true,
+      deletedDeliveriesCount: Number(countRow?.count || 0),
+      deletedGroupsCount: Number(groupCountRow?.count || 0),
+    };
   }
 
   private async executeUpdatePartReceivedQuantityAtomic(
@@ -1637,13 +1821,27 @@ export class PalletTrackDbService {
             .prepare('SELECT version FROM deliveries WHERE id = ?')
             .bind(deliveryId)
             .first<{ version: number }>();
+          const partScansRes = await this.db
+            .prepare('SELECT * FROM scan_events WHERE delivery_id = ? AND part_id = ? ORDER BY timestamp ASC')
+            .bind(deliveryId, partId)
+            .all<ScanEventRow>();
+          const scannedByUsers = this.buildPartScanAttributions(
+            partId,
+            partScansRes.results || [],
+            currentPart || undefined
+          );
 
           return {
             duplicate: false,
             idempotentReplay: true,
             status: 'updated',
             deliveryVersion: Number(currentDelivery?.version || 1),
-            part: currentPart ? this.mapPartRow(currentPart) : null,
+            part: currentPart
+              ? {
+                  ...this.mapPartRow(currentPart),
+                  scannedByUsers,
+                }
+              : null,
             scanEvent: this.mapScanRow(existingScan),
           };
         }
@@ -1891,6 +2089,16 @@ export class PalletTrackDbService {
       const receivedCount = Number(statsRow?.received_count || 0);
       const outstandingCount = Math.max(0, totalCount - receivedCount);
 
+      const partScansRes = await this.db
+        .prepare('SELECT * FROM scan_events WHERE delivery_id = ? AND part_id = ? ORDER BY timestamp ASC')
+        .bind(deliveryId, partId)
+        .all<ScanEventRow>();
+      const scannedByUsers = this.buildPartScanAttributions(
+        partId,
+        partScansRes.results || [],
+        updatedPart || undefined
+      );
+
       return {
         duplicate: false,
         status: 'updated',
@@ -1900,7 +2108,12 @@ export class PalletTrackDbService {
           receivedCount,
           outstandingCount,
         },
-        part: updatedPart ? this.mapPartRow(updatedPart) : null,
+        part: updatedPart
+          ? {
+              ...this.mapPartRow(updatedPart),
+              scannedByUsers,
+            }
+          : null,
         scanEvent: {
           id: scanId,
           deliveryId,
@@ -1922,6 +2135,434 @@ export class PalletTrackDbService {
     }
 
     throw new Error('Failed to commit part quantity after concurrent retries');
+  }
+
+  // =========================================================================
+  // DOCKET GROUPS (Manually created grouping without merging underlying dockets)
+  // =========================================================================
+
+  async listGroups() {
+    await this.ensureSchemaReady();
+    const groupsRes = await this.db
+      .prepare('SELECT * FROM docket_groups ORDER BY created_at DESC')
+      .all<DocketGroupRow>();
+
+    const itemsRes = await this.db
+      .prepare('SELECT * FROM docket_group_items ORDER BY added_at ASC')
+      .all<DocketGroupItemRow>();
+
+    const deliveryIdsByGroup = new Map<string, string[]>();
+    for (const item of itemsRes.results || []) {
+      const arr = deliveryIdsByGroup.get(item.group_id) || [];
+      arr.push(item.delivery_id);
+      deliveryIdsByGroup.set(item.group_id, arr);
+    }
+
+    return (groupsRes.results || []).map((g) => ({
+      id: g.id,
+      name: g.name,
+      deliveryIds: deliveryIdsByGroup.get(g.id) || [],
+      createdBy: g.created_by || null,
+      createdAt: g.created_at,
+      updatedAt: g.updated_at,
+    }));
+  }
+
+  async getGroupById(groupId: string) {
+    await this.ensureSchemaReady();
+    const group = await this.db
+      .prepare('SELECT * FROM docket_groups WHERE id = ?')
+      .bind(groupId)
+      .first<DocketGroupRow>();
+    if (!group) return null;
+
+    const itemsRes = await this.db
+      .prepare('SELECT delivery_id FROM docket_group_items WHERE group_id = ? ORDER BY added_at ASC')
+      .bind(groupId)
+      .all<{ delivery_id: string }>();
+
+    return {
+      id: group.id,
+      name: group.name,
+      deliveryIds: (itemsRes.results || []).map((r) => r.delivery_id),
+      createdBy: group.created_by || null,
+      createdAt: group.created_at,
+      updatedAt: group.updated_at,
+    };
+  }
+
+  async createGroup(input: { name: string; deliveryIds?: string[]; createdBy?: string }) {
+    await this.ensureSchemaReady();
+    const cleanName = String(input.name || '').trim();
+    if (!cleanName) {
+      throw new Error('Group name is required.');
+    }
+    const id = `grp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const now = new Date().toISOString();
+    const uniqueIds = Array.from(
+      new Set((Array.isArray(input.deliveryIds) ? input.deliveryIds : []).map((d) => String(d).trim()).filter(Boolean))
+    );
+
+    const stmts: any[] = [
+      this.db
+        .prepare('INSERT INTO docket_groups (id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(id, cleanName, input.createdBy || null, now, now),
+    ];
+
+    for (const delId of uniqueIds) {
+      const exists = await this.db
+        .prepare('SELECT id FROM deliveries WHERE id = ?')
+        .bind(delId)
+        .first<{ id: string }>();
+      if (exists) {
+        stmts.push(
+          this.db
+            .prepare(
+              'INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)'
+            )
+            .bind(id, delId, input.createdBy || null, now)
+        );
+      }
+    }
+
+    await this.db.batch(stmts);
+    return await this.getGroupById(id);
+  }
+
+  async updateGroup(
+    groupId: string,
+    updates: { name?: string; deliveryIds?: string[] },
+    actorId?: string
+  ) {
+    await this.ensureSchemaReady();
+    const existing = await this.db
+      .prepare('SELECT * FROM docket_groups WHERE id = ?')
+      .bind(groupId)
+      .first<DocketGroupRow>();
+    if (!existing) {
+      throw new Error(`Docket group not found: ${groupId}`);
+    }
+
+    const now = new Date().toISOString();
+    const nextName =
+      updates.name !== undefined ? String(updates.name).trim() || existing.name : existing.name;
+
+    const stmts: any[] = [
+      this.db
+        .prepare('UPDATE docket_groups SET name = ?, updated_at = ? WHERE id = ?')
+        .bind(nextName, now, groupId),
+    ];
+
+    if (Array.isArray(updates.deliveryIds)) {
+      stmts.push(
+        this.db.prepare('DELETE FROM docket_group_items WHERE group_id = ?').bind(groupId)
+      );
+      const uniqueIds = Array.from(
+        new Set(updates.deliveryIds.map((d) => String(d).trim()).filter(Boolean))
+      );
+      for (const delId of uniqueIds) {
+        const exists = await this.db
+          .prepare('SELECT id FROM deliveries WHERE id = ?')
+          .bind(delId)
+          .first<{ id: string }>();
+        if (exists) {
+          stmts.push(
+            this.db
+              .prepare(
+                'INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)'
+              )
+              .bind(groupId, delId, actorId || null, now)
+          );
+        }
+      }
+    }
+
+    await this.db.batch(stmts);
+    return await this.getGroupById(groupId);
+  }
+
+  async addDeliveryToGroup(groupId: string, deliveryId: string, addedBy?: string) {
+    await this.ensureSchemaReady();
+    const group = await this.db
+      .prepare('SELECT id FROM docket_groups WHERE id = ?')
+      .bind(groupId)
+      .first();
+    if (!group) throw new Error(`Docket group not found: ${groupId}`);
+
+    const delivery = await this.db
+      .prepare('SELECT id FROM deliveries WHERE id = ?')
+      .bind(deliveryId)
+      .first();
+    if (!delivery) throw new Error(`Delivery docket not found: ${deliveryId}`);
+
+    const now = new Date().toISOString();
+    await this.db.batch([
+      this.db
+        .prepare(
+          'INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)'
+        )
+        .bind(groupId, deliveryId, addedBy || null, now),
+      this.db
+        .prepare('UPDATE docket_groups SET updated_at = ? WHERE id = ?')
+        .bind(now, groupId),
+    ]);
+
+    return await this.getGroupById(groupId);
+  }
+
+  async removeDeliveryFromGroup(groupId: string, deliveryId: string) {
+    await this.ensureSchemaReady();
+    const group = await this.db
+      .prepare('SELECT id FROM docket_groups WHERE id = ?')
+      .bind(groupId)
+      .first();
+    if (!group) throw new Error(`Docket group not found: ${groupId}`);
+
+    const now = new Date().toISOString();
+    await this.db.batch([
+      this.db
+        .prepare('DELETE FROM docket_group_items WHERE group_id = ? AND delivery_id = ?')
+        .bind(groupId, deliveryId),
+      this.db
+        .prepare('UPDATE docket_groups SET updated_at = ? WHERE id = ?')
+        .bind(now, groupId),
+    ]);
+
+    return await this.getGroupById(groupId);
+  }
+
+  async deleteGroup(groupId: string) {
+    await this.ensureSchemaReady();
+    const existing = await this.db
+      .prepare('SELECT id, name FROM docket_groups WHERE id = ?')
+      .bind(groupId)
+      .first<{ id: string; name: string }>();
+    if (!existing) {
+      return { deleted: false, id: groupId };
+    }
+
+    // Non-destructive: deletes only the group and memberships, never the underlying dockets
+    await this.db.batch([
+      this.db.prepare('DELETE FROM docket_group_items WHERE group_id = ?').bind(groupId),
+      this.db.prepare('DELETE FROM docket_groups WHERE id = ?').bind(groupId),
+    ]);
+
+    return { deleted: true, id: groupId, name: existing.name };
+  }
+
+  private normalizePartMatchCode(raw: string): string {
+    return String(raw || '')
+      .trim()
+      .toUpperCase()
+      .replace(/^P(?:ART)?\s*[:#-]?\s*/i, '')
+      .trim();
+  }
+
+  /**
+   * Scan a part code against a manually curated Docket Group.
+   * - Identifies which member docket owns the part.
+   * - Rejects parts not belonging to any docket in the group.
+   * - Requires explicit operator docket allocation (`targetDeliveryId` + `targetPartId`) when >1 docket matches.
+   * - Strictly commits using the authenticated server session user.
+   */
+  async scanGroupPart(
+    groupId: string,
+    input: {
+      code: string;
+      scannedVia?: 'qr' | 'barcode' | 'ocr_label' | 'manual';
+      receivedQuantity?: number;
+      mode?: 'set' | 'increment';
+      targetDeliveryId?: string;
+      targetPartId?: string;
+      idempotencyKey?: string;
+      notes?: string;
+      rawOcrText?: string;
+      userId?: string;
+      employeeName?: string;
+      employeeRole?: string;
+    }
+  ) {
+    const group = await this.getGroupById(groupId);
+    if (!group) {
+      throw new Error(`Docket group not found: ${groupId}`);
+    }
+    if (group.deliveryIds.length === 0) {
+      return {
+        status: 'not_found',
+        matched: false,
+        message: `Group "${group.name}" has no dockets assigned.`,
+      };
+    }
+
+    const cleanCode = String(input.code || '').trim();
+    if (!cleanCode) {
+      throw new Error('Scanned code is required.');
+    }
+
+    // If operator already selected a specific member docket + part to resolve a multi-docket conflict:
+    if (input.targetDeliveryId && input.targetPartId) {
+      if (!group.deliveryIds.includes(input.targetDeliveryId)) {
+        throw new Error(
+          `Forbidden: Docket ${input.targetDeliveryId} is not a member of group "${group.name}".`
+        );
+      }
+      const delivery = await this.db
+        .prepare('SELECT id, docket_number, supplier FROM deliveries WHERE id = ?')
+        .bind(input.targetDeliveryId)
+        .first<{ id: string; docket_number: string; supplier: string }>();
+      const part = await this.db
+        .prepare('SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?')
+        .bind(input.targetDeliveryId, input.targetPartId)
+        .first<DeliveryPartRow>();
+      if (!delivery || !part) {
+        throw new Error('Selected target part could not be found on the chosen docket.');
+      }
+      const qtyToCommit =
+        input.receivedQuantity !== undefined ? Number(input.receivedQuantity) : part.required_quantity;
+      const commitRes = await this.updatePartReceivedQuantity(delivery.id, part.id, {
+        receivedQuantity: qtyToCommit,
+        mode: input.mode,
+        idempotencyKey: input.idempotencyKey,
+        scannedVia: input.scannedVia || 'qr',
+        scannedCode: cleanCode,
+        status: 'received',
+        notes: input.notes,
+        rawOcrText: input.rawOcrText,
+        userId: input.userId,
+        employeeName: input.employeeName,
+        employeeRole: input.employeeRole,
+        eventAction: 'group_part_scan',
+      });
+      return {
+        ...commitRes,
+        matched: true,
+        deliveryId: delivery.id,
+        docketNumber: delivery.docket_number,
+        supplier: delivery.supplier,
+        groupId,
+      };
+    }
+
+    // Load all member deliveries & their parts
+    const placeholders = group.deliveryIds.map(() => '?').join(', ');
+    const deliveriesRes = await this.db
+      .prepare(`SELECT id, docket_number, supplier FROM deliveries WHERE id IN (${placeholders})`)
+      .bind(...group.deliveryIds)
+      .all<{ id: string; docket_number: string; supplier: string }>();
+    const partsRes = await this.db
+      .prepare(
+        `SELECT * FROM delivery_parts WHERE delivery_id IN (${placeholders}) ORDER BY docket_line_index ASC`
+      )
+      .bind(...group.deliveryIds)
+      .all<DeliveryPartRow>();
+
+    const delById = new Map((deliveriesRes.results || []).map((d) => [d.id, d]));
+    const normUpper = cleanCode.toUpperCase();
+    const normCode = this.normalizePartMatchCode(cleanCode);
+    const barcodeIdxMatch = cleanCode.match(/^\d{4,10}-(\d{1,5})$/);
+    const docketNoSuffix = barcodeIdxMatch ? String(parseInt(barcodeIdxMatch[1], 10)) : null;
+
+    type CandidateMatch = {
+      deliveryId: string;
+      docketNumber: string;
+      supplier: string;
+      part: DeliveryPartRow;
+      matchedMode: 'exact-part' | 'docket-no' | 'exact-item';
+    };
+
+    const candidates: CandidateMatch[] = [];
+    for (const part of partsRes.results || []) {
+      const del = delById.get(part.delivery_id);
+      if (!del) continue;
+      const pNorm = this.normalizePartMatchCode(part.part_number);
+      const pRawUpper = String(part.part_number || '').trim().toUpperCase();
+      const itemNorm = String(part.item_number || '').trim();
+
+      let matchedMode: CandidateMatch['matchedMode'] | null = null;
+      if (pRawUpper === normUpper || (normCode && pNorm === normCode)) {
+        matchedMode = 'exact-part';
+      } else if (docketNoSuffix && itemNorm === docketNoSuffix) {
+        matchedMode = 'docket-no';
+      } else if (itemNorm === cleanCode) {
+        matchedMode = 'exact-item';
+      }
+
+      if (matchedMode) {
+        candidates.push({
+          deliveryId: del.id,
+          docketNumber: del.docket_number,
+          supplier: del.supplier,
+          part,
+          matchedMode,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      return {
+        status: 'not_found',
+        matched: false,
+        message: `Part "${cleanCode}" does not belong to any docket in group "${group.name}".`,
+      };
+    }
+
+    const distinctDeliveries = new Set(candidates.map((c) => c.deliveryId));
+    if (distinctDeliveries.size > 1 || candidates.length > 1) {
+      // If multiple dockets match (or multiple rows in a group match), require explicit operator allocation!
+      if (distinctDeliveries.size > 1) {
+        return {
+          status: 'ambiguous',
+          ambiguous: true,
+          matched: true,
+          message: `Part "${cleanCode}" appears in ${distinctDeliveries.size} dockets in group "${group.name}". Please select which docket to allocate this scan to.`,
+          conflictCandidates: candidates.map((c) => ({
+            deliveryId: c.deliveryId,
+            docketNumber: c.docketNumber,
+            supplier: c.supplier,
+            partId: c.part.id,
+            partNumber: c.part.part_number,
+            itemNumber: c.part.item_number,
+            description: c.part.description,
+            requiredQuantity: c.part.required_quantity,
+            receivedQuantity: c.part.received_quantity,
+            status: c.part.status,
+            matchedMode: c.matchedMode,
+          })),
+        };
+      }
+    }
+
+    // Unique delivery match: pick outstanding candidate first if same docket had split lines, else first
+    const chosen =
+      candidates.find((c) => c.part.status === 'outstanding') || candidates[0];
+    const qtyToCommit =
+      input.receivedQuantity !== undefined
+        ? Number(input.receivedQuantity)
+        : chosen.part.required_quantity;
+
+    const commitRes = await this.updatePartReceivedQuantity(chosen.deliveryId, chosen.part.id, {
+      receivedQuantity: qtyToCommit,
+      mode: input.mode,
+      idempotencyKey: input.idempotencyKey,
+      scannedVia: input.scannedVia || 'qr',
+      scannedCode: cleanCode,
+      status: 'received',
+      notes: input.notes,
+      rawOcrText: input.rawOcrText,
+      userId: input.userId,
+      employeeName: input.employeeName,
+      employeeRole: input.employeeRole,
+      eventAction: 'group_part_scan',
+    });
+
+    return {
+      ...commitRes,
+      matched: true,
+      deliveryId: chosen.deliveryId,
+      docketNumber: chosen.docketNumber,
+      supplier: chosen.supplier,
+      groupId,
+    };
   }
 
   /**
@@ -2090,8 +2731,10 @@ export class PalletTrackDbService {
             (SELECT COUNT(*) FROM (SELECT id, employee_code, role, active FROM users LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id FROM sessions LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1)) +
-            (SELECT COUNT(*) FROM (SELECT id, version FROM deliveries LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, version, needs_review, review_reason FROM deliveries LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, name FROM docket_groups LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT group_id, delivery_id FROM docket_group_items LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT seq, id FROM realtime_events LIMIT 1)) AS schema_ready`
         )
         .first();
@@ -2144,6 +2787,8 @@ export class PalletTrackDbService {
         supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
         notes TEXT,
         version INTEGER NOT NULL DEFAULT 1,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        review_reason TEXT,
         created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -2225,6 +2870,20 @@ export class PalletTrackDbService {
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL
       )`,
+      `CREATE TABLE IF NOT EXISTS docket_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS docket_group_items (
+        group_id TEXT NOT NULL REFERENCES docket_groups(id) ON DELETE CASCADE,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        added_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, delivery_id)
+      )`,
     ];
 
     const schemaBootstrapStatements = [
@@ -2248,6 +2907,9 @@ export class PalletTrackDbService {
       'CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)',
       'CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC)',
       'CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)',
+      'CREATE INDEX IF NOT EXISTS idx_docket_groups_created_at ON docket_groups(created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_docket_group_items_delivery ON docket_group_items(delivery_id)',
+      'CREATE INDEX IF NOT EXISTS idx_docket_group_items_group ON docket_group_items(group_id)',
     ];
 
     try {
@@ -2278,6 +2940,8 @@ export class PalletTrackDbService {
         { table: 'scan_events', col: 'idempotency_key', sql: 'ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT' },
         { table: 'scan_events', col: 'sequence_number', sql: 'ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER' },
         { table: 'deliveries', col: 'version', sql: 'ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+        { table: 'deliveries', col: 'needs_review', sql: 'ALTER TABLE deliveries ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0' },
+        { table: 'deliveries', col: 'review_reason', sql: 'ALTER TABLE deliveries ADD COLUMN review_reason TEXT' },
         { table: 'delivery_parts', col: 'revision', sql: 'ALTER TABLE delivery_parts ADD COLUMN revision TEXT' },
         { table: 'delivery_parts', col: 'manually_edited', sql: 'ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0' },
         { table: 'delivery_parts', col: 'original_ocr_values', sql: 'ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT' },

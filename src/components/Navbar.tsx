@@ -1,8 +1,9 @@
 import React from 'react';
 import {
-  QrCode,
   LayoutGrid,
   ClipboardList,
+  FolderKanban,
+  Upload,
   BarChart3,
   Settings,
   ChevronDown,
@@ -17,7 +18,7 @@ import { Delivery, UserAccount, UserRole } from '../types/delivery';
 import { BRANDING } from '../config/branding';
 import { PartTrackLogo } from './PartTrackLogo';
 
-export type NavTabId = 'scanner' | 'checklist' | 'dashboard' | 'orders' | 'reports';
+export type NavTabId = 'dashboard' | 'orders' | 'groups' | 'reports' | 'checklist' | 'scanner';
 
 interface NavbarProps {
   activeTab: NavTabId;
@@ -37,6 +38,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
   activeDelivery,
+  onOpenNewDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
   currentUser,
@@ -127,36 +129,70 @@ export const Navbar: React.FC<NavbarProps> = ({
             )}
           </div>
 
-          {/* Center Desktop Navigation Links (for larger screens) */}
+          {/* Center Desktop Navigation Links (No global Scan button) */}
           <div className="hidden lg:flex items-center gap-1 bg-[var(--pt-bg-secondary,#101321)] p-1 rounded-xl border border-[var(--pt-border,#29243D)]">
-            {(
-              [
-                { id: 'dashboard', label: 'Home', icon: LayoutGrid },
-                { id: 'orders', label: 'Orders', icon: ClipboardList },
-                { id: 'scanner', label: 'Scan', icon: QrCode },
-                { id: 'reports', label: 'Reports', icon: BarChart3 },
-              ] as const
-            ).map((navItem) => {
-              const Icon = navItem.icon;
-              const isActive =
-                activeTab === navItem.id ||
-                (navItem.id === 'orders' && activeTab === 'checklist');
-              return (
-                <button
-                  key={navItem.id}
-                  type="button"
-                  onClick={() => setActiveTab(navItem.id)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer ${
-                    isActive
-                      ? 'pt-btn-primary text-white'
-                      : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" />
-                  <span>{navItem.label}</span>
-                </button>
-              );
-            })}
+            <button
+              type="button"
+              onClick={() => setActiveTab('dashboard')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'dashboard'
+                  ? 'pt-btn-primary text-white'
+                  : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
+              }`}
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+              <span>Dashboard</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('orders')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'orders' || activeTab === 'checklist'
+                  ? 'pt-btn-primary text-white'
+                  : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
+              }`}
+            >
+              <ClipboardList className="w-3.5 h-3.5" />
+              <span>Dockets</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('groups')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'groups'
+                  ? 'pt-btn-primary text-white'
+                  : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
+              }`}
+            >
+              <FolderKanban className="w-3.5 h-3.5" />
+              <span>Docket Groups</span>
+            </button>
+
+            {onOpenNewDelivery && (
+              <button
+                type="button"
+                onClick={onOpenNewDelivery}
+                className="px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white hover:bg-white/5"
+              >
+                <Upload className="w-3.5 h-3.5 text-[var(--pt-primary-light,#C084FC)]" />
+                <span>Upload Dockets</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('reports')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer ${
+                activeTab === 'reports'
+                  ? 'pt-btn-primary text-white'
+                  : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
+              }`}
+            >
+              <BarChart3 className="w-3.5 h-3.5" />
+              <span>Reports</span>
+            </button>
           </div>
 
           {/* Right: Employee Account Badge + Actions */}
@@ -234,12 +270,12 @@ export const Navbar: React.FC<NavbarProps> = ({
       </header>
 
       {/* =========================================================================
-       * BOTTOM NAVIGATION: 5-Tab Mobile & Tablet Ergonomic Bar
-       * [ Home · Orders · Scan · Reports · Settings ]
+       * BOTTOM NAVIGATION: 5-Tab Mobile & Tablet Bar (No standalone Scan button)
+       * [ Dashboard · Dockets · Groups · Upload · Reports ]
        * ========================================================================= */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[var(--pt-bg-secondary,#101321)]/95 backdrop-blur-md border-t border-[var(--pt-border,#29243D)] pb-safe shadow-[0_-6px_28px_rgba(0,0,0,0.65)]">
         <div className="max-w-lg mx-auto grid grid-cols-5 h-15 items-center px-1">
-          {/* 1. Home */}
+          {/* 1. Dashboard */}
           <button
             type="button"
             onClick={() => setActiveTab('dashboard')}
@@ -251,11 +287,11 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <LayoutGrid className="w-4 h-4 stroke-[2]" />
             <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
-              Home
+              Dashboard
             </span>
           </button>
 
-          {/* 2. Orders */}
+          {/* 2. Dockets */}
           <button
             type="button"
             onClick={() => setActiveTab('orders')}
@@ -267,37 +303,40 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <ClipboardList className="w-4 h-4 stroke-[2]" />
             <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
-              Orders
+              Dockets
             </span>
           </button>
 
-          {/* 3. Scan (Prominent Primary Action) */}
+          {/* 3. Docket Groups */}
           <button
             type="button"
-            onClick={() => setActiveTab('scanner')}
+            onClick={() => setActiveTab('groups')}
             className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer py-1 min-h-[44px] ${
-              activeTab === 'scanner'
-                ? 'text-white'
-                : 'text-[var(--pt-primary-light,#C084FC)] hover:text-white'
+              activeTab === 'groups'
+                ? 'text-[var(--pt-primary-light,#C084FC)]'
+                : 'text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white'
             }`}
-            title="Launch High-Speed Scanner"
-            aria-label="Scan parts"
           >
-            <div
-              className={`w-10 h-7 rounded-xl flex items-center justify-center transition-all ${
-                activeTab === 'scanner'
-                  ? 'pt-btn-primary text-white scale-105'
-                  : 'bg-[var(--pt-card,#15182A)] border border-[var(--pt-primary,#A020F0)]/60 text-[var(--pt-primary-light,#C084FC)] shadow-[0_0_12px_var(--pt-glow,rgba(160,32,240,0.3))]'
-              }`}
-            >
-              <QrCode className="w-4 h-4 stroke-[2.3]" />
-            </div>
-            <span className="text-[10px] font-mono font-extrabold tracking-tight leading-none uppercase">
-              Scan
+            <FolderKanban className="w-4 h-4 stroke-[2]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Groups
             </span>
           </button>
 
-          {/* 4. Reports */}
+          {/* 4. Upload Dockets */}
+          <button
+            type="button"
+            onClick={() => onOpenNewDelivery?.()}
+            className="flex flex-col items-center justify-center gap-1 text-[var(--pt-primary-light,#C084FC)] hover:text-white transition-colors cursor-pointer py-1 min-h-[44px]"
+            title="Upload Delivery Dockets"
+          >
+            <Upload className="w-4 h-4 stroke-[2.2]" />
+            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
+              Upload
+            </span>
+          </button>
+
+          {/* 5. Reports */}
           <button
             type="button"
             onClick={() => setActiveTab('reports')}
@@ -310,19 +349,6 @@ export const Navbar: React.FC<NavbarProps> = ({
             <BarChart3 className="w-4 h-4 stroke-[2]" />
             <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
               Reports
-            </span>
-          </button>
-
-          {/* 5. Settings */}
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className="flex flex-col items-center justify-center gap-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white transition-colors cursor-pointer py-1 min-h-[44px]"
-            title="Application Settings & Theme"
-          >
-            <Settings className="w-4 h-4 stroke-[2]" />
-            <span className="text-[10px] font-mono font-bold tracking-tight leading-none uppercase">
-              Settings
             </span>
           </button>
         </div>

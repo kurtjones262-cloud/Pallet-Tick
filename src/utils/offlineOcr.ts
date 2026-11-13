@@ -54,6 +54,7 @@ export interface SmartDocketExtractionOptions {
   forceGemini?: boolean;
   fetchImpl?: typeof fetch;
   clientBaseBackoffMs?: number;
+  sourceFileIds?: string[];
 }
 
 const CLIENT_MAX_AUTOMATIC_RETRIES = 3;
@@ -79,19 +80,31 @@ export function validateClientExtractedDocketResult(data: any): ExtractedDocketR
   if (!Array.isArray(data.items)) {
     throw new Error('Incomplete OCR response: missing extracted parts array (items).');
   }
-  for (let i = 0; i < data.items.length; i++) {
-    const item = data.items[i];
-    if (!item || typeof item !== 'object') {
-      throw new Error(`Malformed OCR item at row ${i + 1}.`);
+  const validateItems = (arr: any[], prefix = '') => {
+    for (let i = 0; i < arr.length; i++) {
+      const item = arr[i];
+      if (!item || typeof item !== 'object') {
+        throw new Error(`Malformed OCR item at ${prefix}row ${i + 1}.`);
+      }
+      const partNo = String(item.partNumber ?? '').trim();
+      const desc = String(item.description ?? '').trim();
+      if (!partNo && !desc) {
+        throw new Error(`Incomplete OCR item at ${prefix}row ${i + 1}: missing part number and description.`);
+      }
+      const qty = Number(item.quantity ?? 1);
+      if (!Number.isFinite(qty) || qty < 1) {
+        throw new Error(`Invalid OCR item quantity at ${prefix}row ${i + 1}: quantity must be >= 1.`);
+      }
     }
-    const partNo = String(item.partNumber ?? '').trim();
-    const desc = String(item.description ?? '').trim();
-    if (!partNo && !desc) {
-      throw new Error(`Incomplete OCR item at row ${i + 1}: missing part number and description.`);
-    }
-    const qty = Number(item.quantity ?? 1);
-    if (!Number.isFinite(qty) || qty < 1) {
-      throw new Error(`Invalid OCR item quantity at row ${i + 1}: quantity must be >= 1.`);
+  };
+  validateItems(data.items);
+  if (Array.isArray(data.separatedDockets)) {
+    for (let dIdx = 0; dIdx < data.separatedDockets.length; dIdx++) {
+      const sep = data.separatedDockets[dIdx];
+      if (!sep || typeof sep !== 'object' || !Array.isArray(sep.items)) {
+        throw new Error(`Malformed separated docket entry at index ${dIdx}.`);
+      }
+      validateItems(sep.items, `docket ${dIdx + 1} `);
     }
   }
   return data as ExtractedDocketResult;
@@ -592,6 +605,7 @@ export async function performSmartDocketExtraction(
     tesseractResult = await extractDocketWithTesseractFirst(images, {
       pageTextHints,
       supplierHint: options?.supplierHint,
+      sourceFileIds: options?.sourceFileIds,
       onProgress,
     });
   } catch (err: any) {

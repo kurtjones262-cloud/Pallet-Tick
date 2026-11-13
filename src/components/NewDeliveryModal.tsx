@@ -31,13 +31,14 @@ import { apiNotifyDocketProcessing } from '../services/palletTrackApi';
 
 interface NewDeliveryModalProps {
   onClose: () => void;
-  onDeliveryCreated: (delivery: Delivery) => void;
+  onDeliveryCreated: (delivery: Delivery | Delivery[]) => void;
 }
 
 export type UploadOrigin = 'camera' | 'gallery' | 'files';
 
 interface CapturedPage {
   id: string;
+  sourceFileId: string;
   dataUrl: string;
   name: string;
   sourceType?: 'image' | 'pdf';
@@ -133,6 +134,8 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
         const filePrefix =
           filesArray.length > 1 ? `(${i + 1}/${filesArray.length}) ` : '';
 
+        const sourceFileId = `file_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`;
+
         // 1. Handle PDF documents
         if (isPdfFile(file)) {
           setLoadingFileStatus(`${filePrefix}Staging PDF "${file.name}"...`);
@@ -145,6 +148,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             for (const pdfPage of pdfPages) {
               newPages.push({
                 id: `pdf_${Date.now()}_${i}_p${pdfPage.pageNumber}_${Math.random().toString(36).slice(2, 5)}`,
+                sourceFileId,
                 dataUrl: pdfPage.dataUrl,
                 name: pdfPage.name,
                 sourceType: 'pdf',
@@ -177,6 +181,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             const prepared = await prepareColorImageForGemini(file, 1800);
             newPages.push({
               id: `page_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+              sourceFileId,
               dataUrl: prepared.dataUrl,
               name:
                 file.name ||
@@ -194,6 +199,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
               const dataUrl = await readFileAsDataUrl(file);
               newPages.push({
                 id: `page_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+                sourceFileId,
                 dataUrl,
                 name: file.name || `Page ${capturedPages.length + i + 1}`,
                 sourceType: 'image',
@@ -225,6 +231,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             const docPreviewDataUrl = renderTextDocumentPreviewDataUrl(file.name, rawText);
             newPages.push({
               id: `doc_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+              sourceFileId,
               dataUrl: docPreviewDataUrl,
               name: file.name,
               sourceType: 'pdf',
@@ -248,6 +255,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           const prepared = await prepareColorImageForGemini(file, 1800);
           newPages.push({
             id: `file_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+            sourceFileId,
             dataUrl: prepared.dataUrl,
             name: file.name || `File ${capturedPages.length + i + 1}`,
             sourceType: 'image',
@@ -303,6 +311,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
     try {
       const imagesToProcess = capturedPages.map((p) => p.dataUrl);
       const pageTextHints = capturedPages.map((p) => p.textHint || {});
+      const sourceFileIds = capturedPages.map((p) => p.sourceFileId || p.id);
       const output = await performSmartDocketExtraction(
         imagesToProcess,
         (update) => {
@@ -312,6 +321,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
         pageTextHints,
         {
           supplierHint: selectedSupplierRule,
+          sourceFileIds,
         }
       );
 
@@ -346,13 +356,14 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           initialSupplierRule={selectedSupplierRule}
           attachedPages={capturedPages.map((p, idx) => ({
             pageNumber: idx + 1,
+            sourceFileId: p.sourceFileId,
             dataUrl: p.dataUrl,
             name: p.name,
             textHint: p.textHint,
           }))}
           onClose={() => setReviewData(null)}
-          onDeliveryCreated={(newDel) => {
-            onDeliveryCreated(newDel);
+          onDeliveryCreated={(newDels) => {
+            onDeliveryCreated(newDels);
             onClose();
           }}
         />

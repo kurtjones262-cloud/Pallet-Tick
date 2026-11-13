@@ -61,6 +61,7 @@ const localDb = getLocalDevDatabase();
 app.use(async (req, res, next) => {
   if (
     req.path.startsWith('/api/deliveries') ||
+    req.path.startsWith('/api/groups') ||
     req.path.startsWith('/api/users') ||
     req.path.startsWith('/api/auth') ||
     req.path.startsWith('/api/realtime') ||

@@ -1019,6 +1019,7 @@ async function runTests() {
       (globalThis as any).fetch = disallow('fetch');
       Math.random = disallow('Math.random') as any;
 
+      // @ts-ignore — generated dynamically by `npm run build`
       const workerModule = await import('../build/worker.js');
       const hasDefaultExport = typeof workerModule?.default?.fetch === 'function';
       const hasDurableObjectClass = typeof workerModule?.PalletTrackRealtimeHub === 'function';

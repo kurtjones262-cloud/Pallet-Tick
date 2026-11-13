@@ -74,6 +74,7 @@ export interface DeliveryPart {
   scannedCode?: string;
   lastScannedById?: string;
   lastScannedByName?: string;
+  scannedByUsers?: PartScanAttribution[];
   version?: number;
   pendingSync?: boolean;
   notes?: string;
@@ -84,6 +85,14 @@ export interface DeliveryPart {
   lastEditedAt?: string;
   originalOcrValues?: OriginalOcrPartSnapshot;
   editHistory?: PartEditAuditEntry[];
+}
+
+export interface PartScanAttribution {
+  userId?: string;
+  employeeName: string;
+  quantityScanned: number;
+  lastScannedAt: string;
+  scanCount: number;
 }
 
 export interface PendingQuantityConfirmation {
@@ -152,10 +161,35 @@ export interface Delivery {
   totalParts?: number;
   receivedParts?: number;
   status: 'receiving' | 'completed';
+  needsReview?: boolean;
+  separationReason?: string;
   docketAttachments: DocketAttachment[];
   parts: DeliveryPart[];
   unexpectedParts: UnexpectedPart[];
   scanHistory: ScanEvent[];
+}
+
+export interface DocketGroup {
+  id: string;
+  name: string;
+  deliveryIds: string[];
+  createdBy?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GroupScanConflictCandidate {
+  deliveryId: string;
+  docketNumber: string;
+  supplier: string;
+  partId: string;
+  partNumber: string;
+  itemNumber: string;
+  description: string;
+  requiredQuantity: number;
+  receivedQuantity: number;
+  status: PartStatus;
+  matchedMode: 'exact-part' | 'docket-no' | 'exact-item';
 }
 
 export interface ScanFeedback {

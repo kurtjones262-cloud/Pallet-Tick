@@ -15,28 +15,34 @@ import {
   AlertTriangle,
   ArrowUpRight,
   Layers,
+  FolderKanban,
 } from 'lucide-react';
-import { Delivery } from '../types/delivery';
+import { Delivery, DocketGroup } from '../types/delivery';
 import { getStoredDeliveries, getPartVerificationState } from '../utils/storage';
-import { exportDeliveryPdf } from '../utils/pdfExport';
+import { exportDeliveryPdf, exportGroupPdf } from '../utils/pdfExport';
 import { exportDeliveryCsv } from '../utils/csvExport';
 import { exportAllDeliveriesBackupZip } from '../utils/zipExport';
 import { BRANDING } from '../config/branding';
 
 interface ReportsViewProps {
   activeDelivery: Delivery | null;
+  groups?: DocketGroup[];
   onSelectDelivery?: (delivery: Delivery) => void;
   onOpenOrderDetails?: (delivery: Delivery) => void;
 }
 
 export const ReportsView: React.FC<ReportsViewProps> = ({
   activeDelivery,
+  groups = [],
   onSelectDelivery,
   onOpenOrderDetails,
 }) => {
   const [deliveries, setDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
   const [selectedDocketId, setSelectedDocketId] = useState<string>(
     () => activeDelivery?.id || getStoredDeliveries()[0]?.id || ''
+  );
+  const [selectedGroupId, setSelectedGroupId] = useState<string>(
+    () => groups[0]?.id || ''
   );
   const [isExportingZip, setIsExportingZip] = useState(false);
   const [dateFilter, setDateFilter] = useState<'7d' | '30d' | 'all'>('all');
@@ -58,6 +64,19 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       setSelectedDocketId(activeDelivery.id);
     }
   }, [activeDelivery?.id]);
+
+  useEffect(() => {
+    if (!selectedGroupId && groups.length > 0) {
+      setSelectedGroupId(groups[0].id);
+    } else if (selectedGroupId && !groups.some((g) => g.id === selectedGroupId)) {
+      setSelectedGroupId(groups[0]?.id || '');
+    }
+  }, [groups, selectedGroupId]);
+
+  const targetExportGroup = useMemo(
+    () => groups.find((g) => g.id === selectedGroupId) || groups[0] || null,
+    [groups, selectedGroupId]
+  );
 
   // Filter deliveries by selected date window
   const filteredDeliveries = useMemo(() => {
@@ -456,6 +475,42 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               <span>{isExportingZip ? 'Packaging ZIP...' : 'Export All Dockets (.ZIP)'}</span>
             </button>
           </div>
+
+          {groups.length > 0 && (
+            <div className="pt-3 border-t border-[var(--pt-border,#29243D)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <FolderKanban className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)] shrink-0" />
+                <label className="text-[11px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] shrink-0">
+                  Docket Group PDF:
+                </label>
+                <select
+                  value={selectedGroupId}
+                  onChange={(e) => setSelectedGroupId(e.target.value)}
+                  className="h-9 px-3 rounded-xl bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-xs font-mono font-bold text-white outline-none focus:border-[var(--pt-primary,#A020F0)]"
+                >
+                  {groups.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name} ({g.deliveryIds?.length || 0} dockets)
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <button
+                type="button"
+                disabled={!targetExportGroup}
+                onClick={() => {
+                  if (!targetExportGroup) return;
+                  const idSet = new Set(targetExportGroup.deliveryIds || []);
+                  const memberDockets = deliveries.filter((d) => idSet.has(d.id));
+                  exportGroupPdf(targetExportGroup, memberDockets);
+                }}
+                className="h-10 px-4 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/5 border border-[var(--pt-primary,#A020F0)]/50 text-[var(--pt-primary-light,#C084FC)] font-mono font-bold text-xs uppercase tracking-wider inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 transition-colors"
+              >
+                <Printer className="w-4 h-4" />
+                <span>Export Group PDF</span>
+              </button>
+            </div>
+          )}
         </section>
 
         {/* =====================================================================

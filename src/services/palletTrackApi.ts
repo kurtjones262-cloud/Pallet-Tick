@@ -1,5 +1,13 @@
 import { resolveApiUrl } from '../utils/apiConfig.ts';
-import { Delivery, DeliveryPart, ScanEvent, UserAccount, UserRole } from '../types/delivery.ts';
+import {
+  Delivery,
+  DeliveryPart,
+  DocketGroup,
+  GroupScanConflictCandidate,
+  ScanEvent,
+  UserAccount,
+  UserRole,
+} from '../types/delivery.ts';
 
 export interface BackendHealth {
   connected: boolean;
@@ -529,10 +537,17 @@ export async function apiCreateDelivery(delivery: Partial<Delivery>): Promise<De
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Failed to create delivery (HTTP ${res.status})`);
+    const errBody = await res.json().catch(() => ({}));
+    const error: any = new Error(
+      errBody.error || `Failed to create delivery (HTTP ${res.status})`
+    );
+    error.status = res.status;
+    error.code = errBody.code;
+    error.existingDeliveryId = errBody.existingDeliveryId;
+    throw error;
   }
 
+  markBackendSynced();
   return await res.json();
 }
 
@@ -556,6 +571,56 @@ export async function apiUpdateDelivery(id: string, updates: Partial<Delivery>):
   }
 
   return await res.json();
+}
+
+/**
+ * Delete a completed docket (Supervisor / Admin / Super Admin only)
+ */
+export async function apiDeleteDelivery(id: string): Promise<{ success: boolean; deleted: boolean; id: string }> {
+  const url = resolveApiUrl(`/api/deliveries/${encodeURIComponent(id)}?completedOnly=1`);
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error: any = new Error(body.error || `Failed to delete docket (HTTP ${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
+
+  markBackendSynced();
+  return body;
+}
+
+/**
+ * Clear ALL dockets and docket groups across central database (Supervisor / Admin / Super Admin only)
+ */
+export async function apiClearAllDeliveries(): Promise<{
+  success: boolean;
+  deletedDeliveries: number;
+  deletedGroups: number;
+}> {
+  const url = resolveApiUrl('/api/deliveries/clear-all');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify({ confirm: true }),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error: any = new Error(body.error || `Failed to clear all dockets (HTTP ${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
+
+  markBackendSynced();
+  return body;
 }
 
 /**
@@ -914,5 +979,220 @@ export async function apiFetchRealtimePresence(deliveryId?: string | null) {
   }
   return body;
 }
+
+// ==========================================
+// DOCKET GROUPS & GROUP SCANNING API
+// ==========================================
+
+export async function apiListGroups(): Promise<DocketGroup[]> {
+  const url = resolveApiUrl('/api/groups');
+  const res = await fetch(url, {
+    method: 'GET',
+    cache: 'no-store',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+
+  const body = await res.json().catch(() => []);
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to load docket groups (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return Array.isArray(body) ? body : [];
+}
+
+export async function apiGetGroup(id: string): Promise<DocketGroup | null> {
+  const url = resolveApiUrl(`/api/groups/${encodeURIComponent(id)}`);
+  const res = await fetch(url, {
+    method: 'GET',
+    cache: 'no-store',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+  if (res.status === 404) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to load docket group (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+export async function apiCreateGroup(input: {
+  name: string;
+  description?: string;
+  deliveryIds?: string[];
+}): Promise<DocketGroup> {
+  const url = resolveApiUrl('/api/groups');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify(input),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to create docket group (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return body;
+}
+
+export async function apiUpdateGroup(
+  id: string,
+  updates: { name?: string; description?: string }
+): Promise<DocketGroup> {
+  const url = resolveApiUrl(`/api/groups/${encodeURIComponent(id)}`);
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify(updates),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to update docket group (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return body;
+}
+
+export async function apiDeleteGroup(id: string): Promise<{ success: boolean; deleted: boolean; id: string }> {
+  const url = resolveApiUrl(`/api/groups/${encodeURIComponent(id)}`);
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to delete docket group (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return body;
+}
+
+export async function apiAddDocketsToGroup(
+  groupId: string,
+  deliveryIds: string[]
+): Promise<DocketGroup> {
+  const url = resolveApiUrl(`/api/groups/${encodeURIComponent(groupId)}/dockets`);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify({ deliveryIds }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to add dockets to group (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return body;
+}
+
+export async function apiRemoveDocketFromGroup(
+  groupId: string,
+  deliveryId: string
+): Promise<DocketGroup> {
+  const url = resolveApiUrl(
+    `/api/groups/${encodeURIComponent(groupId)}/dockets/${encodeURIComponent(deliveryId)}`
+  );
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: getAuthHeaders({ Accept: 'application/json' }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body?.error || `Failed to remove docket from group (HTTP ${res.status})`);
+  }
+  markBackendSynced();
+  return body;
+}
+
+export async function apiScanGroupPart(
+  groupId: string,
+  payload: {
+    scannedCode: string;
+    scannedVia?: 'qr' | 'barcode' | 'ocr_label' | 'manual';
+    receivedQuantity?: number;
+    mode?: 'set' | 'increment';
+    targetDeliveryId?: string;
+    targetPartId?: string;
+    idempotencyKey?: string;
+    rawOcrText?: string;
+  }
+): Promise<{
+  status: 'committed' | 'duplicate' | 'ambiguous' | 'not_found';
+  deliveryId?: string;
+  partId?: string;
+  part?: DeliveryPart;
+  scanEvent?: ScanEvent;
+  deliveryVersion?: number;
+  idempotentReplay?: boolean;
+  alreadyScannedBy?: string;
+  alreadyScannedAt?: string;
+  candidates?: GroupScanConflictCandidate[];
+  message: string;
+}> {
+  const url = resolveApiUrl(`/api/groups/${encodeURIComponent(groupId)}/scan`);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: getAuthHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }),
+    body: JSON.stringify(payload),
+  });
+
+  const body = await res.json().catch(() => ({}));
+
+  if (res.status === 404 || body?.code === 'NOT_IN_GROUP' || body?.code === 'PART_NOT_IN_GROUP') {
+    return {
+      status: 'not_found',
+      message: body?.error || 'Scanned part does not belong to any docket in this group.',
+    };
+  }
+
+  if (res.status === 409) {
+    if (body?.code === 'AMBIGUOUS_GROUP_PART') {
+      return {
+        status: 'ambiguous',
+        candidates: Array.isArray(body.candidates) ? body.candidates : [],
+        message:
+          body.error ||
+          'Multiple dockets in this group contain this part. Select the docket to allocate this scan to.',
+      };
+    }
+    return {
+      status: 'duplicate',
+      deliveryId: body?.deliveryId,
+      partId: body?.partId,
+      part: body?.part,
+      alreadyScannedBy: body?.alreadyScannedBy,
+      alreadyScannedAt: body?.alreadyScannedAt,
+      message: body?.error || body?.message || 'Duplicate scan — part already fully received.',
+    };
+  }
+
+  if (!res.ok) {
+    throw new Error(body?.error || `Group scan failed (HTTP ${res.status})`);
+  }
+
+  markBackendSynced();
+  return {
+    status: 'committed',
+    deliveryId: body.deliveryId,
+    partId: body.partId,
+    part: body.part,
+    scanEvent: body.scanEvent,
+    deliveryVersion: body.deliveryVersion,
+    idempotentReplay: body.idempotentReplay,
+    message: body.message || 'Group scan committed.',
+  };
+}
+
 
 

@@ -32,6 +32,7 @@ export interface ActiveScanData {
   matchedPart: DeliveryPart | null;
   docketNumber: string;
   customerOrSupplier: string;
+  targetDeliveryId?: string;
   rawOcrText?: string;
   isUnlisted?: boolean;
   unconfidentFields?: string[];

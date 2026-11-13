@@ -17,12 +17,15 @@ import {
   RefreshCw,
   Moon,
   Sun,
+  AlertTriangle,
 } from 'lucide-react';
 import { AppSettings, SupplierRuleId, UserAccount } from '../types/delivery';
 import {
   getStoredSettings,
   saveStoredSettings,
   clearAllDeliveries,
+  clearAllDocketsAuthoritative,
+  syncDeliveriesFromCentralDatabase,
   getPreferredSupplierRuleId,
   setPreferredSupplierRuleId,
 } from '../utils/storage';
@@ -45,6 +48,7 @@ import { checkBackendConnection } from '../services/palletTrackApi';
 interface SettingsModalProps {
   onClose: () => void;
   onSettingsSaved: () => void;
+  onAllDocketsCleared?: () => void;
   onOpenMigration?: () => void;
   onOpenUserManagement?: () => void;
   currentUser?: UserAccount | null;
@@ -53,10 +57,15 @@ interface SettingsModalProps {
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   onSettingsSaved,
+  onAllDocketsCleared,
   onOpenMigration,
   onOpenUserManagement,
   currentUser,
 }) => {
+  const canManageDeletion =
+    currentUser?.role === 'super_admin' ||
+    currentUser?.role === 'admin' ||
+    currentUser?.role === 'supervisor';
   const userKey = currentUser?.id || currentUser?.employeeCode || null;
   const extraUserKey =
     currentUser?.id && currentUser?.employeeCode && currentUser.id !== currentUser.employeeCode
@@ -71,6 +80,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
   const [isBackingUpZip, setIsBackingUpZip] = useState(false);
   const [isSyncingNow, setIsSyncingNow] = useState(false);
+  const [confirmClearAllDockets, setConfirmClearAllDockets] = useState(false);
+  const [isClearingAllDockets, setIsClearingAllDockets] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
 
   const handleToggle = (field: keyof AppSettings) => {
     const next = { ...settings, [field]: !settings[field] };
@@ -109,16 +121,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       await checkBackendConnection();
       await realtimeClient.flushPendingOfflineScans();
+      await syncDeliveriesFromCentralDatabase();
+      onSettingsSaved();
     } finally {
       setTimeout(() => setIsSyncingNow(false), 500);
     }
   };
 
-  const handleClearAll = () => {
-    if (confirm('Clear all local cached deliveries and reset local workspace cache?')) {
+  const handleRefreshLocalCache = async () => {
+    setIsSyncingNow(true);
+    try {
       clearAllDeliveries();
+      await syncDeliveriesFromCentralDatabase();
       onSettingsSaved();
       onClose();
+    } finally {
+      setIsSyncingNow(false);
+    }
+  };
+
+  const handleConfirmClearAllDockets = async () => {
+    if (!canManageDeletion) return;
+    setClearError(null);
+    setIsClearingAllDockets(true);
+    try {
+      await clearAllDocketsAuthoritative();
+      setConfirmClearAllDockets(false);
+      onAllDocketsCleared?.();
+      onSettingsSaved();
+      onClose();
+    } catch (err: any) {
+      setClearError(err?.message || 'Failed to clear all dockets from central database.');
+    } finally {
+      setIsClearingAllDockets(false);
     }
   };
 
@@ -629,12 +664,62 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             <button
               type="button"
-              onClick={handleClearAll}
-              className="w-full h-10 px-3 rounded-xl border border-[#EF4444]/40 bg-[#EF4444]/10 hover:bg-[#EF4444]/20 text-xs font-mono font-bold text-[#EF4444] flex items-center justify-center gap-2 cursor-pointer transition-colors"
+              onClick={handleRefreshLocalCache}
+              disabled={isSyncingNow}
+              className="w-full h-10 px-3 rounded-xl border border-[var(--pt-border,#29243D)] bg-[var(--pt-bg,#080B12)] hover:bg-white/5 text-xs font-mono font-bold text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white flex items-center justify-center gap-2 cursor-pointer transition-colors"
             >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Clear Local Cache &amp; Reset Workspace</span>
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingNow ? 'animate-spin' : ''}`} />
+              <span>Refresh Local Cache from Server</span>
             </button>
+
+            {canManageDeletion && (
+              <div className="pt-2 border-t border-[var(--pt-border,#29243D)] space-y-2">
+                {clearError && (
+                  <div className="p-2.5 rounded-lg bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] text-[11px] font-mono">
+                    {clearError}
+                  </div>
+                )}
+
+                {!confirmClearAllDockets ? (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClearAllDockets(true)}
+                    className="w-full h-10 px-3 rounded-xl border border-[#EF4444]/40 bg-[#EF4444]/10 hover:bg-[#EF4444]/20 text-xs font-mono font-bold text-[#EF4444] flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>CLEAR ALL DOCKETS (ALL USERS)</span>
+                  </button>
+                ) : (
+                  <div className="p-3 rounded-xl border border-[#EF4444]/50 bg-[#EF4444]/10 space-y-2.5">
+                    <div className="flex items-start gap-2 text-[#EF4444] text-[11px] font-mono">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>
+                        Permanently delete ALL dockets, parts, scan logs &amp; docket groups from Cloudflare D1 and all devices? User accounts remain intact.
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        disabled={isClearingAllDockets}
+                        onClick={() => setConfirmClearAllDockets(false)}
+                        className="h-8 px-3 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] text-[var(--pt-text-secondary,#A3A8BD)] text-[11px] font-mono font-bold cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isClearingAllDockets}
+                        onClick={handleConfirmClearAllDockets}
+                        className="h-8 px-3 rounded-lg bg-[#EF4444] hover:bg-red-500 text-white text-[11px] font-mono font-extrabold uppercase inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      >
+                        {isClearingAllDockets && <Loader2 className="w-3 h-3 animate-spin" />}
+                        <span>{isClearingAllDockets ? 'Clearing...' : 'Confirm Clear All'}</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </section>
 
           {/* =================================================================

@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
   supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
   notes TEXT,
   version INTEGER NOT NULL DEFAULT 1,
+  needs_review INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
+  review_reason TEXT,
   created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -141,6 +143,24 @@ CREATE TABLE IF NOT EXISTS realtime_events (
   created_at TEXT NOT NULL
 );
 
+-- 8. Docket Groups Tables
+-- Manually curated groups of independent delivery dockets for combined scanning/reporting
+CREATE TABLE IF NOT EXISTS docket_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS docket_group_items (
+  group_id TEXT NOT NULL REFERENCES docket_groups(id) ON DELETE CASCADE,
+  delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+  added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (group_id, delivery_id)
+);
+
 -- Indexes for performance and high-frequency scan queries
 CREATE INDEX IF NOT EXISTS idx_users_active ON users(active);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code);
@@ -161,4 +181,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(ide
 CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id);
 CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC);
 CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_docket_groups_created_at ON docket_groups(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_docket_group_items_delivery ON docket_group_items(delivery_id);
+CREATE INDEX IF NOT EXISTS idx_docket_group_items_group ON docket_group_items(group_id);
 

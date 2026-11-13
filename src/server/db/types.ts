@@ -70,6 +70,8 @@ export interface DeliveryRow {
   supplier_profile: string;
   notes: string | null;
   version?: number;
+  needs_review?: number;
+  review_reason?: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -155,5 +157,20 @@ export interface RealtimeEventRow {
   delivery_version: number | null;
   payload: string;
   created_at: string;
+}
+
+export interface DocketGroupRow {
+  id: string;
+  name: string;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocketGroupItemRow {
+  group_id: string;
+  delivery_id: string;
+  added_by: string | null;
+  added_at: string;
 }
 

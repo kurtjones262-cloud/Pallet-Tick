@@ -6,12 +6,14 @@ import {
   Archive,
   Loader2,
   Database,
+  AlertTriangle,
 } from 'lucide-react';
 import { Delivery, UserRole } from '../types/delivery';
 import {
   getStoredDeliveries,
   setActiveDeliveryId,
-  deleteDelivery,
+  deleteDeliveryAuthoritative,
+  clearAllDocketsAuthoritative,
 } from '../utils/storage';
 import { exportDeliveryZip, exportAllDeliveriesBackupZip } from '../utils/zipExport';
 
@@ -32,24 +34,54 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
   onClose,
   userRole,
 }) => {
+  const canManageDeletion =
+    userRole === 'super_admin' || userRole === 'admin' || userRole === 'supervisor';
+
   const [deliveries, setDeliveries] = useState<Delivery[]>(getStoredDeliveries());
   const [filter, setFilter] = useState<'all' | 'receiving' | 'completed'>('all');
   const [exportingId, setExportingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const filtered = deliveries.filter((d) => {
     if (filter === 'all') return true;
     return d.status === filter;
   });
 
-  const handleDelete = (id: string, e: React.MouseEvent) => {
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm('Delete this delivery and its scan history?')) {
-      deleteDelivery(id);
+    if (!canManageDeletion) return;
+    if (!confirm('Delete this completed docket and its scan history?')) return;
+    setActionError(null);
+    setDeletingId(id);
+    try {
+      await deleteDeliveryAuthoritative(id);
       const remaining = getStoredDeliveries();
       setDeliveries(remaining);
       if (activeDeliveryId === id && remaining.length > 0) {
         onSelectDelivery(remaining[0]);
       }
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to delete docket.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const handleClearAllModalAction = async () => {
+    if (!canManageDeletion) return;
+    if (!confirm('Permanently delete ALL delivery dockets across the system? Users will be preserved.')) {
+      return;
+    }
+    setActionError(null);
+    setDeletingId('all');
+    try {
+      await clearAllDocketsAuthoritative();
+      setDeliveries([]);
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to clear all dockets.');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -135,6 +167,18 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
               </button>
             )}
 
+            {canManageDeletion && deliveries.length > 0 && (
+              <button
+                onClick={handleClearAllModalAction}
+                disabled={deletingId === 'all'}
+                className="h-7 px-2.5 inline-flex items-center gap-1 rounded-lg border border-[#EF4444]/40 bg-[#EF4444]/10 hover:bg-[#EF4444]/20 text-[#EF4444] text-xs font-mono font-semibold cursor-pointer transition-colors"
+                title="Clear all dockets (Supervisor/Admin only)"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span className="hidden xs:inline">Clear All</span>
+              </button>
+            )}
+
             <button
               onClick={onClose}
               className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[var(--pt-text,#FFFFFF)] cursor-pointer"
@@ -143,6 +187,15 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
             </button>
           </div>
         </div>
+
+        {actionError && (
+          <div className="px-4 py-2 bg-[#EF4444]/15 border-b border-[#EF4444]/40 text-[#EF4444] text-[11px] font-mono flex items-center justify-between gap-2">
+            <span>{actionError}</span>
+            <button onClick={() => setActionError(null)} className="cursor-pointer">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Underline Filter Tabs */}
         <div className="px-4 pt-2 bg-[var(--pt-bg-secondary,#101321)] border-b border-[var(--pt-border,#29243D)] flex items-center gap-5 text-xs font-mono">
@@ -195,6 +248,7 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                 (d as any).stats?.receivedParts ??
                 parts.filter((p) => p.status === 'received').length;
               const percent = total > 0 ? Math.round((received / total) * 100) : 0;
+              const isCompleted = d.status === 'completed' || (total > 0 && received >= total);
               const isActive = d.id === activeDeliveryId;
 
               return (
@@ -213,13 +267,19 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="flex items-baseline gap-2">
+                      <div className="flex items-baseline gap-2 flex-wrap">
                         <span className="font-mono text-xs font-bold text-[var(--pt-text,#FFFFFF)]">
                           {d.docketNumber}
                         </span>
                         {isActive && (
                           <span className="font-mono text-[10px] text-[var(--pt-primary-light,#C084FC)] font-semibold">
                             · Active
+                          </span>
+                        )}
+                        {d.needsReview && (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-[#F59E0B]/15 text-[#F59E0B] text-[9px] font-mono font-bold uppercase">
+                            <AlertTriangle className="w-2.5 h-2.5" />
+                            Review
                           </span>
                         )}
                       </div>
@@ -244,13 +304,18 @@ export const DeliveriesListModal: React.FC<DeliveriesListModalProps> = ({
                           <Archive className="w-3.5 h-3.5" />
                         )}
                       </button>
-                      {userRole !== 'employee' && userRole !== 'operator' && (
+                      {canManageDeletion && isCompleted && (
                         <button
                           onClick={(e) => handleDelete(d.id, e)}
+                          disabled={deletingId === d.id}
                           className="p-1 text-[var(--pt-text-secondary,#A3A8BD)] hover:text-[#EF4444] transition-colors cursor-pointer"
-                          title="Delete delivery"
+                          title="Delete completed docket"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          {deletingId === d.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-[#EF4444]" />
+                          ) : (
+                            <Trash2 className="w-3.5 h-3.5" />
+                          )}
                         </button>
                       )}
                     </div>

@@ -7,6 +7,11 @@ export type RealtimeEventType =
   | 'delivery:updated'
   | 'delivery:completed'
   | 'delivery:reopened'
+  | 'delivery:deleted'
+  | 'deliveries:cleared'
+  | 'group:created'
+  | 'group:updated'
+  | 'group:deleted'
   | 'parts:batch_saved'
   | 'part:added'
   | 'part:edited'
@@ -822,7 +827,7 @@ export class PalletTrackRealtimeBroker {
         rowsRes = await db
           .prepare(
             `SELECT * FROM realtime_events
-             WHERE seq > ? AND (delivery_id = ? OR delivery_id IS NULL OR event_type LIKE 'delivery:%')
+             WHERE seq > ? AND (delivery_id = ? OR delivery_id IS NULL OR event_type LIKE 'delivery:%' OR event_type LIKE 'deliveries:%' OR event_type LIKE 'group:%')
              ORDER BY seq ASC
              LIMIT 300`
           )

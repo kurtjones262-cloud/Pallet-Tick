@@ -16,20 +16,20 @@ import {
   ArrowLeft,
   AlertTriangle,
   Tag,
+  FolderKanban,
 } from 'lucide-react';
 import {
   Delivery,
   DeliveryPart,
+  DocketGroup,
+  GroupScanConflictCandidate,
   ScanFeedback,
   PendingQuantityConfirmation,
   SupplierRuleId,
   ScanEvent,
-  UnexpectedPart,
   ScanMethod,
 } from '../types/delivery';
 import {
-  confirmScannedPartQuantity,
-  commitScanPartAuthoritative,
   parseBarcodeDocketNo,
   getDeliverySupplierRule,
   setDeliverySupplierRule,
@@ -37,9 +37,13 @@ import {
   setPreferredSupplierRuleId,
   SUPPLIER_RULES,
   getStoredSettings,
-  updateDelivery,
+  getStoredDeliveries,
+  saveStoredDeliveries,
+  findMatchingPartsInDelivery,
+  findMatchingPartsInGroup,
+  commitScanPartAuthoritative,
 } from '../utils/storage';
-import { isBackendOnline } from '../services/palletTrackApi';
+import { apiScanGroupPart, isBackendOnline } from '../services/palletTrackApi';
 import { realtimeClient } from '../services/realtimeSync';
 
 import {
@@ -62,6 +66,7 @@ import {
   ScanConfirmationModal,
   ActiveScanData,
   ConfirmedScanPayload,
+  ScanMethodType,
 } from './ScanConfirmationModal';
 import { DuplicateScanModal, DuplicateScanModalData } from './DuplicateScanModal';
 import { detectDuplicateScan } from '../utils/duplicateDetection';
@@ -74,8 +79,19 @@ const SELECTED_CAMERA_STORAGE_KEY = 'pallettick_selected_camera_id_v2';
 
 type DiagnosticCategory = 'camera' | 'barcode_qr' | 'ocr' | 'external_hid' | 'error';
 
+interface GroupScanConflictModalState {
+  rawCode: string;
+  scanMethod: ScanMethodType;
+  detectedQuantity: number;
+  rawOcrText?: string;
+  candidates: GroupScanConflictCandidate[];
+}
+
 interface ScannerViewProps {
+  scanScope?: { mode: 'delivery'; deliveryId: string } | { mode: 'group'; groupId: string };
   delivery: Delivery | null;
+  group?: DocketGroup | null;
+  groupDeliveries?: Delivery[];
   onUpdateDelivery: (updated: Delivery) => void;
   onOpenTestSheet?: () => void;
   onOpenNewDelivery?: () => void;
@@ -86,7 +102,10 @@ interface ScannerViewProps {
 }
 
 export const ScannerView: React.FC<ScannerViewProps> = ({
+  scanScope,
   delivery,
+  group = null,
+  groupDeliveries = [],
   onUpdateDelivery,
   externalPendingQuantity,
   onClearExternalPendingQuantity,
@@ -146,25 +165,36 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   // STRICT DUPLICATE SCAN WARNING STATE (prominent RED warning popup)
   const [activeDuplicateWarning, setActiveDuplicateWarning] = useState<DuplicateScanModalData | null>(null);
 
-  // Notify parent container so global menu bars are hidden while confirming a scan or viewing duplicate warning
+  // DOCKET GROUP PART ALLOCATION MODAL (when >1 member docket contains the scanned part)
+  const [groupConflictModal, setGroupConflictModal] = useState<GroupScanConflictModalState | null>(
+    null
+  );
+
+  // Notify parent container so global menu bars are hidden while confirming a scan or resolving conflict
   useEffect(() => {
-    onScanConfirmationChange?.(activeScanConfirmation !== null || activeDuplicateWarning !== null);
+    onScanConfirmationChange?.(
+      activeScanConfirmation !== null ||
+        activeDuplicateWarning !== null ||
+        groupConflictModal !== null
+    );
     return () => {
       onScanConfirmationChange?.(false);
     };
-  }, [activeScanConfirmation, activeDuplicateWarning, onScanConfirmationChange]);
+  }, [activeScanConfirmation, activeDuplicateWarning, groupConflictModal, onScanConfirmationChange]);
 
   // Announce active scanning status to real-time room while ScannerView is mounted
   useEffect(() => {
-    if (delivery?.id) {
-      realtimeClient.joinDeliveryRoom(delivery.id, 'scanning');
+    const activeTargetId =
+      scanScope?.mode === 'group' ? groupDeliveries[0]?.id || delivery?.id : delivery?.id;
+    if (activeTargetId) {
+      realtimeClient.joinDeliveryRoom(activeTargetId, 'scanning');
     }
     return () => {
-      if (delivery?.id) {
+      if (activeTargetId) {
         realtimeClient.setWorkerStatus('viewing');
       }
     };
-  }, [delivery?.id]);
+  }, [delivery?.id, scanScope?.mode, groupDeliveries]);
 
   // App Settings (sound, vibration, speech)
   const [appSettings] = useState(() => getStoredSettings());
@@ -172,8 +202,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   // Real-time concurrent scan guard: if another worker completes scanning the exact part
   // that this worker currently has open in the Scan Confirmation sheet, immediately alert!
   useEffect(() => {
-    if (!activeScanConfirmation?.matchedPart || !delivery) return;
-    const livePart = delivery.parts.find(
+    if (!activeScanConfirmation?.matchedPart) return;
+    const targetDel = activeScanConfirmation.targetDeliveryId
+      ? groupDeliveries.find((d) => d.id === activeScanConfirmation.targetDeliveryId) || delivery
+      : delivery;
+    if (!targetDel) return;
+    const livePart = targetDel.parts.find(
       (p) => p.id === activeScanConfirmation.matchedPart?.id
     );
     if (
@@ -201,7 +235,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       activeDuplicateWarningRef.current = dupData;
       setActiveDuplicateWarning(dupData);
     }
-  }, [delivery, activeScanConfirmation, appSettings]);
+  }, [delivery, groupDeliveries, activeScanConfirmation, appSettings]);
 
   // Status and feedback states
   const [scanFeedback, setScanFeedback] = useState<ScanFeedback | null>(null);
@@ -322,6 +356,9 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const activeDuplicateWarningRef = useRef<DuplicateScanModalData | null>(null);
   activeDuplicateWarningRef.current = activeDuplicateWarning;
 
+  const groupConflictModalRef = useRef<GroupScanConflictModalState | null>(null);
+  groupConflictModalRef.current = groupConflictModal;
+
   // Atomic processing lock against rapid consecutive events
   const isProcessingScanRef = useRef<boolean>(false);
 
@@ -330,6 +367,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   const deliveryRef = useRef(delivery);
   deliveryRef.current = delivery;
+
+  const scanScopeRef = useRef(scanScope);
+  scanScopeRef.current = scanScope;
+
+  const groupRef = useRef(group);
+  groupRef.current = group;
+
+  const groupDeliveriesRef = useRef<Delivery[]>(groupDeliveries);
+  groupDeliveriesRef.current = groupDeliveries;
 
   const onUpdateDeliveryRef = useRef(onUpdateDelivery);
   onUpdateDeliveryRef.current = onUpdateDelivery;
@@ -396,6 +442,28 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     activeDuplicateWarningRef.current = null;
     lastScannedTimeRef.current = Date.now();
   }, []);
+
+  /**
+   * Rejects a code that does not belong to the active docket or group
+   */
+  const rejectUnscopedCode = useCallback(
+    (code: string, message: string) => {
+      playAudio.duplicate(appSettings.soundEnabled);
+      triggerHaptic('duplicate', appSettings.vibrationEnabled);
+      triggerVisualFlash('red');
+      setScanFeedback({
+        type: 'unexpected',
+        code,
+        message,
+        timestamp: Date.now(),
+      });
+      if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
+      feedbackTimeoutRef.current = setTimeout(() => {
+        setScanFeedback(null);
+      }, 4200);
+    },
+    [appSettings, triggerVisualFlash]
+  );
 
   /**
    * Universal device video inputs enumeration (ranked with primary rear wide sensor first)
@@ -641,10 +709,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   /**
    * CENTRAL SCAN EVENT HANDLER
-   * When ANY barcode, QR code, or OCR label is detected:
-   * 1. Pauses/locks camera scanning.
-   * 2. Evaluates against delivery parts.
-   * 3. Opens the dedicated ScanConfirmationModal.
+   * Strictly scoped either to a single opened Delivery Docket OR a Docket Group's member dockets.
+   * Rejects external codes clearly and triggers docket allocation if >1 group docket matches.
    */
   const handleScannedCode = useCallback(
     (
@@ -652,10 +718,11 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       inputSource: ScanInputSource = 'camera_barcode_qr',
       detectedFormat?: string
     ) => {
-      // Block scanning if confirmation modal or duplicate warning is already open, or scan is being processed
+      // Block scanning if confirmation, conflict allocation, or duplicate warning modal is already open
       if (
         activeScanConfirmationRef.current !== null ||
         activeDuplicateWarningRef.current !== null ||
+        groupConflictModalRef.current !== null ||
         isProcessingScanRef.current
       ) {
         return;
@@ -665,16 +732,10 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const isOcrMode = activeSupplierRuleRef.current?.id === 'ocr_label';
       if (isOcrMode && inputSource === 'camera_barcode_qr') {
         const fmt = (detectedFormat || '').toUpperCase();
-        if (
-          fmt === 'QR_CODE' ||
-          fmt === 'QRCODE' ||
-          fmt.includes('QR')
-        ) {
+        if (fmt === 'QR_CODE' || fmt === 'QRCODE' || fmt.includes('QR')) {
           return;
         }
-
         const trimmed = codeText.trim();
-        // Guard against QR payloads (URL, mailto, complex json/multiline data)
         if (
           trimmed.startsWith('http://') ||
           trimmed.startsWith('https://') ||
@@ -685,11 +746,19 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         }
       }
 
+      const isGroupMode =
+        scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
       const currentDelivery = deliveryRef.current;
-      if (!currentDelivery) return;
+      const scopedGroup = groupRef.current;
+      const scopedDeliveries = isGroupMode
+        ? groupDeliveriesRef.current
+        : currentDelivery
+        ? [currentDelivery]
+        : [];
 
-      // Requirement 5: Online-only receiving
-      // Prevent scans from being recorded when disconnected from central database
+      if (scopedDeliveries.length === 0) return;
+
+      // Online-only receiving guard
       if (!isBackendOnline()) {
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('parttrack_connection_required'));
@@ -703,76 +772,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       if (!cleaned) return;
 
       const now = Date.now();
-
-      // Debounce identical scans within 1.2 seconds
       if (cleaned === lastScannedCodeRef.current && now - lastScannedTimeRef.current < 1200) {
-        return;
-      }
-
-      // STRICT DUPLICATE SCAN PREVENTION:
-      // When a QR code or barcode is scanned, immediately check whether that exact part
-      // has already been successfully scanned in the current delivery.
-      // Must happen before adding the part or quantity to the scanned parts list.
-      const duplicateCheck = detectDuplicateScan(currentDelivery, cleaned);
-      if (duplicateCheck.isDuplicate) {
-        lastScannedCodeRef.current = cleaned;
-        lastScannedTimeRef.current = now;
-
-        triggerDuplicateWarning({
-          partNumber: duplicateCheck.partNumber,
-          description: duplicateCheck.description,
-          code: cleaned,
-          itemNumber: duplicateCheck.itemNumber,
-          palletNumber: duplicateCheck.palletNumber,
-          scannedAt: duplicateCheck.scannedAt,
-          scannedBy: duplicateCheck.scannedBy,
-          customMessage: duplicateCheck.scannedBy
-            ? 'Duplicate scan – this part has already been received by another worker'
-            : undefined,
-          receivedQuantity: duplicateCheck.receivedQuantity,
-        });
         return;
       }
 
       lastScannedCodeRef.current = cleaned;
       lastScannedTimeRef.current = now;
 
-      appendDiagnosticLog(
-        inputSource === 'external_hid' ? 'external_hid' : 'barcode_qr',
-        `Scanned code "${cleaned}" via ${inputSource}`
-      );
-
-      // Evaluate match against delivery parts
-      const parsedBarcode = parseBarcodeDocketNo(cleaned);
-      const cleanNorm = cleaned.toUpperCase().replace(/\s*-\s*/g, '-');
-
-      let matched: DeliveryPart | null = null;
-
-      // 1. Exact partNumber match
-      matched = currentDelivery.parts.find(
-        (p) => p.partNumber.trim().toUpperCase().replace(/\s*-\s*/g, '-') === cleanNorm
-      ) || null;
-
-      // 2. Barcode item number or numeric line match
-      if (!matched && parsedBarcode.hasDashFormat && parsedBarcode.numericNo !== null) {
-        matched = currentDelivery.parts.find((p) => {
-          const rawItm = (p.itemNumber || '').trim().replace(/^ITM-0*/i, '');
-          return (
-            rawItm === String(parsedBarcode.numericNo) ||
-            p.docketLineIndex === parsedBarcode.numericNo
-          );
-        }) || null;
-      }
-
-      if (!matched) {
-        matched = currentDelivery.parts.find((p) => {
-          const rawItm = (p.itemNumber || '').trim().toUpperCase();
-          return rawItm && (rawItm === cleanNorm || rawItm.replace(/^ITM-0*/, '') === cleanNorm);
-        }) || null;
-      }
-
-      // Determine scan method
-      let method: 'barcode' | 'qr_code' | 'ocr_label' | 'external_hid' | 'manual' = 'barcode';
+      let method: ScanMethodType = 'barcode';
       if (inputSource === 'external_hid') {
         method = 'external_hid';
       } else if (inputSource === 'manual') {
@@ -781,54 +788,154 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         method = 'qr_code';
       }
 
-      const detectedPartNo = matched ? matched.partNumber : cleaned;
-      const detectedDesc = matched ? matched.description : '';
-      const detectedQty = matched ? Math.max(1, matched.quantity ?? 1) : 1;
+      appendDiagnosticLog(
+        inputSource === 'external_hid' ? 'external_hid' : 'barcode_qr',
+        `Scanned code "${cleaned}" via ${inputSource} (${isGroupMode ? `Group:${scopedGroup?.name}` : `Docket:#${currentDelivery?.docketNumber}`})`
+      );
 
-      if (matched) {
-        realtimeClient.notifyScanningActivity({
-          action: 'confirming_scan',
-          partId: matched.id,
-          partNumber: matched.partNumber,
-          itemNumber: matched.itemNumber,
-          summary: `Scanning ${matched.partNumber} (No. ${matched.itemNumber})`,
-        });
+      // Deduplicated matches strictly inside scoped delivery or scoped group deliveries
+      const rawMatches = isGroupMode
+        ? findMatchingPartsInGroup(scopedDeliveries, cleaned)
+        : findMatchingPartsInDelivery(scopedDeliveries[0], cleaned);
+
+      const dedupedMatches = rawMatches.filter(
+        (m, idx, arr) =>
+          arr.findIndex((x) => x.delivery.id === m.delivery.id && x.part.id === m.part.id) === idx
+      );
+
+      if (dedupedMatches.length === 0) {
+        // Fallback check on previously recorded scannedCode inside scoped dockets
+        for (const d of scopedDeliveries) {
+          const dupCheck = detectDuplicateScan(d, cleaned);
+          if (dupCheck.isDuplicate) {
+            triggerDuplicateWarning({
+              partNumber: dupCheck.partNumber,
+              description: dupCheck.description,
+              code: cleaned,
+              itemNumber: dupCheck.itemNumber,
+              palletNumber: dupCheck.palletNumber,
+              scannedAt: dupCheck.scannedAt,
+              scannedBy: dupCheck.scannedBy,
+              customMessage: dupCheck.scannedBy
+                ? `Duplicate scan – already received by ${dupCheck.scannedBy} on Docket #${d.docketNumber}`
+                : undefined,
+              receivedQuantity: dupCheck.receivedQuantity,
+            });
+            return;
+          }
+        }
+
+        rejectUnscopedCode(
+          cleaned,
+          isGroupMode
+            ? `✕ Rejected: "${cleaned}" does not belong to any docket in group "${scopedGroup?.name || ''}"`
+            : `✕ Rejected: "${cleaned}" does not belong to Docket #${scopedDeliveries[0].docketNumber}`
+        );
+        return;
       }
 
-      // Play detection chime & feedback
+      const uncompleted = dedupedMatches.filter((m) => !m.alreadyFullyScanned);
+
+      if (uncompleted.length === 0) {
+        const firstDup = dedupedMatches[0];
+        triggerDuplicateWarning({
+          partNumber: firstDup.part.partNumber,
+          description: firstDup.part.description,
+          code: cleaned,
+          itemNumber: firstDup.part.itemNumber,
+          palletNumber: firstDup.part.palletNumber,
+          scannedAt: firstDup.part.scannedAt,
+          scannedBy: firstDup.part.lastScannedByName,
+          customMessage: firstDup.part.lastScannedByName
+            ? `Duplicate scan – already received on Docket #${firstDup.delivery.docketNumber} by ${firstDup.part.lastScannedByName}`
+            : `Duplicate scan – already received on Docket #${firstDup.delivery.docketNumber}`,
+          receivedQuantity: firstDup.part.receivedQuantity ?? firstDup.part.quantity ?? 1,
+        });
+        return;
+      }
+
+      // Group mode ambiguity: require explicit operator docket allocation if >1 member docket has this part
+      if (isGroupMode && uncompleted.length > 1) {
+        playAudio.unexpected(appSettings.soundEnabled);
+        triggerHaptic('unexpected', appSettings.vibrationEnabled);
+        const candidates: GroupScanConflictCandidate[] = uncompleted.map((m) => {
+          const req = Math.max(1, m.part.quantity ?? 1);
+          const rec =
+            m.part.status === 'received' && typeof m.part.receivedQuantity === 'number'
+              ? m.part.receivedQuantity
+              : 0;
+          return {
+            deliveryId: m.delivery.id,
+            docketNumber: m.delivery.docketNumber,
+            supplier: m.delivery.supplier,
+            partId: m.part.id,
+            partNumber: m.part.partNumber,
+            itemNumber: m.part.itemNumber,
+            description: m.part.description,
+            requiredQuantity: req,
+            receivedQuantity: rec,
+            status: m.part.status,
+            matchedMode: m.matchMode,
+          };
+        });
+        const conflictState: GroupScanConflictModalState = {
+          rawCode: cleaned,
+          scanMethod: method,
+          detectedQuantity: Math.max(1, uncompleted[0].part.quantity ?? 1),
+          candidates,
+        };
+        groupConflictModalRef.current = conflictState;
+        setGroupConflictModal(conflictState);
+        return;
+      }
+
+      const match = uncompleted[0];
+      realtimeClient.notifyScanningActivity({
+        action: 'confirming_scan',
+        partId: match.part.id,
+        partNumber: match.part.partNumber,
+        itemNumber: match.part.itemNumber,
+        summary: `Scanning ${match.part.partNumber} (Docket #${match.delivery.docketNumber})`,
+      });
+
       playAudio.success(appSettings.soundEnabled);
       triggerHaptic('success', appSettings.vibrationEnabled);
 
-      // Open dedicated Scan Confirmation Screen!
       const newScanData: ActiveScanData = {
         scanMethod: method,
         rawCode: cleaned,
-        detectedPartNumber: detectedPartNo,
-        detectedDescription: detectedDesc,
-        detectedQuantity: detectedQty,
-        matchedPart: matched,
-        docketNumber: currentDelivery.docketNumber,
-        customerOrSupplier: currentDelivery.supplier || '',
-        isUnlisted: !matched,
+        detectedPartNumber: match.part.partNumber,
+        detectedDescription: match.part.description,
+        detectedQuantity: Math.max(1, match.part.quantity ?? 1),
+        matchedPart: match.part,
+        docketNumber: match.delivery.docketNumber,
+        customerOrSupplier: match.delivery.supplier || '',
+        targetDeliveryId: match.delivery.id,
+        isUnlisted: false,
       };
 
       activeScanConfirmationRef.current = newScanData;
       setActiveScanConfirmation(newScanData);
     },
-    [appendDiagnosticLog, appSettings, triggerDuplicateWarning]
+    [appendDiagnosticLog, appSettings, rejectUnscopedCode, triggerDuplicateWarning]
   );
 
   /**
    * Handle SAVE & SCAN NEXT action from confirmation modal.
-   * Uses authoritative server commit (`commitScanPartAuthoritative`) so concurrent
-   * scans of the same part across multiple devices are atomically checked in D1.
+   * Uses authoritative server commits (`apiScanGroupPart` in Group mode, `commitScanPartAuthoritative` in Single-Docket mode).
    */
   const handleSaveAndScanNext = useCallback(
     async (payload: ConfirmedScanPayload) => {
-      const currentDelivery = deliveryRef.current;
-      if (!currentDelivery) return;
+      const activeConfirm = activeScanConfirmationRef.current;
+      const isGroupMode =
+        scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
 
-      const now = new Date().toISOString();
+      const currentDelivery =
+        (activeConfirm?.targetDeliveryId
+          ? groupDeliveriesRef.current.find((d) => d.id === activeConfirm.targetDeliveryId)
+          : undefined) || deliveryRef.current;
+
+      if (!currentDelivery && !isGroupMode) return;
 
       const scanMethodToCodeType: ScanMethod =
         payload.scanMethod === 'qr_code'
@@ -839,7 +946,6 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           ? 'manual'
           : 'barcode';
 
-      // Debounce same code for 1.5 seconds so camera doesn't re-trigger immediately
       lastScannedCodeRef.current = payload.rawCode;
       lastScannedTimeRef.current = Date.now();
 
@@ -847,125 +953,195 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       activeScanConfirmationRef.current = null;
       setActiveScanConfirmation(null);
 
-      if (payload.matchedPart) {
-        const res = await commitScanPartAuthoritative(
-          currentDelivery,
-          {
-            code: payload.rawCode,
-            detectedType: scanMethodToCodeType,
-            matchedMode: 'exact-part',
-            part: {
-              ...payload.matchedPart,
-              partNumber: payload.partNumber,
-              description: payload.description,
-            },
-          },
-          payload.quantity,
-          {
+      // Group Scan Path -> authoritative group scan endpoint
+      if (isGroupMode && groupRef.current) {
+        try {
+          const idempotencyKey = `gscan_${groupRef.current.id}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+          const res = await apiScanGroupPart(groupRef.current.id, {
+            scannedCode: payload.rawCode || payload.partNumber,
+            scannedVia: scanMethodToCodeType,
+            receivedQuantity: payload.quantity,
             mode: scanMethodToCodeType === 'ocr_label' ? 'increment' : 'set',
+            targetDeliveryId: activeConfirm?.targetDeliveryId || currentDelivery?.id,
+            targetPartId: payload.matchedPart?.id,
+            idempotencyKey,
+            rawOcrText: activeConfirm?.rawOcrText,
+          });
+
+          if (res.status === 'not_found') {
+            rejectUnscopedCode(payload.rawCode, res.message);
+            return;
           }
+
+          if (res.status === 'ambiguous' && res.candidates && res.candidates.length > 0) {
+            const conflictState: GroupScanConflictModalState = {
+              rawCode: payload.rawCode,
+              scanMethod: payload.scanMethod,
+              detectedQuantity: payload.quantity,
+              rawOcrText: activeConfirm?.rawOcrText,
+              candidates: res.candidates,
+            };
+            groupConflictModalRef.current = conflictState;
+            setGroupConflictModal(conflictState);
+            return;
+          }
+
+          if (res.status === 'duplicate') {
+            triggerDuplicateWarning({
+              partNumber: res.part?.partNumber || payload.partNumber,
+              description: res.part?.description || payload.description,
+              code: payload.rawCode,
+              itemNumber: res.part?.itemNumber,
+              palletNumber: res.part?.palletNumber,
+              scannedAt: res.alreadyScannedAt || res.part?.scannedAt,
+              scannedBy: res.alreadyScannedBy || res.part?.lastScannedByName || 'Another worker',
+              customMessage: res.message,
+              receivedQuantity: res.part?.receivedQuantity ?? payload.quantity,
+            });
+            return;
+          }
+
+          if (res.status === 'committed' && res.deliveryId && res.part) {
+            const allStored = getStoredDeliveries();
+            const targetDel =
+              allStored.find((d) => d.id === res.deliveryId) ||
+              groupDeliveriesRef.current.find((d) => d.id === res.deliveryId);
+
+            if (targetDel) {
+              const nextParts = targetDel.parts.map((p) =>
+                p.id === res.part!.id ? { ...p, ...res.part! } : p
+              );
+              const allDone = nextParts.length > 0 && nextParts.every((p) => p.status === 'received');
+              const nextHistory =
+                res.scanEvent && !targetDel.scanHistory.some((ev) => ev.id === res.scanEvent!.id)
+                  ? [res.scanEvent, ...targetDel.scanHistory].slice(0, 300)
+                  : targetDel.scanHistory;
+              const updatedTarget: Delivery = {
+                ...targetDel,
+                parts: nextParts,
+                status: allDone ? 'completed' : 'receiving',
+                version: res.deliveryVersion || (targetDel.version || 1) + 1,
+                scanHistory: nextHistory,
+                updatedAt: new Date().toISOString(),
+              };
+              const updatedList = allStored.map((d) =>
+                d.id === updatedTarget.id ? updatedTarget : d
+              );
+              saveStoredDeliveries(updatedList);
+              onUpdateDeliveryRef.current(updatedTarget);
+            }
+
+            const reqQty = Math.max(1, res.part.quantity ?? payload.matchedPart?.quantity ?? 1);
+            const recQty = res.part.receivedQuantity ?? payload.quantity;
+            const isQtyMatch = recQty === reqQty;
+
+            if (isQtyMatch) {
+              playAudio.success(appSettings.soundEnabled);
+              triggerHaptic('success', appSettings.vibrationEnabled);
+              triggerVisualFlash('green');
+            } else {
+              playAudio.unexpected(appSettings.soundEnabled);
+              triggerHaptic('unexpected', appSettings.vibrationEnabled);
+              triggerVisualFlash('orange');
+            }
+
+            setScanFeedback({
+              type: isQtyMatch ? 'success' : 'quantity_mismatch',
+              code: payload.rawCode,
+              message: `✓ Docket #${targetDel?.docketNumber || ''}: ${payload.partNumber} (${recQty}/${reqQty})`,
+              timestamp: Date.now(),
+            });
+            if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
+            feedbackTimeoutRef.current = setTimeout(() => {
+              setScanFeedback(null);
+            }, 3500);
+          }
+        } catch (err: any) {
+          rejectUnscopedCode(
+            payload.rawCode,
+            err?.message || 'Unable to verify scan against docket group.'
+          );
+        }
+        return;
+      }
+
+      // Single-Docket Scan Path -> authoritative single-delivery commit
+      if (!currentDelivery || !payload.matchedPart) {
+        rejectUnscopedCode(
+          payload.rawCode,
+          `✕ Rejected: "${payload.rawCode || payload.partNumber}" is not part of Docket #${currentDelivery?.docketNumber || ''}`
         );
+        return;
+      }
 
-        onUpdateDeliveryRef.current(res.updatedDelivery);
-
-        if (res.outcome === 'duplicate') {
-          triggerDuplicateWarning({
-            partNumber: res.updatedPart.partNumber || payload.partNumber,
-            description: res.updatedPart.description || payload.description,
-            code: payload.rawCode,
-            itemNumber: res.updatedPart.itemNumber,
-            palletNumber: res.updatedPart.palletNumber,
-            scannedAt: res.alreadyScannedAt || res.updatedPart.scannedAt,
-            scannedBy: res.alreadyScannedBy || res.updatedPart.lastScannedByName || 'Another worker',
-            customMessage:
-              'Duplicate scan – this part has already been received by another worker',
-            receivedQuantity: res.receivedQuantity,
-          });
-          return;
-        }
-
-        if (res.outcome === 'pending_sync') {
-          playAudio.unexpected(appSettings.soundEnabled);
-          triggerHaptic('unexpected', appSettings.vibrationEnabled);
-          triggerVisualFlash('orange');
-          setScanFeedback({
-            type: 'pending_sync',
-            code: payload.rawCode,
-            message: `⏳ Pending Sync: ${payload.partNumber} (will verify on reconnect)`,
-            timestamp: Date.now(),
-          });
-          if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
-          feedbackTimeoutRef.current = setTimeout(() => {
-            setScanFeedback(null);
-          }, 4500);
-          return;
-        }
-
-        // Verified or quantity mismatch committed to D1
-        if (res.isCorrectQuantity) {
-          playAudio.success(appSettings.soundEnabled);
-          triggerHaptic('success', appSettings.vibrationEnabled);
-          triggerVisualFlash('green');
-        } else {
-          playAudio.unexpected(appSettings.soundEnabled);
-          triggerHaptic('unexpected', appSettings.vibrationEnabled);
-          triggerVisualFlash('orange');
-        }
-
-        setScanFeedback({
-          type: res.isCorrectQuantity ? 'success' : 'quantity_mismatch',
+      const res = await commitScanPartAuthoritative(
+        currentDelivery,
+        {
           code: payload.rawCode,
-          message: `✓ Saved: ${payload.partNumber} (Qty ${res.receivedQuantity}/${res.requiredQuantity})`,
+          detectedType: scanMethodToCodeType,
+          matchedMode: 'exact-part',
+          part: {
+            ...payload.matchedPart,
+            partNumber: payload.partNumber,
+            description: payload.description,
+          },
+        },
+        payload.quantity,
+        {
+          mode: scanMethodToCodeType === 'ocr_label' ? 'increment' : 'set',
+          rawOcrText: activeConfirm?.rawOcrText,
+        }
+      );
+
+      onUpdateDeliveryRef.current(res.updatedDelivery);
+
+      if (res.outcome === 'duplicate') {
+        triggerDuplicateWarning({
+          partNumber: res.updatedPart.partNumber || payload.partNumber,
+          description: res.updatedPart.description || payload.description,
+          code: payload.rawCode,
+          itemNumber: res.updatedPart.itemNumber,
+          palletNumber: res.updatedPart.palletNumber,
+          scannedAt: res.alreadyScannedAt || res.updatedPart.scannedAt,
+          scannedBy: res.alreadyScannedBy || res.updatedPart.lastScannedByName || 'Another worker',
+          customMessage:
+            'Duplicate scan – this part has already been received by another worker',
+          receivedQuantity: res.receivedQuantity,
+        });
+        return;
+      }
+
+      if (res.outcome === 'pending_sync') {
+        playAudio.unexpected(appSettings.soundEnabled);
+        triggerHaptic('unexpected', appSettings.vibrationEnabled);
+        triggerVisualFlash('orange');
+        setScanFeedback({
+          type: 'pending_sync',
+          code: payload.rawCode,
+          message: `⏳ Pending Sync: ${payload.partNumber} (will verify on reconnect)`,
           timestamp: Date.now(),
         });
         if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
         feedbackTimeoutRef.current = setTimeout(() => {
           setScanFeedback(null);
-        }, 3500);
+        }, 4500);
         return;
       }
 
-      // Save unlisted part into unexpectedParts and scanHistory
-      const unexpectedItem: UnexpectedPart = {
-        id: `unexp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        code: payload.rawCode || payload.partNumber,
-        codeType: scanMethodToCodeType,
-        scannedAt: now,
-        notes: payload.description
-          ? `${payload.partNumber} (${payload.description}) - Qty ${payload.quantity}`
-          : `Qty ${payload.quantity}`,
-      };
-
-      const scanEvent: ScanEvent = {
-        id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        timestamp: now,
-        code: payload.rawCode || payload.partNumber,
-        codeType: scanMethodToCodeType,
-        status: 'unexpected_warning',
-        partNumber: payload.partNumber,
-        requiredQuantity: 0,
-        receivedQuantity: payload.quantity,
-        addedQuantity: payload.quantity,
-        message: `Recorded unexpected item ${payload.partNumber} — Qty ${payload.quantity}`,
-      };
-
-      const updatedDelivery: Delivery = {
-        ...currentDelivery,
-        unexpectedParts: [unexpectedItem, ...currentDelivery.unexpectedParts],
-        scanHistory: [scanEvent, ...currentDelivery.scanHistory].slice(0, 300),
-        updatedAt: now,
-      };
-      updateDelivery(updatedDelivery);
-      onUpdateDeliveryRef.current(updatedDelivery);
-
-      playAudio.success(appSettings.soundEnabled);
-      triggerHaptic('success', appSettings.vibrationEnabled);
-      triggerVisualFlash('green');
+      if (res.isCorrectQuantity) {
+        playAudio.success(appSettings.soundEnabled);
+        triggerHaptic('success', appSettings.vibrationEnabled);
+        triggerVisualFlash('green');
+      } else {
+        playAudio.unexpected(appSettings.soundEnabled);
+        triggerHaptic('unexpected', appSettings.vibrationEnabled);
+        triggerVisualFlash('orange');
+      }
 
       setScanFeedback({
-        type: 'success',
+        type: res.isCorrectQuantity ? 'success' : 'quantity_mismatch',
         code: payload.rawCode,
-        message: `✓ Saved: ${payload.partNumber} (Qty ${payload.quantity})`,
+        message: `✓ Saved: ${payload.partNumber} (Qty ${res.receivedQuantity}/${res.requiredQuantity})`,
         timestamp: Date.now(),
       });
       if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
@@ -973,7 +1149,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         setScanFeedback(null);
       }, 3500);
     },
-    [appSettings, triggerVisualFlash, triggerDuplicateWarning]
+    [appSettings, rejectUnscopedCode, triggerVisualFlash, triggerDuplicateWarning]
   );
 
   /**
@@ -1269,9 +1445,18 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       const t0 = performance.now();
 
       try {
+        const isGroupMode =
+          scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
+        const scopedDeliveries = isGroupMode
+          ? groupDeliveriesRef.current
+          : deliveryRef.current
+          ? [deliveryRef.current]
+          : [];
+        const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
+
         const result = await recognizePalletLabelOffline(
           video,
-          deliveryRef.current?.parts || [],
+          partsPool,
           { x: 0.05, y: 0.16, width: 0.9, height: 0.68 }
         );
         const ocrElapsedMs = performance.now() - t0;
@@ -1279,65 +1464,94 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         if (
           !isMountedRef.current ||
           activeScanConfirmationRef.current !== null ||
-          activeDuplicateWarningRef.current !== null
+          activeDuplicateWarningRef.current !== null ||
+          groupConflictModalRef.current !== null
         ) {
           return;
         }
 
-        if (result.partNumber) {
+        if (result.partNumber && scopedDeliveries.length > 0) {
           recordDecodeDiagnostics(ocrElapsedMs, true, 'BarcodeDetector (1D) + Offline OCR');
-          // STRICT DUPLICATE SCAN PREVENTION CHECK
-          const duplicateCheck = detectDuplicateScan(
-            deliveryRef.current,
-            result.partNumber,
-            result.partNumber
+          const matches = isGroupMode
+            ? findMatchingPartsInGroup(scopedDeliveries, result.partNumber)
+            : findMatchingPartsInDelivery(scopedDeliveries[0], result.partNumber);
+          const deduped = matches.filter(
+            (m, i, arr) =>
+              arr.findIndex((x) => x.delivery.id === m.delivery.id && x.part.id === m.part.id) === i
           );
-          if (duplicateCheck.isDuplicate) {
+          if (deduped.length === 0) return;
+
+          const uncompleted = deduped.filter((m) => !m.alreadyFullyScanned);
+          if (uncompleted.length === 0) {
+            const firstDup = deduped[0];
             triggerDuplicateWarning({
-              partNumber: duplicateCheck.partNumber,
-              description: duplicateCheck.description,
+              partNumber: firstDup.part.partNumber,
+              description: firstDup.part.description,
               code: result.partNumber,
-              itemNumber: duplicateCheck.itemNumber,
-              palletNumber: duplicateCheck.palletNumber,
-              scannedAt: duplicateCheck.scannedAt,
-              receivedQuantity: duplicateCheck.receivedQuantity,
+              itemNumber: firstDup.part.itemNumber,
+              palletNumber: firstDup.part.palletNumber,
+              scannedAt: firstDup.part.scannedAt,
+              scannedBy: firstDup.part.lastScannedByName,
+              receivedQuantity: firstDup.part.receivedQuantity,
             });
             return;
           }
 
-          const evalResult = evaluatePalletLabelMatch(
-            result.partNumber,
-            result.quantity,
-            deliveryRef.current?.parts || [],
-            result.ocrConfidence
-          );
-
-          if (
-            evalResult.matchedPart ||
-            (result.ocrConfidence === 'high' && result.quantity !== null && result.quantity > 0)
-          ) {
-            playAudio.success(appSettings.soundEnabled);
-            triggerHaptic('success', appSettings.vibrationEnabled);
-
-            const newScanData: ActiveScanData = {
-              scanMethod: 'ocr_label',
+          if (isGroupMode && uncompleted.length > 1) {
+            playAudio.unexpected(appSettings.soundEnabled);
+            triggerHaptic('unexpected', appSettings.vibrationEnabled);
+            const conflictState: GroupScanConflictModalState = {
               rawCode: result.partNumber,
-              detectedPartNumber: result.partNumber,
-              detectedDescription:
-                result.description || evalResult.matchedPart?.description || '',
-              detectedQuantity:
-                result.quantity || (evalResult.matchedPart?.quantity ?? 1),
-              matchedPart: evalResult.matchedPart,
-              docketNumber: deliveryRef.current?.docketNumber || '',
-              customerOrSupplier: deliveryRef.current?.supplier || '',
+              scanMethod: 'ocr_label',
+              detectedQuantity: result.quantity || (uncompleted[0].part.quantity ?? 1),
               rawOcrText: result.rawOcrText,
-              isUnlisted: !evalResult.matchedPart,
-              unconfidentFields: result.quantity === null ? ['quantity'] : undefined,
+              candidates: uncompleted.map((m) => {
+                const req = Math.max(1, m.part.quantity ?? 1);
+                const rec =
+                  m.part.status === 'received' && typeof m.part.receivedQuantity === 'number'
+                    ? m.part.receivedQuantity
+                    : 0;
+                return {
+                  deliveryId: m.delivery.id,
+                  docketNumber: m.delivery.docketNumber,
+                  supplier: m.delivery.supplier,
+                  partId: m.part.id,
+                  partNumber: m.part.partNumber,
+                  itemNumber: m.part.itemNumber,
+                  description: m.part.description,
+                  requiredQuantity: req,
+                  receivedQuantity: rec,
+                  status: m.part.status,
+                  matchedMode: m.matchMode,
+                };
+              }),
             };
-
-            activeScanConfirmationRef.current = newScanData;
-            setActiveScanConfirmation(newScanData);
+            groupConflictModalRef.current = conflictState;
+            setGroupConflictModal(conflictState);
+            return;
           }
+
+          const match = uncompleted[0];
+          playAudio.success(appSettings.soundEnabled);
+          triggerHaptic('success', appSettings.vibrationEnabled);
+
+          const newScanData: ActiveScanData = {
+            scanMethod: 'ocr_label',
+            rawCode: result.partNumber,
+            detectedPartNumber: match.part.partNumber,
+            detectedDescription: result.description || match.part.description || '',
+            detectedQuantity: result.quantity || (match.part.quantity ?? 1),
+            matchedPart: match.part,
+            docketNumber: match.delivery.docketNumber,
+            customerOrSupplier: match.delivery.supplier || '',
+            targetDeliveryId: match.delivery.id,
+            rawOcrText: result.rawOcrText,
+            isUnlisted: false,
+            unconfidentFields: result.quantity === null ? ['quantity'] : undefined,
+          };
+
+          activeScanConfirmationRef.current = newScanData;
+          setActiveScanConfirmation(newScanData);
         }
       } catch (err: any) {
         appendDiagnosticLog('error', `Live OCR note: ${err?.message || String(err)}`);
@@ -1743,10 +1957,19 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       }
 
       // 2. Run high-detail unsharp-masked OCR on the video frame
+      const isGroupMode =
+        scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
+      const scopedDeliveries = isGroupMode
+        ? groupDeliveriesRef.current
+        : deliveryRef.current
+        ? [deliveryRef.current]
+        : [];
+      const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
+
       const t0 = performance.now();
       const ocrResult = await recognizePalletLabelOffline(
         video,
-        deliveryRef.current?.parts || [],
+        partsPool,
         { x: 0.05, y: 0.15, width: 0.9, height: 0.7 }
       );
       recordDecodeDiagnostics(
@@ -1755,48 +1978,84 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         'Shutter Offline OCR (Unsharp)'
       );
 
-      const evalMatch = evaluatePalletLabelMatch(
-        ocrResult.partNumber || '',
-        ocrResult.quantity,
-        deliveryRef.current?.parts || [],
-        ocrResult.ocrConfidence
-      );
-
-      if (ocrResult.partNumber) {
-        // STRICT DUPLICATE SCAN PREVENTION CHECK
-        const duplicateCheck = detectDuplicateScan(
-          deliveryRef.current,
-          ocrResult.partNumber,
-          ocrResult.partNumber
+      if (ocrResult.partNumber && scopedDeliveries.length > 0) {
+        const matches = isGroupMode
+          ? findMatchingPartsInGroup(scopedDeliveries, ocrResult.partNumber)
+          : findMatchingPartsInDelivery(scopedDeliveries[0], ocrResult.partNumber);
+        const deduped = matches.filter(
+          (m, i, arr) =>
+            arr.findIndex((x) => x.delivery.id === m.delivery.id && x.part.id === m.part.id) === i
         );
-        if (duplicateCheck.isDuplicate) {
+        if (deduped.length === 0) {
+          rejectUnscopedCode(
+            ocrResult.partNumber,
+            isGroupMode
+              ? `✕ Rejected: "${ocrResult.partNumber}" does not belong to any docket in group "${groupRef.current?.name || ''}"`
+              : `✕ Rejected: "${ocrResult.partNumber}" does not belong to Docket #${scopedDeliveries[0].docketNumber}`
+          );
+          return;
+        }
+
+        const uncompleted = deduped.filter((m) => !m.alreadyFullyScanned);
+        if (uncompleted.length === 0) {
+          const firstDup = deduped[0];
           triggerDuplicateWarning({
-            partNumber: duplicateCheck.partNumber,
-            description: duplicateCheck.description,
+            partNumber: firstDup.part.partNumber,
+            description: firstDup.part.description,
             code: ocrResult.partNumber,
-            itemNumber: duplicateCheck.itemNumber,
-            palletNumber: duplicateCheck.palletNumber,
-            scannedAt: duplicateCheck.scannedAt,
-            receivedQuantity: duplicateCheck.receivedQuantity,
+            itemNumber: firstDup.part.itemNumber,
+            palletNumber: firstDup.part.palletNumber,
+            scannedAt: firstDup.part.scannedAt,
+            scannedBy: firstDup.part.lastScannedByName,
+            receivedQuantity: firstDup.part.receivedQuantity,
           });
           return;
         }
 
+        if (isGroupMode && uncompleted.length > 1) {
+          const conflictState: GroupScanConflictModalState = {
+            rawCode: ocrResult.partNumber,
+            scanMethod: 'ocr_label',
+            detectedQuantity: ocrResult.quantity || (uncompleted[0].part.quantity ?? 1),
+            rawOcrText: ocrResult.rawOcrText,
+            candidates: uncompleted.map((m) => ({
+              deliveryId: m.delivery.id,
+              docketNumber: m.delivery.docketNumber,
+              supplier: m.delivery.supplier,
+              partId: m.part.id,
+              partNumber: m.part.partNumber,
+              itemNumber: m.part.itemNumber,
+              description: m.part.description,
+              requiredQuantity: Math.max(1, m.part.quantity ?? 1),
+              receivedQuantity:
+                m.part.status === 'received' && typeof m.part.receivedQuantity === 'number'
+                  ? m.part.receivedQuantity
+                  : 0,
+              status: m.part.status,
+              matchedMode: m.matchMode,
+            })),
+          };
+          groupConflictModalRef.current = conflictState;
+          setGroupConflictModal(conflictState);
+          return;
+        }
+
+        const match = uncompleted[0];
         playAudio.success(appSettings.soundEnabled);
         triggerHaptic('success', appSettings.vibrationEnabled);
 
         const newScanData: ActiveScanData = {
           scanMethod: 'ocr_label',
           rawCode: ocrResult.partNumber,
-          detectedPartNumber: ocrResult.partNumber,
-          detectedDescription:
-            ocrResult.description || evalMatch.matchedPart?.description || '',
-          detectedQuantity: ocrResult.quantity || (evalMatch.matchedPart?.quantity ?? 1),
-          matchedPart: evalMatch.matchedPart,
-          docketNumber: deliveryRef.current?.docketNumber || '',
-          customerOrSupplier: deliveryRef.current?.supplier || '',
+          detectedPartNumber: match.part.partNumber,
+          detectedDescription: ocrResult.description || match.part.description || '',
+          detectedQuantity: ocrResult.quantity || (match.part.quantity ?? 1),
+          matchedPart: match.part,
+          docketNumber: match.delivery.docketNumber,
+          customerOrSupplier: match.delivery.supplier || '',
+          targetDeliveryId: match.delivery.id,
           rawOcrText: ocrResult.rawOcrText,
-          isUnlisted: !evalMatch.matchedPart,
+          isUnlisted: false,
           unconfidentFields: ocrResult.quantity === null ? ['quantity'] : undefined,
         };
 
@@ -1837,6 +2096,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         isEditable ||
         activeScanConfirmationRef.current !== null ||
         activeDuplicateWarningRef.current !== null ||
+        groupConflictModalRef.current !== null ||
         isManualModalOpenRef.current
       ) {
         return;
@@ -1877,16 +2137,31 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   }, [handleScannedCode]);
 
   /**
-   * Smart search candidate suggestions for manual code entry (e.g. typing last 4 digits)
+   * Smart search candidate suggestions for manual code entry (scoped to docket or group dockets)
    */
   const manualCandidates = useMemo(() => {
     const q = manualCodeInput.trim();
-    if (!q || !delivery?.parts) return [];
-    return filterPartsSmart(delivery.parts, q, {
-      docketNumber: delivery.docketNumber,
-      supplier: delivery.supplier,
-    }).slice(0, 5);
-  }, [delivery, manualCodeInput]);
+    if (!q) return [];
+    const isGroupMode = scanScope?.mode === 'group' && Boolean(group);
+    const scopedDels = isGroupMode
+      ? groupDeliveries
+      : delivery
+      ? [delivery]
+      : [];
+
+    const results: Array<{ part: DeliveryPart; docketNumber: string }> = [];
+    for (const del of scopedDels) {
+      const matches = filterPartsSmart(del.parts || [], q, {
+        docketNumber: del.docketNumber,
+        supplier: del.supplier,
+      });
+      for (const m of matches) {
+        results.push({ part: m, docketNumber: del.docketNumber });
+        if (results.length >= 6) return results;
+      }
+    }
+    return results;
+  }, [scanScope?.mode, group, groupDeliveries, delivery, manualCodeInput]);
 
   const handleSelectCandidate = (partNumber: string) => {
     setIsManualModalOpen(false);
@@ -1930,10 +2205,19 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       }
 
       // 2. Run high-detail unsharp-masked OCR on picked file
+      const isGroupMode =
+        scanScopeRef.current?.mode === 'group' && Boolean(groupRef.current);
+      const scopedDeliveries = isGroupMode
+        ? groupDeliveriesRef.current
+        : deliveryRef.current
+        ? [deliveryRef.current]
+        : [];
+      const partsPool = scopedDeliveries.flatMap((d) => d.parts || []);
+
       const t0 = performance.now();
       const ocrResult = await recognizePalletLabelOffline(
         file,
-        deliveryRef.current?.parts || [],
+        partsPool,
         { x: 0, y: 0, width: 1, height: 1 }
       );
       recordDecodeDiagnostics(
@@ -1942,42 +2226,84 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         'File Offline OCR (Unsharp)'
       );
 
-      const evalMatch = evaluatePalletLabelMatch(
-        ocrResult.partNumber || '',
-        ocrResult.quantity,
-        deliveryRef.current?.parts || [],
-        ocrResult.ocrConfidence
+      const partNo = (ocrResult.partNumber || file.name.replace(/\.[^.]+$/, '')).trim();
+      if (!partNo || scopedDeliveries.length === 0) return;
+
+      const matches = isGroupMode
+        ? findMatchingPartsInGroup(scopedDeliveries, partNo)
+        : findMatchingPartsInDelivery(scopedDeliveries[0], partNo);
+      const deduped = matches.filter(
+        (m, i, arr) =>
+          arr.findIndex((x) => x.delivery.id === m.delivery.id && x.part.id === m.part.id) === i
       );
 
-      const partNo = ocrResult.partNumber || file.name.replace(/\.[^.]+$/, '');
+      if (deduped.length === 0) {
+        rejectUnscopedCode(
+          partNo,
+          isGroupMode
+            ? `✕ Rejected: "${partNo}" does not belong to any docket in group "${groupRef.current?.name || ''}"`
+            : `✕ Rejected: "${partNo}" does not belong to Docket #${scopedDeliveries[0].docketNumber}`
+        );
+        return;
+      }
 
-      // STRICT DUPLICATE SCAN PREVENTION CHECK
-      const duplicateCheck = detectDuplicateScan(deliveryRef.current, partNo, partNo);
-      if (duplicateCheck.isDuplicate) {
+      const uncompleted = deduped.filter((m) => !m.alreadyFullyScanned);
+      if (uncompleted.length === 0) {
+        const firstDup = deduped[0];
         triggerDuplicateWarning({
-          partNumber: duplicateCheck.partNumber,
-          description: duplicateCheck.description,
+          partNumber: firstDup.part.partNumber,
+          description: firstDup.part.description,
           code: partNo,
-          itemNumber: duplicateCheck.itemNumber,
-          palletNumber: duplicateCheck.palletNumber,
-          scannedAt: duplicateCheck.scannedAt,
-          receivedQuantity: duplicateCheck.receivedQuantity,
+          itemNumber: firstDup.part.itemNumber,
+          palletNumber: firstDup.part.palletNumber,
+          scannedAt: firstDup.part.scannedAt,
+          scannedBy: firstDup.part.lastScannedByName,
+          receivedQuantity: firstDup.part.receivedQuantity,
         });
         return;
       }
 
+      if (isGroupMode && uncompleted.length > 1) {
+        const conflictState: GroupScanConflictModalState = {
+          rawCode: partNo,
+          scanMethod: 'ocr_label',
+          detectedQuantity: ocrResult.quantity || (uncompleted[0].part.quantity ?? 1),
+          rawOcrText: ocrResult.rawOcrText,
+          candidates: uncompleted.map((m) => ({
+            deliveryId: m.delivery.id,
+            docketNumber: m.delivery.docketNumber,
+            supplier: m.delivery.supplier,
+            partId: m.part.id,
+            partNumber: m.part.partNumber,
+            itemNumber: m.part.itemNumber,
+            description: m.part.description,
+            requiredQuantity: Math.max(1, m.part.quantity ?? 1),
+            receivedQuantity:
+              m.part.status === 'received' && typeof m.part.receivedQuantity === 'number'
+                ? m.part.receivedQuantity
+                : 0,
+            status: m.part.status,
+            matchedMode: m.matchMode,
+          })),
+        };
+        groupConflictModalRef.current = conflictState;
+        setGroupConflictModal(conflictState);
+        return;
+      }
+
+      const match = uncompleted[0];
       const newScanData: ActiveScanData = {
         scanMethod: 'ocr_label',
         rawCode: partNo,
-        detectedPartNumber: partNo,
-        detectedDescription:
-          ocrResult.description || evalMatch.matchedPart?.description || '',
-        detectedQuantity: ocrResult.quantity || (evalMatch.matchedPart?.quantity ?? 1),
-        matchedPart: evalMatch.matchedPart,
-        docketNumber: deliveryRef.current?.docketNumber || '',
-        customerOrSupplier: deliveryRef.current?.supplier || '',
+        detectedPartNumber: match.part.partNumber,
+        detectedDescription: ocrResult.description || match.part.description || '',
+        detectedQuantity: ocrResult.quantity || (match.part.quantity ?? 1),
+        matchedPart: match.part,
+        docketNumber: match.delivery.docketNumber,
+        customerOrSupplier: match.delivery.supplier || '',
+        targetDeliveryId: match.delivery.id,
         rawOcrText: ocrResult.rawOcrText,
-        isUnlisted: !evalMatch.matchedPart,
+        isUnlisted: false,
       };
 
       activeScanConfirmationRef.current = newScanData;
@@ -2149,6 +2475,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               <div
                 className={`mt-2.5 px-4 py-2 rounded-xl border font-mono text-xs font-extrabold shadow-2xl animate-in zoom-in-95 duration-150 ${
                   scanFeedback.type === 'unexpected'
+                    ? 'bg-red-950/95 border-[#EF4444] text-[#FCA5A5]'
+                    : scanFeedback.type === 'quantity_mismatch' || scanFeedback.type === 'pending_sync'
                     ? 'bg-amber-950/95 border-[#F59E0B] text-[#F59E0B]'
                     : 'bg-emerald-950/95 border-[#00D979] text-[#00D979]'
                 }`}
@@ -2226,12 +2554,19 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               </span>
             </div>
 
-            {delivery ? (
-              <span className="px-2.5 py-0.5 rounded-lg bg-[#15182A]/90 border border-[var(--pt-border,#29243D)] text-white font-mono text-[11px] font-bold truncate max-w-[140px] sm:max-w-[220px]">
-                Docket #{delivery.docketNumber}
+            {scanScope?.mode === 'group' && group ? (
+              <span className="px-2.5 py-0.5 rounded-lg bg-[#15182A]/90 border border-[var(--pt-primary,#A020F0)]/50 text-[var(--pt-primary-light,#C084FC)] font-mono text-[11px] font-bold truncate max-w-[180px] sm:max-w-[280px] inline-flex items-center gap-1.5">
+                <FolderKanban className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">
+                  Group: {group.name} ({groupDeliveries.length})
+                </span>
+              </span>
+            ) : delivery ? (
+              <span className="px-2.5 py-0.5 rounded-lg bg-[#15182A]/90 border border-[var(--pt-border,#29243D)] text-white font-mono text-[11px] font-bold truncate max-w-[160px] sm:max-w-[260px]">
+                Docket #{delivery.docketNumber} · {delivery.supplier}
               </span>
             ) : (
-              <span className="text-[11px] text-zinc-400 font-mono">No docket</span>
+              <span className="text-[11px] text-zinc-400 font-mono">No scoped target</span>
             )}
           </div>
 
@@ -2484,14 +2819,122 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       {/* ============================================================ */}
       {/* SCAN CONFIRMATION SCREEN / MODAL                             */}
       {/* ============================================================ */}
-      {activeScanConfirmation && delivery && (
-        <ScanConfirmationModal
-          scan={activeScanConfirmation}
-          delivery={delivery}
-          onSaveAndScanNext={handleSaveAndScanNext}
-          onConfirmAndSave={handleConfirmAndSave}
-          onDiscard={handleDiscard}
-        />
+      {activeScanConfirmation && (
+        (() => {
+          const confirmTargetDelivery =
+            (activeScanConfirmation.targetDeliveryId
+              ? groupDeliveries.find((d) => d.id === activeScanConfirmation.targetDeliveryId)
+              : undefined) || delivery;
+          if (!confirmTargetDelivery) return null;
+          return (
+            <ScanConfirmationModal
+              scan={activeScanConfirmation}
+              delivery={confirmTargetDelivery}
+              onSaveAndScanNext={handleSaveAndScanNext}
+              onConfirmAndSave={handleConfirmAndSave}
+              onDiscard={handleDiscard}
+            />
+          );
+        })()
+      )}
+
+      {/* ============================================================ */}
+      {/* DOCKET GROUP SCAN CONFLICT ALLOCATION MODAL                  */}
+      {/* ============================================================ */}
+      {groupConflictModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => {
+            groupConflictModalRef.current = null;
+            setGroupConflictModal(null);
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl bg-[var(--pt-card,#15182A)] border border-[var(--pt-primary,#A020F0)]/60 p-5 shadow-2xl space-y-4 text-white"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <div className="inline-flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-[var(--pt-primary-light,#C084FC)] font-bold">
+                  <FolderKanban className="w-3.5 h-3.5" />
+                  <span>Multiple Dockets Match Part</span>
+                </div>
+                <h3 className="font-mono font-extrabold text-sm mt-1">
+                  Allocate Scan &ldquo;{groupConflictModal.rawCode}&rdquo;
+                </h3>
+                <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
+                  Select which docket in &ldquo;{group?.name}&rdquo; should receive this part:
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  groupConflictModalRef.current = null;
+                  setGroupConflictModal(null);
+                }}
+                className="w-7 h-7 rounded-full bg-[var(--pt-bg-secondary,#101321)] text-zinc-400 hover:text-white flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              {groupConflictModal.candidates.map((cand) => {
+                const remaining = Math.max(0, cand.requiredQuantity - cand.receivedQuantity);
+                return (
+                  <button
+                    key={`${cand.deliveryId}_${cand.partId}`}
+                    type="button"
+                    onClick={() => {
+                      const targetDel = groupDeliveries.find((d) => d.id === cand.deliveryId);
+                      const targetPart = targetDel?.parts.find((p) => p.id === cand.partId);
+                      if (!targetDel || !targetPart) return;
+                      const scanData: ActiveScanData = {
+                        scanMethod: groupConflictModal.scanMethod,
+                        rawCode: groupConflictModal.rawCode,
+                        detectedPartNumber: targetPart.partNumber,
+                        detectedDescription: targetPart.description,
+                        detectedQuantity:
+                          groupConflictModal.detectedQuantity || Math.max(1, targetPart.quantity ?? 1),
+                        matchedPart: targetPart,
+                        docketNumber: targetDel.docketNumber,
+                        customerOrSupplier: targetDel.supplier || '',
+                        targetDeliveryId: targetDel.id,
+                        rawOcrText: groupConflictModal.rawOcrText,
+                        isUnlisted: false,
+                      };
+                      groupConflictModalRef.current = null;
+                      setGroupConflictModal(null);
+                      activeScanConfirmationRef.current = scanData;
+                      setActiveScanConfirmation(scanData);
+                    }}
+                    className="w-full p-3 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-left transition-all cursor-pointer flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-mono font-extrabold text-xs text-white flex items-center gap-2">
+                        <span>Docket #{cand.docketNumber}</span>
+                        <span className="text-[var(--pt-primary-light,#C084FC)] font-semibold truncate">
+                          {cand.supplier}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5 truncate">
+                        {cand.partNumber} · No. {cand.itemNumber}
+                      </div>
+                    </div>
+                    <div className="text-right font-mono shrink-0">
+                      <div className="text-xs font-bold text-[#F59E0B] tabular-nums">
+                        {cand.receivedQuantity} / {cand.requiredQuantity}
+                      </div>
+                      <div className="text-[10px] text-[var(--pt-text-muted,#737B94)]">
+                        {remaining} left
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ============================================================ */}
@@ -2714,22 +3157,29 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 {manualCandidates.length > 0 && (
                   <div className="mt-2 space-y-1">
                     <span className="text-[10px] font-mono uppercase text-[var(--pt-primary-light,#C084FC)] block font-semibold">
-                      Matching parts in docket:
+                      {scanScope?.mode === 'group'
+                        ? 'Matching parts in group dockets:'
+                        : 'Matching parts in docket:'}
                     </span>
                     <div className="max-h-36 overflow-y-auto space-y-1 pr-1 divide-y divide-[var(--pt-border,#29243D)]">
-                      {manualCandidates.map((cand) => (
+                      {manualCandidates.map((item) => (
                         <button
-                          key={cand.id}
+                          key={`${item.docketNumber}_${item.part.id}`}
                           type="button"
-                          onClick={() => handleSelectCandidate(cand.partNumber)}
+                          onClick={() => handleSelectCandidate(item.part.partNumber)}
                           className="w-full text-left p-2 rounded-lg bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer"
                         >
                           <div className="min-w-0">
                             <span className="font-mono font-bold text-white block truncate">
-                              <HighlightMatch text={cand.partNumber} query={manualCodeInput} />
+                              <HighlightMatch text={item.part.partNumber} query={manualCodeInput} />
+                              {scanScope?.mode === 'group' && (
+                                <span className="ml-1.5 text-[10px] text-[var(--pt-primary-light,#C084FC)]">
+                                  #{item.docketNumber}
+                                </span>
+                              )}
                             </span>
                             <span className="text-[11px] text-[var(--pt-text-secondary,#A3A8BD)] truncate block">
-                              <HighlightMatch text={cand.description} query={manualCodeInput} />
+                              <HighlightMatch text={item.part.description} query={manualCodeInput} />
                             </span>
                           </div>
                           <span className="text-[10px] font-mono text-[var(--pt-primary-light,#C084FC)] shrink-0 font-bold">

@@ -119,6 +119,10 @@ export interface ExtractedDocketResult {
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: number;
   lastVisibleRowNo?: number;
+  separationUncertain?: boolean;
+  separationReason?: string;
+  sourcePageNumbers?: number[];
+  separatedDockets?: ExtractedDocketResult[];
   tesseractDiagnostics?: TesseractPipelineDiagnostics;
 }
 
@@ -394,6 +398,17 @@ interface RawBatchItem {
   qty: number;
 }
 
+interface RawPageHeader {
+  page: number;
+  docketNumber?: string;
+  supplier?: string;
+  deliveryDate?: string;
+  carrier?: string;
+  orderNumber?: string;
+  palletCount?: number;
+  startsNewDocket?: boolean;
+}
+
 interface BatchExtractionResponse {
   docketNumber?: string;
   supplier?: string;
@@ -404,6 +419,7 @@ interface BatchExtractionResponse {
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: string;
   lastVisibleRowNo?: string;
+  pageHeaders?: RawPageHeader[];
   items: RawBatchItem[];
   modelUsed: string;
   fallbackUsed: boolean;
@@ -663,9 +679,13 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
 3. IGNORE NON-PART LINES:
    - Ignore document header barcodes, consignment notes, and column headers.
    - On Tax Invoices, ignore non-physical charge/summary lines (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Tax, Total, Balance Due).
-4. FIELD MAPPING FOR EACH PART ROW:
+4. MULTIPLE DOCKETS / PAGE HEADERS:
+   - The upload may contain MULTIPLE separate delivery dockets (each with its own docket/invoice number) OR a multi-page single docket.
+   - Record one entry in 'pageHeaders' for EVERY page (${batchPages.map((b) => b.pageNumber).join(', ')}) with that page's exact 'docketNumber' (or "" if a continuation page has no docket header printed), 'supplier', 'deliveryDate', 'orderNumber', 'carrier', 'palletCount', and 'startsNewDocket' (true if a new docket/invoice starts on that page).
+   - Never fabricate a docket number if none is printed on a continuation page.
+5. FIELD MAPPING FOR EACH PART ROW:
    - page: The page number (${batchPages.map((b) => b.pageNumber).join(' or ')}) this row is on.
-   - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. Never restart numbering at "1" on the lower half or on subsequent pages if printed row numbers continue across the document.
+   - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. If a NEW docket starts on a page and its row numbers restart at 1, keep the printed "1".
    - part: The Part Number, Drawing Number, Mark, Code, or DXF/Profile Name written on the row. If the table only has ONE text column (e.g. "Description" or "Part / Description"), put the part code/name in 'part' and the full text in 'desc'. NEVER put the row number in 'part'.
    - desc: The full part description or name written on the row.
    - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "01", "Rev B"), else "".
@@ -684,6 +704,24 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
       orderNumber: { type: Type.STRING },
       carrier: { type: Type.STRING },
       palletCount: { type: Type.INTEGER },
+      pageHeaders: {
+        type: Type.ARRAY,
+        description: 'Per-page docket header metadata used to keep multi-page dockets together and separate distinct dockets.',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            page: { type: Type.INTEGER },
+            docketNumber: { type: Type.STRING },
+            supplier: { type: Type.STRING },
+            deliveryDate: { type: Type.STRING },
+            orderNumber: { type: Type.STRING },
+            carrier: { type: Type.STRING },
+            palletCount: { type: Type.INTEGER },
+            startsNewDocket: { type: Type.BOOLEAN },
+          },
+          required: ['page'],
+        },
+      },
       hasPrintedNoColumn: {
         type: Type.BOOLEAN,
         description: 'True if the table has a printed No / Item / Pos / Line number column.',
@@ -726,6 +764,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
       'orderNumber',
       'carrier',
       'palletCount',
+      'pageHeaders',
       'hasPrintedNoColumn',
       'firstVisibleRowNo',
       'lastVisibleRowNo',
@@ -751,6 +790,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     carrier: parsed.carrier,
     orderNumber: parsed.orderNumber,
     palletCount: parsed.palletCount,
+    pageHeaders: Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [],
     hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
     firstVisibleRowNo: parsed.firstVisibleRowNo,
     lastVisibleRowNo: parsed.lastVisibleRowNo,
@@ -983,13 +1023,27 @@ export async function extractDocketWithGeminiVision(
     batchResponses.push(...pairRes);
   }
 
-  const globalByNo = new Map<number, ExtractedDocketItem>();
-  const unnumberedItems: ExtractedDocketItem[] = [];
-  const pageMinNo = new Map<number, number>();
-  const pageMaxNo = new Map<number, number>();
-  let anyPrintedNoColumn = false;
-  let globalMaxCandidate = 0;
+  // Segment pages into independent dockets using pageHeaders and row-numbering continuity
+  interface VisionPageMeta {
+    pageNumber: number;
+    explicitDocketNumber: string;
+    supplier?: string;
+    deliveryDate?: string;
+    orderNumber?: string;
+    carrier?: string;
+    palletCount?: number;
+    startsNewDocket?: boolean;
+    rawItems: RawBatchItem[];
+    minRowNo?: number;
+    maxRowNo?: number;
+  }
 
+  const pageMetaMap = new Map<number, VisionPageMeta>();
+  for (let p = 1; p <= totalPages; p++) {
+    pageMetaMap.set(p, { pageNumber: p, explicitDocketNumber: '', rawItems: [] });
+  }
+
+  let anyPrintedNoColumn = false;
   let modelUsed = DEFAULT_PRIMARY_VISION_MODEL;
   let fallbackUsed = false;
   let totalRetries = 0;
@@ -999,40 +1053,196 @@ export async function extractDocketWithGeminiVision(
     modelUsed = bRes.modelUsed || modelUsed;
     fallbackUsed = fallbackUsed || Boolean(bRes.fallbackUsed);
     totalRetries += bRes.retryAttempts || 0;
-
-    const defaultPage = batches[bIdx][0].pageNumber;
     if (bRes.hasPrintedNoColumn !== false) {
       anyPrintedNoColumn = true;
     }
 
-    const fNo = parseInt(parseCleanRowNo(bRes.firstVisibleRowNo), 10);
-    const lNo = parseInt(parseCleanRowNo(bRes.lastVisibleRowNo), 10);
-    if (!Number.isNaN(fNo) && fNo > 0) {
-      pageMinNo.set(defaultPage, Math.min(pageMinNo.get(defaultPage) ?? fNo, fNo));
-      if (fNo > globalMaxCandidate && fNo <= 1500) globalMaxCandidate = fNo;
+    const batchPageNums = batches[bIdx].map((b) => b.pageNumber);
+    const defaultPage = batchPageNums[0];
+
+    for (const ph of bRes.pageHeaders || []) {
+      const pNum = Math.min(totalPages, Math.max(1, Number(ph.page) || defaultPage));
+      const meta = pageMetaMap.get(pNum)!;
+      const dn = String(ph.docketNumber || '').trim();
+      if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
+      if (ph.supplier && ph.supplier.trim() && !meta.supplier) meta.supplier = ph.supplier.trim();
+      if (ph.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(ph.deliveryDate.trim()) && !meta.deliveryDate) {
+        meta.deliveryDate = ph.deliveryDate.trim();
+      }
+      if (ph.orderNumber && ph.orderNumber.trim() && !meta.orderNumber) meta.orderNumber = ph.orderNumber.trim();
+      if (ph.carrier && ph.carrier.trim() && !meta.carrier) meta.carrier = ph.carrier.trim();
+      if (ph.palletCount && ph.palletCount > 0 && !meta.palletCount) meta.palletCount = ph.palletCount;
+      if (ph.startsNewDocket) meta.startsNewDocket = true;
     }
-    if (!Number.isNaN(lNo) && lNo > 0) {
-      const lastPageInBatch = batches[bIdx][batches[bIdx].length - 1].pageNumber;
-      pageMaxNo.set(lastPageInBatch, Math.max(pageMaxNo.get(lastPageInBatch) ?? lNo, lNo));
-      if (lNo > globalMaxCandidate && lNo <= 1500) globalMaxCandidate = lNo;
+
+    // Backfill page 1 of batch if pageHeaders omitted batch-level header fields
+    const firstMeta = pageMetaMap.get(defaultPage)!;
+    if (!firstMeta.explicitDocketNumber && bRes.docketNumber?.trim() && batchPageNums.length === 1) {
+      firstMeta.explicitDocketNumber = bRes.docketNumber.trim();
     }
+    if (!firstMeta.supplier && bRes.supplier?.trim()) firstMeta.supplier = bRes.supplier.trim();
+    if (!firstMeta.deliveryDate && bRes.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(bRes.deliveryDate.trim())) {
+      firstMeta.deliveryDate = bRes.deliveryDate.trim();
+    }
+    if (!firstMeta.orderNumber && bRes.orderNumber?.trim()) firstMeta.orderNumber = bRes.orderNumber.trim();
+    if (!firstMeta.carrier && bRes.carrier?.trim()) firstMeta.carrier = bRes.carrier.trim();
 
     for (const rawIt of bRes.items || []) {
-      const norm = normalizeRawBatchItem(rawIt, defaultPage);
+      const targetPage = Math.min(totalPages, Math.max(1, Number(rawIt.page) || defaultPage));
+      const meta = pageMetaMap.get(targetPage)!;
+      meta.rawItems.push({ ...rawIt, page: targetPage });
+      const nVal = parseInt(parseCleanRowNo(rawIt.no), 10);
+      if (!Number.isNaN(nVal) && nVal > 0 && nVal <= 1500) {
+        meta.minRowNo = meta.minRowNo === undefined ? nVal : Math.min(meta.minRowNo, nVal);
+        meta.maxRowNo = meta.maxRowNo === undefined ? nVal : Math.max(meta.maxRowNo, nVal);
+      }
+    }
+  }
+
+  // Group pages into independent docket segments
+  interface VisionSegment {
+    docketKey: string;
+    explicitDocketNumber: string;
+    hasExplicitDocketNumber: boolean;
+    supplier: string;
+    deliveryDate: string;
+    carrier?: string;
+    orderNumber?: string;
+    palletCount: number;
+    pageNumbers: number[];
+    maxRowSeen: number;
+    rawItems: RawBatchItem[];
+    separationUncertain: boolean;
+    separationReason?: string;
+  }
+
+  const segments: VisionSegment[] = [];
+  const normDocketKey = (s: string) => s.trim().toUpperCase().replace(/\s+/g, '');
+
+  for (let p = 1; p <= totalPages; p++) {
+    const meta = pageMetaMap.get(p)!;
+    const explicitKey = normDocketKey(meta.explicitDocketNumber);
+    const hasExplicit = explicitKey.length > 0;
+
+    if (segments.length === 0) {
+      const fallbackDk = `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+      segments.push({
+        docketKey: hasExplicit ? explicitKey : fallbackDk,
+        explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
+        hasExplicitDocketNumber: hasExplicit,
+        supplier: meta.supplier || 'Steel Fabrication Supplier',
+        deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: !hasExplicit && totalPages > 1,
+        separationReason:
+          !hasExplicit && totalPages > 1
+            ? 'Docket number not detected on page 1 — verify page boundaries.'
+            : undefined,
+      });
+      continue;
+    }
+
+    // Never merge pages whose explicit docket numbers differ!
+    if (hasExplicit) {
+      const existingSameDocket = segments.find(
+        (seg) => seg.hasExplicitDocketNumber && seg.docketKey === explicitKey
+      );
+      if (existingSameDocket) {
+        existingSameDocket.pageNumbers.push(p);
+        existingSameDocket.rawItems.push(...meta.rawItems);
+        existingSameDocket.maxRowSeen = Math.max(existingSameDocket.maxRowSeen, meta.maxRowNo || 0);
+        if (!existingSameDocket.carrier && meta.carrier) existingSameDocket.carrier = meta.carrier;
+        if (!existingSameDocket.orderNumber && meta.orderNumber) existingSameDocket.orderNumber = meta.orderNumber;
+        existingSameDocket.palletCount = Math.max(existingSameDocket.palletCount, meta.palletCount || 1);
+      } else {
+        segments.push({
+          docketKey: explicitKey,
+          explicitDocketNumber: meta.explicitDocketNumber,
+          hasExplicitDocketNumber: true,
+          supplier: meta.supplier || 'Steel Fabrication Supplier',
+          deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          separationUncertain: false,
+        });
+      }
+      continue;
+    }
+
+    // No explicit docket number on this page: decide continuation vs uncertain boundary split
+    const prevSeg = segments[segments.length - 1];
+    const rowResetDetected =
+      meta.minRowNo !== undefined && meta.minRowNo <= 2 && prevSeg.maxRowSeen >= 3;
+    const orderChanged =
+      Boolean(meta.orderNumber && prevSeg.orderNumber && meta.orderNumber !== prevSeg.orderNumber);
+    const shouldSplitUncertain = Boolean(meta.startsNewDocket || rowResetDetected || orderChanged);
+
+    if (shouldSplitUncertain) {
+      const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
+      const reason = `Page ${p} appears to start a new docket (${
+        rowResetDetected ? 'row numbering restarted at 1' : orderChanged ? 'order number changed' : 'new header detected'
+      }), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
+      prevSeg.separationUncertain = true;
+      prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+      segments.push({
+        docketKey: fallbackDk,
+        explicitDocketNumber: fallbackDk,
+        hasExplicitDocketNumber: false,
+        supplier: meta.supplier || prevSeg.supplier,
+        deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: true,
+        separationReason: reason,
+      });
+    } else {
+      // Continuation page of previous docket
+      prevSeg.pageNumbers.push(p);
+      prevSeg.rawItems.push(...meta.rawItems);
+      prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, meta.maxRowNo || 0);
+      prevSeg.palletCount = Math.max(prevSeg.palletCount, meta.palletCount || 1);
+    }
+  }
+
+  // Finalize each segment independently so row numbers in different dockets NEVER collide
+  const builtDockets: ExtractedDocketResult[] = [];
+
+  for (const seg of segments) {
+    const segByNo = new Map<number, ExtractedDocketItem>();
+    const segUnnumbered: ExtractedDocketItem[] = [];
+    const segPageMin = new Map<number, number>();
+    const segPageMax = new Map<number, number>();
+    let segMaxCandidate = 0;
+
+    for (const rawIt of seg.rawItems) {
+      const norm = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
       if (!norm) continue;
       const numNo = parseInt(norm.cleanNo, 10);
-      const itemPage = norm.item.pageNumber || defaultPage;
+      const itemPage = norm.item.pageNumber || seg.pageNumbers[0];
 
       if (!Number.isNaN(numNo) && numNo > 0 && numNo <= 1500) {
-        if (numNo > globalMaxCandidate) globalMaxCandidate = numNo;
-        pageMinNo.set(itemPage, Math.min(pageMinNo.get(itemPage) ?? numNo, numNo));
-        pageMaxNo.set(itemPage, Math.max(pageMaxNo.get(itemPage) ?? numNo, numNo));
+        if (numNo > segMaxCandidate) segMaxCandidate = numNo;
+        segPageMin.set(itemPage, Math.min(segPageMin.get(itemPage) ?? numNo, numNo));
+        segPageMax.set(itemPage, Math.max(segPageMax.get(itemPage) ?? numNo, numNo));
 
-        const existing = globalByNo.get(numNo);
+        const existing = segByNo.get(numNo);
         if (!existing) {
-          globalByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
+          segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
         } else if (existing.pageNumber === itemPage) {
-          globalByNo.set(numNo, {
+          segByNo.set(numNo, {
             ...existing,
             partNumber:
               existing.partNumber && existing.partNumber !== 'PART'
@@ -1050,141 +1260,112 @@ export async function extractDocketWithGeminiVision(
             quantity: existing.quantity || norm.item.quantity,
           });
         } else {
-          unnumberedItems.push(norm.item);
+          segUnnumbered.push(norm.item);
         }
       } else {
-        unnumberedItems.push(norm.item);
-      }
-    }
-  }
-
-  // Pass 2: Single-Call Global Missing "No" Recovery
-  if (
-    anyPrintedNoColumn &&
-    globalMaxCandidate > 1 &&
-    globalMaxCandidate <= 600 &&
-    unnumberedItems.length === 0
-  ) {
-    const missingNos: number[] = [];
-    for (let n = 1; n <= globalMaxCandidate; n++) {
-      if (!globalByNo.has(n)) {
-        missingNos.push(n);
+        segUnnumbered.push(norm.item);
       }
     }
 
-    if (missingNos.length > 0 && missingNos.length <= 60) {
-      const missingPerPage = new Map<number, Set<number>>();
-      const assignToPage = (pNum: number, val: number) => {
-        if (pNum < 1 || pNum > totalPages) return;
-        if (!missingPerPage.has(pNum)) missingPerPage.set(pNum, new Set());
-        missingPerPage.get(pNum)!.add(val);
-      };
-
-      for (const mNo of missingNos) {
-        let matched = false;
-        for (let p = 1; p <= totalPages; p++) {
-          const pMin = pageMinNo.get(p) ?? 1;
-          const pMax = pageMaxNo.get(p) ?? globalMaxCandidate;
-          if (mNo >= pMin && mNo <= pMax) {
-            assignToPage(p, mNo);
-            matched = true;
+    // Pass 2: Missing row recovery scoped strictly to this segment's pages
+    if (
+      anyPrintedNoColumn &&
+      segMaxCandidate > 1 &&
+      segMaxCandidate <= 600 &&
+      segUnnumbered.length === 0
+    ) {
+      const missingNos: number[] = [];
+      for (let n = 1; n <= segMaxCandidate; n++) {
+        if (!segByNo.has(n)) missingNos.push(n);
+      }
+      if (missingNos.length > 0 && missingNos.length <= 60) {
+        const missingPerPage = new Map<number, Set<number>>();
+        for (const mNo of missingNos) {
+          let targetP = seg.pageNumbers[0];
+          for (const p of seg.pageNumbers) {
+            const pMin = segPageMin.get(p) ?? 1;
+            const pMax = segPageMax.get(p) ?? segMaxCandidate;
+            if (mNo >= pMin && mNo <= pMax) {
+              targetP = p;
+              break;
+            }
           }
+          if (!missingPerPage.has(targetP)) missingPerPage.set(targetP, new Set());
+          missingPerPage.get(targetP)!.add(mNo);
         }
-        if (!matched) {
-          for (let p = 1; p < totalPages; p++) {
-            const pMax = pageMaxNo.get(p);
-            const nextMin = pageMinNo.get(p + 1);
-            if (pMax !== undefined && nextMin !== undefined && mNo > pMax && mNo < nextMin) {
-              assignToPage(p, mNo);
-              assignToPage(p + 1, mNo);
-              matched = true;
+        const recoveryPayloads = Array.from(missingPerPage.entries()).map(([pNum, set]) => ({
+          pageNumber: pNum,
+          payload: resolvedPayloads[pNum - 1],
+          missingNos: Array.from(set).sort((a, b) => a - b),
+        }));
+        for (let i = 0; i < recoveryPayloads.length; i += 3) {
+          const chunk = recoveryPayloads.slice(i, i + 3);
+          const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
+          for (const r of recoveredRaw) {
+            const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
+            if (!norm) continue;
+            const numNo = parseInt(norm.cleanNo, 10);
+            if (!Number.isNaN(numNo) && numNo > 0 && !segByNo.has(numNo)) {
+              segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
             }
           }
         }
-        if (!matched) {
-          assignToPage(mNo <= (pageMaxNo.get(1) ?? 50) ? 1 : totalPages, mNo);
-        }
-      }
-
-      const recoveryPayloads = Array.from(missingPerPage.entries()).map(([pNum, set]) => ({
-        pageNumber: pNum,
-        payload: resolvedPayloads[pNum - 1],
-        missingNos: Array.from(set).sort((a, b) => a - b),
-      }));
-
-      for (let i = 0; i < recoveryPayloads.length; i += 3) {
-        const chunk = recoveryPayloads.slice(i, i + 3);
-        const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
-        for (const r of recoveredRaw) {
-          const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
-          if (!norm) continue;
-          const numNo = parseInt(norm.cleanNo, 10);
-          if (!Number.isNaN(numNo) && numNo > 0 && !globalByNo.has(numNo)) {
-            globalByNo.set(numNo, {
-              ...norm.item,
-              itemNumber: String(numNo),
-            });
-          }
-        }
       }
     }
-  }
 
-  const validItems: ExtractedDocketItem[] = [];
-  const sortedNos = Array.from(globalByNo.keys()).sort((a, b) => a - b);
-  for (const n of sortedNos) {
-    validItems.push(globalByNo.get(n)!);
-  }
+    const validItems: ExtractedDocketItem[] = [];
+    const sortedNos = Array.from(segByNo.keys()).sort((a, b) => a - b);
+    for (const n of sortedNos) {
+      validItems.push(segByNo.get(n)!);
+    }
+    let nextSeq = (sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : startItemIndex - 1) + 1;
+    for (const unnum of segUnnumbered) {
+      validItems.push({ ...unnum, itemNumber: String(nextSeq++) });
+    }
 
-  let nextSeq = (sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : startItemIndex - 1) + 1;
-  for (const unnum of unnumberedItems) {
-    validItems.push({
-      ...unnum,
-      itemNumber: String(nextSeq++),
+    builtDockets.push({
+      docketNumber: seg.explicitDocketNumber,
+      supplier: seg.supplier,
+      deliveryDate: seg.deliveryDate,
+      carrier: seg.carrier,
+      orderNumber: seg.orderNumber,
+      palletCount: seg.palletCount,
+      items: validItems,
+      confidenceScore: validItems.length > 0 ? (seg.separationUncertain ? 75 : 100) : 0,
+      needsManualReview: validItems.length === 0 || seg.separationUncertain,
+      separationUncertain: seg.separationUncertain,
+      separationReason: seg.separationReason,
+      sourcePageNumbers: [...seg.pageNumbers],
+      extractionMethod: 'ai-vision',
+      aiModelUsed: modelUsed,
+      fallbackUsed,
+      retryAttempts: totalRetries,
+      pagesScanned: seg.pageNumbers.length,
+      hasPrintedNoColumn: anyPrintedNoColumn,
+      firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : undefined,
+      lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : undefined,
     });
   }
 
-  const rawDocketNo =
-    batchResponses.find((p) => p.docketNumber && p.docketNumber.trim())?.docketNumber ||
-    `DK-${Math.floor(10000 + Math.random() * 90000)}`;
-  const cleanedDocketNumber = rawDocketNo.trim();
-
-  const supplier =
-    batchResponses.find((p) => p.supplier && p.supplier.trim())?.supplier?.trim() ||
-    'Steel Fabrication Supplier';
-
-  const rawDate = batchResponses.find(
-    (p) => p.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(p.deliveryDate.trim())
-  )?.deliveryDate;
-  const deliveryDate = rawDate ? rawDate.trim() : new Date().toISOString().slice(0, 10);
-
-  const carrier = batchResponses.find((p) => p.carrier && p.carrier.trim())?.carrier?.trim();
-  const orderNumber = batchResponses
-    .find((p) => p.orderNumber && p.orderNumber.trim())
-    ?.orderNumber?.trim();
-  const maxPalletCount = Math.max(
-    1,
-    ...batchResponses.map((p) => parseInt(String(p.palletCount || 1), 10) || 1)
-  );
-
-  return {
-    docketNumber: cleanedDocketNumber,
-    supplier,
-    deliveryDate,
-    carrier,
-    orderNumber,
-    palletCount: maxPalletCount,
-    items: validItems,
-    confidenceScore: validItems.length > 0 ? 100 : 0,
-    needsManualReview: validItems.length === 0,
-    extractionMethod: 'ai-vision',
+  const primary = builtDockets[0] || {
+    docketNumber: `DK-${Math.floor(10000 + Math.random() * 90000)}`,
+    supplier: 'Steel Fabrication Supplier',
+    deliveryDate: new Date().toISOString().slice(0, 10),
+    palletCount: 1,
+    items: [],
+    confidenceScore: 0,
+    needsManualReview: true,
+    extractionMethod: 'ai-vision' as const,
     aiModelUsed: modelUsed,
     fallbackUsed,
     retryAttempts: totalRetries,
     pagesScanned: totalPages,
-    hasPrintedNoColumn: anyPrintedNoColumn,
-    firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : undefined,
-    lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : undefined,
+  };
+
+  return {
+    ...primary,
+    pagesScanned: totalPages,
+    separatedDockets: builtDockets,
   };
 }
 

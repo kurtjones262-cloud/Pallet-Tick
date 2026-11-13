@@ -18,10 +18,23 @@ import {
   Layers,
   Calendar,
   RotateCcw,
+  Loader2,
+  UserCheck,
+  X,
 } from 'lucide-react';
-import { Delivery, DeliveryPart, PendingQuantityConfirmation } from '../types/delivery';
-import { updateDelivery, getPartVerificationState } from '../utils/storage';
-import { exportDeliveryPdf } from '../utils/pdfExport';
+import {
+  Delivery,
+  DeliveryPart,
+  PendingQuantityConfirmation,
+  UserRole,
+} from '../types/delivery';
+import {
+  updateDelivery,
+  deleteDeliveryAuthoritative,
+  getPartVerificationState,
+} from '../utils/storage';
+import { apiUpdateDelivery } from '../services/palletTrackApi';
+import { exportDeliveryPdf, formatPartScannersSummary } from '../utils/pdfExport';
 import { exportDeliveryCsv } from '../utils/csvExport';
 import { filterPartsSmart, HighlightMatch } from '../utils/partSearch';
 import { PartsListEditorModal, PartsEditorMode } from './PartsListEditorModal';
@@ -36,9 +49,11 @@ interface ChecklistViewProps {
   onStartScanning?: () => void;
   onBackToOrders?: () => void;
   onNavigateToOrders?: () => void;
+  onDeleteDelivery?: (id: string) => void;
   onOpenTestSheet?: () => void;
   onOpenUnexpectedModal?: () => void;
   onOpenNewDelivery?: () => void;
+  userRole?: UserRole;
 }
 
 type OrderDetailsTab = 'parts' | 'pallets' | 'details' | 'activity';
@@ -52,7 +67,11 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   onStartScanning,
   onBackToOrders,
   onNavigateToOrders,
+  onDeleteDelivery,
+  userRole,
 }) => {
+  const canManageDeletion =
+    userRole === 'super_admin' || userRole === 'admin' || userRole === 'supervisor';
   const handleBackToOrders = onBackToOrders || onNavigateToOrders;
   const [activeSubTab, setActiveSubTab] = useState<OrderDetailsTab>('parts');
   const [searchQuery, setSearchQuery] = useState('');
@@ -64,6 +83,11 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
   const [editingQtyPartId, setEditingQtyPartId] = useState<string | null>(null);
   const [inlineReceivedQty, setInlineReceivedQty] = useState<string>('');
   const [isDocketPhotosOpen, setIsDocketPhotosOpen] = useState(false);
+  const [expandedAttributionPartId, setExpandedAttributionPartId] = useState<string | null>(null);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [isDeletingDocket, setIsDeletingDocket] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [isMarkingReviewed, setIsMarkingReviewed] = useState(false);
 
   useEffect(() => {
     if (initialPalletFilter) {
@@ -268,11 +292,44 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
     setEditingQtyPartId(null);
   };
 
+  const handleMarkDocketReviewed = async () => {
+    if (!delivery) return;
+    setIsMarkingReviewed(true);
+    try {
+      const updated: Delivery = {
+        ...delivery,
+        needsReview: false,
+        separationReason: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      await apiUpdateDelivery(delivery.id, { needsReview: false }).catch(() => {});
+      updateDelivery(updated);
+      onUpdateDelivery(updated);
+    } finally {
+      setIsMarkingReviewed(false);
+    }
+  };
+
+  const handleConfirmDeleteDocket = async () => {
+    if (!delivery || !canManageDeletion) return;
+    setActionError(null);
+    setIsDeletingDocket(true);
+    try {
+      await deleteDeliveryAuthoritative(delivery.id);
+      setConfirmDeleteOpen(false);
+      onDeleteDelivery?.(delivery.id);
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to delete completed docket.');
+    } finally {
+      setIsDeletingDocket(false);
+    }
+  };
+
   if (!delivery) {
     return (
       <div className="flex-1 w-full bg-[var(--pt-bg,#080B12)] text-white p-8 text-center">
         <p className="text-xs font-mono text-[var(--pt-text-secondary,#A3A8BD)]">
-          No delivery docket selected. Select an order from Orders &amp; Shipments.
+          No delivery docket selected. Select a docket from Delivery Dockets.
         </p>
       </div>
     );
@@ -381,8 +438,52 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                 <Printer className="w-3.5 h-3.5 text-[var(--pt-primary-light,#C084FC)]" />
                 <span className="hidden sm:inline">PDF</span>
               </button>
+
+              {canManageDeletion && isCompleted && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  className="h-10 px-3 rounded-xl bg-[#EF4444]/10 hover:bg-[#EF4444]/20 border border-[#EF4444]/40 text-[#EF4444] font-mono font-bold text-xs inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                  title="Delete completed docket (Supervisor/Admin only)"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Delete Docket</span>
+                </button>
+              )}
             </div>
           </div>
+
+          {delivery.needsReview && (
+            <div className="p-3 rounded-xl bg-[#F59E0B]/15 border border-[#F59E0B]/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-start gap-2 text-xs font-mono text-[#F59E0B]">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-extrabold uppercase">Needs Review: </span>
+                  <span className="text-white/90">
+                    {delivery.separationReason ||
+                      'Multi-page or docket separation could not be fully confirmed automatically. Verify docket number & parts list.'}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isMarkingReviewed}
+                onClick={handleMarkDocketReviewed}
+                className="h-8 px-3 rounded-lg bg-[#F59E0B] hover:brightness-110 text-black font-mono font-extrabold text-[11px] uppercase shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                {isMarkingReviewed ? 'Saving...' : 'Mark Reviewed'}
+              </button>
+            </div>
+          )}
+
+          {actionError && (
+            <div className="p-3 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] text-xs font-mono flex items-center justify-between gap-2">
+              <span>{actionError}</span>
+              <button type="button" onClick={() => setActionError(null)} className="cursor-pointer">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
 
           {/* Progress Bar */}
           <div className="w-full h-2 rounded-full bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] overflow-hidden">
@@ -660,11 +761,70 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
                             )}
                             {part.material && <span>• Mat: {part.material}</span>}
                             {part.thickness && <span>• Thk: {part.thickness}</span>}
-                            {part.lastScannedByName && (
-                              <span className="text-[#00D979]">
-                                • Verified by {part.lastScannedByName}
-                              </span>
-                            )}
+                            {(() => {
+                              const scannersSummary = formatPartScannersSummary(
+                                part,
+                                delivery.scanHistory
+                              );
+                              if (scannersSummary === '—') return null;
+                              const attributions = Array.isArray(part.scannedByUsers)
+                                ? part.scannedByUsers
+                                : [];
+                              const isExpandedAttr = expandedAttributionPartId === part.id;
+                              return (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (attributions.length > 0) {
+                                        setExpandedAttributionPartId(
+                                          isExpandedAttr ? null : part.id
+                                        );
+                                      }
+                                    }}
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#00D979]/10 border border-[#00D979]/30 text-[#00D979] font-semibold cursor-pointer hover:bg-[#00D979]/20 transition-colors"
+                                    title={
+                                      attributions.length > 0
+                                        ? 'Click to view per-operator scan breakdown'
+                                        : undefined
+                                    }
+                                  >
+                                    <UserCheck className="w-3 h-3" />
+                                    <span>Scanned by: {scannersSummary}</span>
+                                  </button>
+                                  {isExpandedAttr && attributions.length > 0 && (
+                                    <div className="w-full mt-1.5 p-2 rounded-lg bg-[var(--pt-bg,#080B12)] border border-[var(--pt-border,#29243D)] space-y-1">
+                                      <div className="text-[9px] uppercase tracking-wider text-[var(--pt-text-muted,#737B94)] font-bold">
+                                        Operator Attribution Breakdown
+                                      </div>
+                                      {attributions.map((attr, aIdx) => (
+                                        <div
+                                          key={`${attr.userId || attr.employeeName}_${aIdx}`}
+                                          className="flex items-center justify-between gap-2 text-[10px] text-white/90"
+                                        >
+                                          <span className="font-semibold text-[#00D979]">
+                                            {attr.employeeName}
+                                          </span>
+                                          <span className="text-[var(--pt-text-secondary,#A3A8BD)] tabular-nums">
+                                            {attr.quantityScanned} units · {attr.scanCount}{' '}
+                                            {attr.scanCount === 1 ? 'scan' : 'scans'} ·{' '}
+                                            {attr.lastScannedAt
+                                              ? new Date(attr.lastScannedAt).toLocaleString([], {
+                                                  month: 'short',
+                                                  day: 'numeric',
+                                                  hour: '2-digit',
+                                                  minute: '2-digit',
+                                                })
+                                              : ''}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </>
+                              );
+                            })()}
                           </div>
                         </div>
                       </div>
@@ -980,6 +1140,57 @@ export const ChecklistView: React.FC<ChecklistViewProps> = ({
           delivery={delivery}
           onClose={() => setIsDocketPhotosOpen(false)}
         />
+      )}
+
+      {/* Role-Restricted Delete Completed Docket Modal */}
+      {confirmDeleteOpen && delivery && (
+        <div
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => !isDeletingDocket && setConfirmDeleteOpen(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl bg-[var(--pt-card,#15182A)] border border-[#EF4444]/40 p-5 shadow-2xl space-y-4 text-white"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-mono font-extrabold text-sm uppercase text-white">
+                  Delete Completed Docket #{delivery.docketNumber}?
+                </h3>
+                <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mt-1 leading-relaxed">
+                  This permanently deletes Docket #{delivery.docketNumber} ({delivery.supplier}), all of its parts, scan history, and removes it from any Docket Groups.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isDeletingDocket}
+                onClick={() => setConfirmDeleteOpen(false)}
+                className="h-9 px-4 rounded-xl bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] text-xs font-mono font-bold text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingDocket}
+                onClick={handleConfirmDeleteDocket}
+                className="h-9 px-4 rounded-xl bg-[#EF4444] hover:bg-red-500 text-white text-xs font-mono font-extrabold uppercase inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isDeletingDocket ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isDeletingDocket ? 'Deleting...' : 'Confirm Delete'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

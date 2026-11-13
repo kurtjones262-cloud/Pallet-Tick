@@ -33,6 +33,7 @@ import {
   HardHat,
   BarChart3,
   RefreshCw,
+  FolderKanban,
 } from 'lucide-react';
 import { Delivery, UserAccount, UserRole } from '../types/delivery';
 import { exportDeliveryPdf } from '../utils/pdfExport';
@@ -55,8 +56,9 @@ interface DeliveryDashboardProps {
   onOpenTestSheet: () => void;
   onNavigateToChecklist: (palletFilter?: string) => void;
   onNavigateToOrders?: () => void;
+  onNavigateToGroups?: () => void;
   onNavigateToReports?: () => void;
-  onStartScanning: () => void;
+  groupsCount?: number;
   onOpenNewDelivery?: () => void;
   onOpenDeliveriesList?: () => void;
   onOpenSettings?: () => void;
@@ -71,8 +73,9 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
   onOpenUnexpectedModal,
   onNavigateToChecklist,
   onNavigateToOrders,
+  onNavigateToGroups,
   onNavigateToReports,
-  onStartScanning,
+  groupsCount = 0,
   onOpenNewDelivery,
   onOpenDeliveriesList,
   onOpenSettings,
@@ -641,11 +644,13 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
               </div>
 
               <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white font-sans">
-                READY TO SCAN?
+                {allDeliveries.length === 0 ? 'NO DOCKETS ON FILE' : 'DOCKET RECEIVING CONTROL'}
               </h2>
 
               <p className="text-xs sm:text-sm text-[var(--pt-text-secondary,#A3A8BD)] leading-relaxed">
-                Scan barcodes, QR codes and pallet labels to receive, verify and track parts in real time.
+                {allDeliveries.length === 0
+                  ? 'Upload one or more delivery dockets to create independent shipments, or group existing dockets to scan parts.'
+                  : 'Open an individual delivery docket or a docket group to verify barcodes, QR codes and pallet labels in real time.'}
               </p>
 
               {/* Supported Scanning Methods */}
@@ -665,17 +670,29 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
               </div>
             </div>
 
-            {/* Primary & Secondary Action Buttons */}
+            {/* Primary & Secondary Action Buttons (Never global scan — open a docket or upload) */}
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 shrink-0">
-              <button
-                type="button"
-                onClick={onStartScanning}
-                className="h-13 sm:h-14 px-7 sm:px-8 rounded-xl pt-btn-primary font-mono font-extrabold text-sm tracking-wider uppercase inline-flex items-center justify-center gap-3 transition-all transform active:scale-[0.98] cursor-pointer"
-              >
-                <QrCode className="w-5 h-5 stroke-[2.4]" />
-                <span>SCAN NOW</span>
-                <ArrowUpRight className="w-4 h-4" />
-              </button>
+              {delivery ? (
+                <button
+                  type="button"
+                  onClick={() => onNavigateToChecklist()}
+                  className="h-13 sm:h-14 px-6 sm:px-7 rounded-xl pt-btn-primary font-mono font-extrabold text-sm tracking-wider uppercase inline-flex items-center justify-center gap-3 transition-all transform active:scale-[0.98] cursor-pointer"
+                >
+                  <ClipboardList className="w-5 h-5 stroke-[2.4]" />
+                  <span>OPEN DOCKET #{delivery.docketNumber}</span>
+                  <ArrowUpRight className="w-4 h-4" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => (onNavigateToOrders ? onNavigateToOrders() : onNavigateToChecklist())}
+                  className="h-13 sm:h-14 px-6 sm:px-7 rounded-xl pt-btn-primary font-mono font-extrabold text-sm tracking-wider uppercase inline-flex items-center justify-center gap-3 transition-all transform active:scale-[0.98] cursor-pointer"
+                >
+                  <ClipboardList className="w-5 h-5 stroke-[2.4]" />
+                  <span>VIEW DOCKETS</span>
+                  <ArrowUpRight className="w-4 h-4" />
+                </button>
+              )}
 
               {onOpenNewDelivery && (
                 <button
@@ -684,7 +701,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
                   className="h-13 sm:h-14 px-5 rounded-xl bg-[var(--pt-bg-secondary,#101321)] hover:bg-white/10 border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-white font-mono font-bold text-xs uppercase tracking-wider inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
                 >
                   <Plus className="w-4 h-4 text-[var(--pt-primary-light,#C084FC)] stroke-[2.5]" />
-                  <span>UPLOAD DOCKET</span>
+                  <span>UPLOAD DOCKETS</span>
                 </button>
               )}
             </div>
@@ -1109,10 +1126,10 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
                 </p>
                 <button
                   type="button"
-                  onClick={onStartScanning}
+                  onClick={() => (onNavigateToOrders ? onNavigateToOrders() : onNavigateToChecklist())}
                   className="mt-2 text-xs font-mono font-bold text-[var(--pt-primary-light,#C084FC)] hover:underline flex items-center gap-1 cursor-pointer"
                 >
-                  <span>Start scanning now</span>
+                  <span>Open dockets to scan</span>
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -1126,29 +1143,29 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
         <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <button
             type="button"
-            onClick={onStartScanning}
-            className="p-4 rounded-2xl bg-[var(--pt-card,#15182A)] hover:bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-left transition-all cursor-pointer group"
-          >
-            <div className="w-9 h-9 rounded-xl bg-[var(--pt-bg,#080B12)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)] flex items-center justify-center mb-2.5 group-hover:scale-105 transition-transform">
-              <QrCode className="w-4 h-4" />
-            </div>
-            <div className="font-bold text-xs text-white">Scan Parts &amp; Pallets</div>
-            <div className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
-              1D, QR &amp; Label OCR
-            </div>
-          </button>
-
-          <button
-            type="button"
             onClick={() => (onNavigateToOrders ? onNavigateToOrders() : onNavigateToChecklist())}
             className="p-4 rounded-2xl bg-[var(--pt-card,#15182A)] hover:bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-left transition-all cursor-pointer group"
           >
             <div className="w-9 h-9 rounded-xl bg-[var(--pt-bg,#080B12)] text-[#078BFF] border border-[var(--pt-border,#29243D)] flex items-center justify-center mb-2.5 group-hover:scale-105 transition-transform">
               <ClipboardList className="w-4 h-4" />
             </div>
-            <div className="font-bold text-xs text-white">Orders &amp; Shipments</div>
+            <div className="font-bold text-xs text-white">Delivery Dockets</div>
             <div className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
-              All, Incomplete, Started &amp; Finished
+              {stats.totalDeliveries} dockets · Open to scan parts
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => (onNavigateToGroups ? onNavigateToGroups() : onNavigateToOrders?.())}
+            className="p-4 rounded-2xl bg-[var(--pt-card,#15182A)] hover:bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] hover:border-[var(--pt-primary,#A020F0)] text-left transition-all cursor-pointer group"
+          >
+            <div className="w-9 h-9 rounded-xl bg-[var(--pt-bg,#080B12)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)] flex items-center justify-center mb-2.5 group-hover:scale-105 transition-transform">
+              <FolderKanban className="w-4 h-4" />
+            </div>
+            <div className="font-bold text-xs text-white">Docket Groups</div>
+            <div className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
+              {groupsCount} {groupsCount === 1 ? 'group' : 'groups'} · Batch group scanning
             </div>
           </button>
 
@@ -1164,7 +1181,7 @@ export const DeliveryDashboard: React.FC<DeliveryDashboardProps> = ({
             </div>
             <div className="font-bold text-xs text-white">Reports &amp; Exports</div>
             <div className="text-[10px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-0.5">
-              PDF, CSV &amp; Analytics
+              PDF, CSV &amp; User Accountability
             </div>
           </button>
 

@@ -9,10 +9,16 @@ import { TestBarcodesModal } from './components/TestBarcodesModal';
 import { UnexpectedPartsModal } from './components/UnexpectedPartsModal';
 import { SettingsModal } from './components/SettingsModal';
 import { ReportsView } from './components/ReportsView';
-import { Delivery, PendingQuantityConfirmation, UserAccount } from './types/delivery';
+import {
+  Delivery,
+  DocketGroup,
+  PendingQuantityConfirmation,
+  UserAccount,
+} from './types/delivery';
 import {
   getActiveDelivery,
   getStoredDeliveries,
+  setActiveDeliveryId,
   updateDelivery,
   processScannedCode,
   getStoredSettings,
@@ -23,6 +29,7 @@ import {
 import { playAudio, triggerHaptic, speakAlert } from './utils/audioFeedback';
 import { SplashScreen } from './components/SplashScreen';
 import { OrdersView } from './components/OrdersView';
+import { DocketGroupsView } from './components/DocketGroupsView';
 import { DuplicateScanModal, DuplicateScanModalData } from './components/DuplicateScanModal';
 import { ConnectionStatusBar } from './components/ConnectionStatusBar';
 import { ConnectionRequiredModal } from './components/ConnectionRequiredModal';
@@ -35,6 +42,7 @@ import {
   apiLogin,
   apiLogout,
   apiCheckProvisionStatus,
+  apiListGroups,
   getStoredUser,
   getAuthToken,
   setAuthToken,
@@ -47,6 +55,11 @@ import {
   applyThemeToDocument,
 } from './config/theme';
 
+export type ScanScopeContext =
+  | { mode: 'delivery'; deliveryId: string }
+  | { mode: 'group'; groupId: string }
+  | null;
+
 export function App() {
   // Phase 2 Multi-User & RBAC State
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => getStoredUser());
@@ -57,7 +70,11 @@ export function App() {
 
   // Application views & state
   const [activeTab, setActiveTab] = useState<NavTabId>('dashboard');
+  const [deliveries, setDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
   const [activeDelivery, setActiveDelivery] = useState<Delivery | null>(null);
+  const [groups, setGroups] = useState<DocketGroup[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [scanContext, setScanContext] = useState<ScanScopeContext>(null);
   const [checklistPalletFilter, setChecklistPalletFilter] = useState<string>('all');
   const [externalPendingQuantity, setExternalPendingQuantity] =
     useState<PendingQuantityConfirmation | null>(null);
@@ -88,14 +105,28 @@ export function App() {
   }, [currentUser]);
 
   const reloadDelivery = useCallback(() => {
+    const all = getStoredDeliveries();
     const current = getActiveDelivery();
+    setDeliveries(all);
     setActiveDelivery(current);
   }, []);
+
+  const refreshGroups = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      const list = await apiListGroups();
+      setGroups(list);
+    } catch {
+      // Keep cached groups on transient network issues
+    }
+  }, [currentUser]);
 
   const initAppWorkspace = useCallback(() => {
     try {
       setInitError(null);
+      const all = getStoredDeliveries();
       const current = getActiveDelivery();
+      setDeliveries(all);
       setActiveDelivery(current);
       setIsAppReady(true);
     } catch (err: any) {
@@ -185,6 +216,7 @@ export function App() {
       syncDeliveriesFromCentralDatabase()
         .then(() => reloadDelivery())
         .catch(console.warn);
+      refreshGroups().catch(() => {});
 
       // Start live multi-user WebSocket synchronisation
       realtimeClient.start(getActiveDelivery()?.id || null);
@@ -193,6 +225,19 @@ export function App() {
     }
 
     const unsubRealtimeEvent = realtimeClient.onEvent((event) => {
+      if (event.type === 'deliveries:cleared') {
+        setGroups([]);
+        setSelectedGroupId(null);
+        setScanContext(null);
+      }
+      if (
+        event.type === 'group:created' ||
+        event.type === 'group:updated' ||
+        event.type === 'group:deleted' ||
+        event.type === 'delivery:deleted'
+      ) {
+        refreshGroups().catch(() => {});
+      }
       const { changed } = applyRealtimeEventToDeliveries(getStoredDeliveries(), event);
       if (changed) {
         reloadDelivery();
@@ -204,6 +249,7 @@ export function App() {
       setAuthToken(null);
       setStoredUser(null);
       setCurrentUser(null);
+      setScanContext(null);
       setActiveTab('dashboard');
     });
 
@@ -222,7 +268,7 @@ export function App() {
       window.removeEventListener('parttrack_active_delivery_changed', handleActiveChange);
       window.removeEventListener('parttrack_connection_required', handleConnectionRequired);
     };
-  }, [initAppWorkspace, reloadDelivery, currentUser]);
+  }, [initAppWorkspace, reloadDelivery, refreshGroups, currentUser]);
 
   // Keep active delivery room and worker status synchronised across tabs/deliveries
   useEffect(() => {
@@ -252,7 +298,23 @@ export function App() {
   const handleUpdateDelivery = (updated: Delivery) => {
     setActiveDelivery(updated);
     updateDelivery(updated);
+    setDeliveries(getStoredDeliveries());
   };
+
+  const openScopedScanner = useCallback(
+    (scope: NonNullable<ScanScopeContext>) => {
+      if (scope.mode === 'delivery') {
+        const target =
+          getStoredDeliveries().find((d) => d.id === scope.deliveryId) || activeDelivery;
+        if (!target) return;
+        setActiveDeliveryId(target.id);
+        setActiveDelivery(target);
+      }
+      setScanContext(scope);
+      setActiveTab('scanner');
+    },
+    [activeDelivery]
+  );
 
   const handleLoginSuccess = (user: UserAccount) => {
     try {
@@ -273,6 +335,7 @@ export function App() {
     realtimeClient.stop();
     await apiLogout();
     setCurrentUser(null);
+    setScanContext(null);
     setActiveTab('dashboard');
   };
 
@@ -362,6 +425,9 @@ export function App() {
     if (tab !== 'checklist') {
       setChecklistPalletFilter('all');
     }
+    if (tab !== 'scanner') {
+      setScanContext(null);
+    }
     setActiveTab(tab);
   };
 
@@ -432,8 +498,9 @@ export function App() {
               setActiveTab('checklist');
             }}
             onNavigateToOrders={() => setActiveTab('orders')}
+            onNavigateToGroups={() => setActiveTab('groups')}
             onNavigateToReports={() => setActiveTab('reports')}
-            onStartScanning={() => setActiveTab('scanner')}
+            groupsCount={groups.length}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             onOpenDeliveriesList={() => setIsDeliveriesListOpen(true)}
             onOpenSettings={() => setIsSettingsOpen(true)}
@@ -446,37 +513,113 @@ export function App() {
         {activeTab === 'orders' && (
           <OrdersView
             activeDelivery={activeDelivery}
-            onSelectDelivery={handleUpdateDelivery}
+            onSelectDelivery={(del) => {
+              setActiveDeliveryId(del.id);
+              setActiveDelivery(del);
+            }}
             onUpdateDelivery={handleUpdateDelivery}
+            onDeleteDelivery={() => {
+              reloadDelivery();
+              refreshGroups().catch(() => {});
+            }}
+            onClearAllDockets={() => {
+              setGroups([]);
+              setSelectedGroupId(null);
+              setScanContext(null);
+              reloadDelivery();
+            }}
+            onOpenChecklist={(del) => {
+              setActiveDeliveryId(del.id);
+              setActiveDelivery(del);
+              setChecklistPalletFilter('all');
+              setActiveTab('checklist');
+            }}
             onNavigateToChecklist={(pallet?: string) => {
               setChecklistPalletFilter(pallet || 'all');
               setActiveTab('checklist');
             }}
-            onStartScanning={() => setActiveTab('scanner')}
+            onStartScanning={(del) => {
+              const target = del || activeDelivery;
+              if (target) {
+                openScopedScanner({ mode: 'delivery', deliveryId: target.id });
+              }
+            }}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
+            userRole={currentUser?.role}
+          />
+        )}
+
+        {activeTab === 'groups' && (
+          <DocketGroupsView
+            groups={groups}
+            deliveries={deliveries}
+            selectedGroupId={selectedGroupId}
+            onSelectGroup={setSelectedGroupId}
+            onGroupsChanged={setGroups}
+            onOpenDelivery={(del) => {
+              setActiveDeliveryId(del.id);
+              setActiveDelivery(del);
+              setChecklistPalletFilter('all');
+              setActiveTab('checklist');
+            }}
+            onScanGroup={(groupId) => {
+              openScopedScanner({ mode: 'group', groupId });
+            }}
+            userRole={currentUser?.role}
           />
         )}
 
         {activeTab === 'reports' && (
           <ReportsView
             activeDelivery={activeDelivery}
+            groups={groups}
             onSelectDelivery={(del) => {
-              handleUpdateDelivery(del);
+              setActiveDeliveryId(del.id);
+              setActiveDelivery(del);
+            }}
+            onOpenOrderDetails={(del) => {
+              setActiveDeliveryId(del.id);
+              setActiveDelivery(del);
+              setChecklistPalletFilter('all');
               setActiveTab('checklist');
             }}
           />
         )}
 
-        {activeTab === 'scanner' && (
+        {activeTab === 'scanner' && scanContext && (
           <ScannerView
-            delivery={activeDelivery}
+            scanScope={scanContext}
+            delivery={
+              scanContext.mode === 'delivery'
+                ? deliveries.find((d) => d.id === scanContext.deliveryId) || activeDelivery
+                : activeDelivery
+            }
+            group={
+              scanContext.mode === 'group'
+                ? groups.find((g) => g.id === scanContext.groupId) || null
+                : null
+            }
+            groupDeliveries={
+              scanContext.mode === 'group'
+                ? (() => {
+                    const g = groups.find((item) => item.id === scanContext.groupId);
+                    if (!g) return [];
+                    const idSet = new Set(g.deliveryIds || []);
+                    return deliveries.filter((d) => idSet.has(d.id));
+                  })()
+                : []
+            }
             onUpdateDelivery={handleUpdateDelivery}
             onOpenTestSheet={() => setIsTestSheetOpen(true)}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
             externalPendingQuantity={externalPendingQuantity}
             onClearExternalPendingQuantity={() => setExternalPendingQuantity(null)}
             onScanConfirmationChange={setIsConfirmingScan}
-            onClose={() => setActiveTab('dashboard')}
+            onClose={() => {
+              const returnTab = scanContext.mode === 'group' ? 'groups' : 'checklist';
+              setScanContext(null);
+              setActiveTab(returnTab);
+            }}
           />
         )}
 
@@ -488,8 +631,18 @@ export function App() {
             onOpenUnexpectedModal={() => setIsUnexpectedOpen(true)}
             initialPalletFilter={checklistPalletFilter}
             onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
-            onStartScanning={() => setActiveTab('scanner')}
+            onStartScanning={() => {
+              if (activeDelivery) {
+                openScopedScanner({ mode: 'delivery', deliveryId: activeDelivery.id });
+              }
+            }}
+            onDeleteDelivery={() => {
+              reloadDelivery();
+              refreshGroups().catch(() => {});
+              setActiveTab('orders');
+            }}
             onNavigateToOrders={() => setActiveTab('orders')}
+            userRole={currentUser?.role}
           />
         )}
       </main>
@@ -498,9 +651,19 @@ export function App() {
       {isNewDeliveryOpen && (
         <NewDeliveryModal
           onClose={() => setIsNewDeliveryOpen(false)}
-          onDeliveryCreated={(newDel) => {
-            setActiveDelivery(newDel);
-            setActiveTab('scanner');
+          onDeliveryCreated={(created) => {
+            const createdList = Array.isArray(created) ? created : [created];
+            reloadDelivery();
+            if (createdList.length > 1) {
+              setActiveDeliveryId(createdList[0].id);
+              setActiveDelivery(createdList[0]);
+              setActiveTab('orders');
+            } else if (createdList[0]) {
+              setActiveDeliveryId(createdList[0].id);
+              setActiveDelivery(createdList[0]);
+              setChecklistPalletFilter('all');
+              setActiveTab('checklist');
+            }
           }}
         />
       )}
@@ -508,7 +671,12 @@ export function App() {
       {isDeliveriesListOpen && (
         <DeliveriesListModal
           activeDeliveryId={activeDelivery?.id || null}
-          onSelectDelivery={(selected) => setActiveDelivery(selected)}
+          onSelectDelivery={(selected) => {
+            setActiveDeliveryId(selected.id);
+            setActiveDelivery(selected);
+            setChecklistPalletFilter('all');
+            setActiveTab('checklist');
+          }}
           onOpenNewDelivery={() => setIsNewDeliveryOpen(true)}
           onOpenMigration={() => setIsMigrationModalOpen(true)}
           onClose={() => setIsDeliveriesListOpen(false)}
@@ -535,7 +703,16 @@ export function App() {
       {isSettingsOpen && (
         <SettingsModal
           onClose={() => setIsSettingsOpen(false)}
-          onSettingsSaved={() => reloadDelivery()}
+          onSettingsSaved={() => {
+            reloadDelivery();
+            refreshGroups().catch(() => {});
+          }}
+          onAllDocketsCleared={() => {
+            setGroups([]);
+            setSelectedGroupId(null);
+            setScanContext(null);
+            reloadDelivery();
+          }}
           onOpenMigration={() => setIsMigrationModalOpen(true)}
           currentUser={currentUser}
           onOpenUserManagement={() => setIsUserManagementOpen(true)}

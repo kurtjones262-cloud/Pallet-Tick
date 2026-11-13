@@ -965,6 +965,7 @@ export async function extractDocketWithTesseractFirst(
   options?: {
     pageTextHints?: PageTextHint[];
     supplierHint?: SupplierRuleId;
+    sourceFileIds?: string[];
     onProgress?: (update: OcrProgressUpdate) => void;
   }
 ): Promise<TesseractDocketExtractionResult> {
@@ -1128,13 +1129,19 @@ export async function extractDocketWithTesseractFirst(
         pdfParsed.unparsedCandidateCount
       );
       const usePdfHeader =
-        pdfParsed.header.docketNumber && !/^DOC-\d+$/i.test(pdfParsed.header.docketNumber);
+        pdfParsed.header.hasExplicitDocketNumber ||
+        (!ocrParsed.header.hasExplicitDocketNumber &&
+          pdfParsed.header.docketNumber &&
+          !/^DK-\d{5}$/i.test(pdfParsed.header.docketNumber));
 
       pageParseResults.push({
         header: {
           docketNumber: usePdfHeader
             ? pdfParsed.header.docketNumber
             : ocrParsed.header.docketNumber,
+          hasExplicitDocketNumber:
+            pdfParsed.header.hasExplicitDocketNumber ||
+            ocrParsed.header.hasExplicitDocketNumber,
           supplier:
             pdfParsed.header.supplierProfile !== 'ocr_label'
               ? pdfParsed.header.supplier
@@ -1180,6 +1187,7 @@ export async function extractDocketWithTesseractFirst(
     ocrTimeMs: totalOcrTimeMs,
     parseTimeMs,
     pagesFromCache,
+    sourceFileIds: options?.sourceFileIds,
   });
 
   const { validationReport, ...extractedData } = combined;

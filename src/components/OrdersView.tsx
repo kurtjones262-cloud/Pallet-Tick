@@ -19,15 +19,19 @@ import {
   Boxes,
   Edit3,
   FileSpreadsheet,
+  AlertTriangle,
+  Loader2,
+  UserCheck,
 } from 'lucide-react';
-import { Delivery, DeliveryPart } from '../types/delivery';
+import { Delivery, DeliveryPart, UserRole } from '../types/delivery';
 import {
   getStoredDeliveries,
   updateDelivery,
-  deleteDelivery,
+  deleteDeliveryAuthoritative,
+  clearAllDocketsAuthoritative,
   getPartVerificationState,
 } from '../utils/storage';
-import { exportDeliveryPdf } from '../utils/pdfExport';
+import { exportDeliveryPdf, formatPartScannersSummary } from '../utils/pdfExport';
 import { filterPartsSmart, deliveryMatchesSmartQuery, HighlightMatch } from '../utils/partSearch';
 import { PartsListEditorModal, PartsEditorMode } from './PartsListEditorModal';
 
@@ -36,10 +40,12 @@ interface OrdersViewProps {
   onSelectDelivery: (delivery: Delivery) => void;
   onUpdateDelivery?: (updated: Delivery) => void;
   onDeleteDelivery?: (id: string) => void;
+  onClearAllDockets?: () => void;
   onOpenNewDelivery: () => void;
   onStartScanning: (delivery?: Delivery) => void;
   onOpenChecklist?: (delivery: Delivery) => void;
   onNavigateToChecklist?: (pallet?: string) => void;
+  userRole?: UserRole;
 }
 
 type OrderFilterTab = 'incomplete' | 'started' | 'finished' | 'all';
@@ -49,11 +55,16 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   onSelectDelivery,
   onUpdateDelivery,
   onDeleteDelivery,
+  onClearAllDockets,
   onOpenNewDelivery,
   onStartScanning,
   onOpenChecklist,
   onNavigateToChecklist,
+  userRole,
 }) => {
+  const canManageDeletion =
+    userRole === 'super_admin' || userRole === 'admin' || userRole === 'supervisor';
+
   const [deliveries, setDeliveries] = useState<Delivery[]>(() => getStoredDeliveries());
   const [filterTab, setFilterTab] = useState<OrderFilterTab>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -61,6 +72,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     activeDelivery?.id || null
   );
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [isDeletingId, setIsDeletingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [confirmClearAllOpen, setConfirmClearAllOpen] = useState(false);
+  const [isClearingAll, setIsClearingAll] = useState(false);
   const [editorTarget, setEditorTarget] = useState<{
     delivery: Delivery;
     mode: PartsEditorMode;
@@ -158,14 +173,39 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     setDeliveries(getStoredDeliveries());
   };
 
-  const handleConfirmDelete = (id: string, e: React.MouseEvent) => {
+  const handleConfirmDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    deleteDelivery(id);
-    if (onDeleteDelivery) {
-      onDeleteDelivery(id);
+    if (!canManageDeletion) return;
+    setActionError(null);
+    setIsDeletingId(id);
+    try {
+      await deleteDeliveryAuthoritative(id);
+      if (onDeleteDelivery) {
+        onDeleteDelivery(id);
+      }
+      setDeliveries(getStoredDeliveries());
+      setConfirmDeleteId(null);
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to delete completed docket.');
+    } finally {
+      setIsDeletingId(null);
     }
-    setDeliveries(getStoredDeliveries());
-    setConfirmDeleteId(null);
+  };
+
+  const handleConfirmClearAll = async () => {
+    if (!canManageDeletion) return;
+    setActionError(null);
+    setIsClearingAll(true);
+    try {
+      await clearAllDocketsAuthoritative();
+      setDeliveries([]);
+      setConfirmClearAllOpen(false);
+      onClearAllDockets?.();
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to clear all dockets.');
+    } finally {
+      setIsClearingAll(false);
+    }
   };
 
   const handleTogglePartManualStatus = (del: Delivery, part: DeliveryPart) => {
@@ -205,26 +245,55 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           <div>
             <div className="flex items-center gap-2.5 flex-wrap">
               <h1 className="text-lg sm:text-xl font-extrabold tracking-tight text-white uppercase font-sans">
-                ORDERS &amp; SHIPMENTS
+                DELIVERY DOCKETS
               </h1>
               <span className="text-xs font-mono font-bold px-2.5 py-0.5 rounded-lg bg-[var(--pt-bg-secondary,#101321)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)]">
                 {deliveries.length} {deliveries.length === 1 ? 'Docket' : 'Dockets'}
               </span>
             </div>
             <p className="text-xs font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-1">
-              Track dockets, pallets, parts received vs required, and verification progress
+              Each delivery docket tracks its own customer, parts, pallets, scan attribution &amp; progress
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={onOpenNewDelivery}
-            className="h-11 px-5 rounded-xl pt-btn-primary font-mono font-extrabold text-xs tracking-wider uppercase inline-flex items-center justify-center gap-2 cursor-pointer transition-all shrink-0"
-          >
-            <Plus className="w-4 h-4 stroke-[2.6]" />
-            <span>NEW ORDER</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {canManageDeletion && deliveries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setConfirmClearAllOpen(true)}
+                className="h-11 px-4 rounded-xl bg-[#EF4444]/10 hover:bg-[#EF4444]/20 border border-[#EF4444]/40 text-[#EF4444] font-mono font-bold text-xs tracking-wider uppercase inline-flex items-center justify-center gap-2 cursor-pointer transition-all"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>CLEAR ALL DOCKETS</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={onOpenNewDelivery}
+              className="h-11 px-5 rounded-xl pt-btn-primary font-mono font-extrabold text-xs tracking-wider uppercase inline-flex items-center justify-center gap-2 cursor-pointer transition-all"
+            >
+              <Plus className="w-4 h-4 stroke-[2.6]" />
+              <span>UPLOAD DOCKETS</span>
+            </button>
+          </div>
         </div>
+
+        {actionError && (
+          <div className="p-3 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] text-xs font-mono flex items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              {actionError}
+            </span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="p-1 hover:text-white cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* =========================================================================
          * 2. SMART SEARCH & FILTER TABS (All / Incomplete / Started / Finished)
@@ -300,6 +369,14 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               const totalParts = parts.length;
               const receivedParts = parts.filter((p) => p.status === 'received').length;
               const remainingParts = totalParts - receivedParts;
+              const requiredUnits = parts.reduce(
+                (sum, p) => sum + getPartVerificationState(p).requiredQty,
+                0
+              );
+              const receivedUnits = parts.reduce(
+                (sum, p) => sum + getPartVerificationState(p).receivedQty,
+                0
+              );
               const progressPct =
                 totalParts > 0 ? Math.round((receivedParts / totalParts) * 100) : 0;
               const category = getOrderCategory(del);
@@ -369,6 +446,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                 ACTIVE DOCKET
                               </span>
                             )}
+                            {del.needsReview && (
+                              <span
+                                title={del.separationReason || 'OCR split needs review'}
+                                className="text-[10px] font-mono font-bold uppercase px-2 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/40 inline-flex items-center gap-1"
+                              >
+                                <AlertTriangle className="w-3 h-3" />
+                                NEEDS REVIEW
+                              </span>
+                            )}
                           </div>
 
                           <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-[var(--pt-text-secondary,#A3A8BD)] mt-1">
@@ -382,7 +468,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                             </span>
                             <span className="inline-flex items-center gap-1">
                               <Layers className="w-3.5 h-3.5 text-[var(--pt-text-muted,#737B94)]" />
-                              {receivedParts} / {totalParts} Parts Received
+                              {receivedParts} / {totalParts} Parts ({receivedUnits} / {requiredUnits} Units)
                             </span>
                           </div>
                         </div>
@@ -567,43 +653,47 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           )}
                         </div>
 
-                        {/* Delete Order Action */}
-                        {confirmDeleteId === del.id ? (
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[11px] font-mono text-[#EF4444]">
-                              Delete docket?
-                            </span>
-                            <button
-                              type="button"
-                              onClick={(e) => handleConfirmDelete(del.id, e)}
-                              className="h-7 px-2.5 rounded bg-[#EF4444] hover:bg-red-500 text-white text-[11px] font-mono font-bold cursor-pointer"
-                            >
-                              Confirm
-                            </button>
+                        {/* Role-Restricted Delete Action (Completed Dockets Only) */}
+                        {canManageDeletion && category === 'finished' && (
+                          confirmDeleteId === del.id ? (
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[11px] font-mono text-[#EF4444]">
+                                Delete completed docket?
+                              </span>
+                              <button
+                                type="button"
+                                disabled={isDeletingId === del.id}
+                                onClick={(e) => handleConfirmDelete(del.id, e)}
+                                className="h-7 px-2.5 rounded bg-[#EF4444] hover:bg-red-500 text-white text-[11px] font-mono font-bold cursor-pointer disabled:opacity-50 inline-flex items-center gap-1"
+                              >
+                                {isDeletingId === del.id && <Loader2 className="w-3 h-3 animate-spin" />}
+                                Confirm
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setConfirmDeleteId(null);
+                                }}
+                                className="h-7 px-2 rounded bg-[var(--pt-card,#15182A)] text-slate-300 text-[11px] font-mono cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                setConfirmDeleteId(null);
+                                setConfirmDeleteId(del.id);
                               }}
-                              className="h-7 px-2 rounded bg-[var(--pt-card,#15182A)] text-slate-300 text-[11px] font-mono cursor-pointer"
+                              className="h-8 px-2.5 rounded-lg bg-[#EF4444]/10 hover:bg-[#EF4444]/20 border border-[#EF4444]/30 text-[#EF4444] text-xs font-mono inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              title="Delete completed docket (Supervisor/Admin only)"
                             >
-                              Cancel
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
                             </button>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setConfirmDeleteId(del.id);
-                            }}
-                            className="h-8 px-2.5 rounded-lg bg-[#EF4444]/10 hover:bg-[#EF4444]/20 border border-[#EF4444]/30 text-[#EF4444] text-xs font-mono inline-flex items-center gap-1 cursor-pointer transition-colors"
-                            title="Delete order"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>Delete</span>
-                          </button>
+                          )
                         )}
                       </div>
 
@@ -620,6 +710,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                               const vState = getPartVerificationState(part);
                               const isReceived = part.status === 'received';
                               const isMismatch = vState.state === 'quantity_mismatch';
+                              const scannersSummary = formatPartScannersSummary(part, del.scanHistory);
 
                               return (
                                 <div
@@ -668,6 +759,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                         {part.palletNumber && (
                                           <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[var(--pt-card,#15182A)] text-[var(--pt-primary-light,#C084FC)] border border-[var(--pt-border,#29243D)]">
                                             {part.palletNumber}
+                                          </span>
+                                        )}
+                                        {scannersSummary !== '—' && (
+                                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#00D979]/10 text-[#00D979] border border-[#00D979]/30 inline-flex items-center gap-1">
+                                            <UserCheck className="w-3 h-3" />
+                                            {scannersSummary}
                                           </span>
                                         )}
                                       </div>
@@ -805,6 +902,57 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
             setDeliveries(getStoredDeliveries());
           }}
         />
+      )}
+
+      {/* Role-Restricted CLEAR ALL DOCKETS Confirmation Modal */}
+      {confirmClearAllOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => !isClearingAll && setConfirmClearAllOpen(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl bg-[var(--pt-card,#15182A)] border border-[#EF4444]/40 p-5 shadow-2xl space-y-4 text-white"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#EF4444]/15 border border-[#EF4444]/40 text-[#EF4444] flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-mono font-extrabold text-sm uppercase text-white">
+                  CLEAR ALL DOCKETS
+                </h3>
+                <p className="text-xs text-[var(--pt-text-secondary,#A3A8BD)] mt-1 leading-relaxed">
+                  This will permanently delete <strong className="text-white">ALL {deliveries.length} delivery dockets</strong>, parts, scan history, and docket groups across the entire system. User accounts and login sessions will remain intact.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isClearingAll}
+                onClick={() => setConfirmClearAllOpen(false)}
+                className="h-9 px-4 rounded-xl bg-[var(--pt-bg-secondary,#101321)] border border-[var(--pt-border,#29243D)] text-xs font-mono font-bold text-[var(--pt-text-secondary,#A3A8BD)] hover:text-white cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isClearingAll}
+                onClick={handleConfirmClearAll}
+                className="h-9 px-4 rounded-xl bg-[#EF4444] hover:bg-red-500 text-white text-xs font-mono font-extrabold uppercase inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isClearingAll ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isClearingAll ? 'Clearing...' : 'Confirm Clear All'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

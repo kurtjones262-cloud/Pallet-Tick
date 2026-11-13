@@ -58,7 +58,10 @@ async function runPhase2AuthTests() {
     return { status: res.status, body: resBody, headers: res.headers };
   }
 
-  // Clean test users and sessions to test fresh Super Admin provisioning
+  // Clean test users, sessions, and leftover test docket to make test runs idempotent
+  await db.exec("DELETE FROM scan_events WHERE delivery_id IN (SELECT id FROM deliveries WHERE docket_number = 'TEST-DOCKET-SUP-01');");
+  await db.exec("DELETE FROM delivery_parts WHERE delivery_id IN (SELECT id FROM deliveries WHERE docket_number = 'TEST-DOCKET-SUP-01');");
+  await db.exec("DELETE FROM deliveries WHERE docket_number = 'TEST-DOCKET-SUP-01';");
   await db.exec("DELETE FROM sessions;");
   await db.exec("DELETE FROM users;");
 

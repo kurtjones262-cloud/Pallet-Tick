@@ -60,19 +60,36 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
       }
     };
 
-    try {
-      const worker = await createWorker('eng', OEM.LSTM_ONLY, {
-        workerPath: `${origin}/tesseract/worker.min.js`,
-        workerBlobURL: false,
-        corePath: `${origin}/tesseract/core`,
-        langPath: `${origin}/tesseract/lang-data`,
-        gzip: true,
-        cacheMethod: 'none',
-        logger: loggerFn,
-        errorHandler: (err: any) => {
-          console.warn('[PartTrack OCR] Worker internal warning:', err);
-        },
+    const LABEL_WORKER_INIT_TIMEOUT_MS = 15000;
+    const withWorkerInitTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`[PartTrack OCR] ${label} initialization timed out after ${LABEL_WORKER_INIT_TIMEOUT_MS}ms.`));
+        }, LABEL_WORKER_INIT_TIMEOUT_MS);
       });
+      try {
+        return await Promise.race([promise, timeoutPromise]);
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+      }
+    };
+
+    try {
+      const worker = await withWorkerInitTimeout(
+        createWorker('eng', OEM.LSTM_ONLY, {
+          workerPath: `${origin}/tesseract/worker.min.js`,
+          workerBlobURL: false,
+          corePath: `${origin}/tesseract/core`,
+          langPath: `${origin}/tesseract/lang-data`,
+          gzip: true,
+          cacheMethod: 'none',
+          logger: loggerFn,
+        }),
+        'Primary offline LSTM worker'
+      );
       console.info('[PartTrack OCR] Bundled offline LSTM worker initialized and ready.');
       return worker;
     } catch (firstErr) {
@@ -80,14 +97,17 @@ async function getOrInitWarmOnDeviceWorker(): Promise<any> {
         '[PartTrack OCR] Primary non-blob worker init failed, retrying with blob URL fallback:',
         firstErr
       );
-      const fallbackWorker = await createWorker('eng', OEM.LSTM_ONLY, {
-        workerPath: '/tesseract/worker.min.js',
-        corePath: `${origin}/tesseract/core`,
-        langPath: `${origin}/tesseract/lang-data`,
-        gzip: true,
-        cacheMethod: 'none',
-        logger: loggerFn,
-      });
+      const fallbackWorker = await withWorkerInitTimeout(
+        createWorker('eng', OEM.LSTM_ONLY, {
+          workerPath: '/tesseract/worker.min.js',
+          corePath: `${origin}/tesseract/core`,
+          langPath: `${origin}/tesseract/lang-data`,
+          gzip: true,
+          cacheMethod: 'none',
+          logger: loggerFn,
+        }),
+        'Fallback offline LSTM worker'
+      );
       console.info('[PartTrack OCR] Fallback offline LSTM worker initialized.');
       return fallbackWorker;
     }
@@ -361,7 +381,7 @@ export async function recognizePalletLabelOffline(
     const ocrResult = await worker.recognize(
       preprocessed.enhancedOcrDataUrl,
       {},
-      { blocks: true, text: true }
+      { text: true }
     );
 
     let rawText = (ocrResult?.data?.text || '').trim();
@@ -383,7 +403,7 @@ export async function recognizePalletLabelOffline(
       const fallbackOcrResult = await worker.recognize(
         fullPreprocessed.enhancedOcrDataUrl,
         {},
-        { blocks: true, text: true }
+        { text: true }
       );
       const fallbackText = (fallbackOcrResult?.data?.text || '').trim();
       const fallbackConf =

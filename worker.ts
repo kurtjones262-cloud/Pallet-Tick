@@ -20,6 +20,17 @@ import {
   RealtimeEvent,
 } from './src/server/realtime/realtimeHub.ts';
 
+import {
+  DEFAULT_PRIMARY_VISION_MODEL,
+  DEFAULT_FALLBACK_VISION_MODELS,
+  GEMINI_REQUEST_TIMEOUT_MS,
+  MAX_AUTOMATIC_RETRIES,
+  INITIAL_BACKOFF_MS,
+  resolveConfiguredVisionModels,
+  classifyGeminiError,
+  validateAndParseOcrJsonResponse,
+} from './src/server/docketOcr.ts';
+
 export interface Env {
   GEMINI_API_KEY?: string;
   GEMINI_PRIMARY_MODEL?: string;
@@ -34,14 +45,11 @@ export interface Env {
   [key: string]: unknown;
 }
 
-const DEFAULT_PRIMARY_MODEL = 'gemini-3.8-flash';
-const DEFAULT_FALLBACK_MODELS = [
-  'gemini-3-flash-preview',
-  'gemini-3.1-flash-lite-preview',
-  'gemini-flash-latest',
-] as const;
-const MAX_AUTOMATIC_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 2000;
+const DEFAULT_PRIMARY_MODEL = DEFAULT_PRIMARY_VISION_MODEL;
+const DEFAULT_FALLBACK_MODELS = DEFAULT_FALLBACK_VISION_MODELS;
+const workerModelCooldownUntil = new Map<string, number>();
+const WORKER_MODEL_COOLDOWN_MS = 5 * 60 * 1000;
+const WORKER_TRANSIENT_COOLDOWN_MS = 60 * 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,7 +57,7 @@ function sleep(ms: number): Promise<void> {
 
 function computeExponentialBackoffWithJitter(retryAttempt: number, baseMs: number = INITIAL_BACKOFF_MS): number {
   const exp = Math.max(0, retryAttempt - 1);
-  return Math.min(20000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 650));
+  return Math.min(8000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 450));
 }
 
 function logWorkerOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta: Record<string, unknown> = {}) {
@@ -65,54 +73,7 @@ function logWorkerOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta
 }
 
 function resolveWorkerModels(env: Env): { primaryModel: string; fallbackModels: string[] } {
-  const primaryModel =
-    (typeof env.GEMINI_PRIMARY_MODEL === 'string' && env.GEMINI_PRIMARY_MODEL.trim()) ||
-    DEFAULT_PRIMARY_MODEL;
-  const rawFallbacks =
-    (typeof env.GEMINI_FALLBACK_MODEL === 'string' && env.GEMINI_FALLBACK_MODEL.trim()) ||
-    (typeof env.GEMINI_FALLBACK_MODELS === 'string' && env.GEMINI_FALLBACK_MODELS.trim()) ||
-    DEFAULT_FALLBACK_MODELS.join(',');
-  const fallbackModels = rawFallbacks
-    .split(',')
-    .map((m) => m.trim())
-    .filter((m) => Boolean(m) && m !== primaryModel);
-  return {
-    primaryModel,
-    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_MODELS],
-  };
-}
-
-function validateOcrPayload(rawText: string): any {
-  const trimmed = (rawText || '').trim();
-  if (!trimmed) {
-    throw new Error('Malformed OCR response: empty body.');
-  }
-  let parsed: any;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (e: any) {
-    throw new Error(`Malformed OCR JSON response: ${e?.message || 'parse error'}`);
-  }
-  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
-    throw new Error('Incomplete OCR response: missing items array.');
-  }
-  for (let i = 0; i < parsed.items.length; i++) {
-    const it = parsed.items[i];
-    if (!it || typeof it !== 'object') {
-      throw new Error(`Malformed OCR item at index ${i}.`);
-    }
-    const hasPartOrDesc =
-      (typeof it.part === 'string' && it.part.trim().length > 0) ||
-      (typeof it.desc === 'string' && it.desc.trim().length > 0);
-    if (!hasPartOrDesc) {
-      throw new Error(`Incomplete OCR item at index ${i}: missing part and description.`);
-    }
-    const q = Number(it.qty);
-    if (Number.isNaN(q) || q < 0) {
-      throw new Error(`Invalid OCR item quantity at index ${i}.`);
-    }
-  }
-  return parsed;
+  return resolveConfiguredVisionModels(env as Record<string, unknown>);
 }
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
@@ -147,9 +108,18 @@ async function callGeminiRestSingleAttempt(
   model: string,
   systemInstruction: string,
   parts: Array<Record<string, unknown>>,
-  responseSchema: Record<string, unknown>
+  responseSchema: Record<string, unknown>,
+  timeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS
 ): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const generationConfig: Record<string, unknown> = {
+    responseMimeType: 'application/json',
+    responseSchema,
+  };
+  if (model.includes('gemini-4-hydrogen')) {
+    generationConfig.thinkingConfig = { thinkingLevel: 'LOW' };
+  }
 
   const requestBody = {
     systemInstruction: {
@@ -160,17 +130,35 @@ async function callGeminiRestSingleAttempt(
         parts,
       },
     ],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema,
-    },
+    generationConfig,
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+  } catch (fetchErr: any) {
+    clearTimeout(timer);
+    if (controller.signal.aborted || fetchErr?.name === 'AbortError') {
+      const timeoutErr: any = new Error(
+        `Gemini API request to ${model} timed out after ${Math.round(timeoutMs / 1000)}s (HTTP 504).`
+      );
+      timeoutErr.status = 504;
+      timeoutErr.code = 'GEMINI_TIMEOUT';
+      timeoutErr.isTimeout = true;
+      throw timeoutErr;
+    }
+    throw fetchErr;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!response.ok) {
     const errText = await response.text();
@@ -192,22 +180,31 @@ async function callGeminiRestWithRetryAndFallback(
   env: Env,
   systemInstruction: string,
   parts: Array<Record<string, unknown>>,
-  responseSchema: Record<string, unknown>
+  responseSchema: Record<string, unknown>,
+  mode: 'batch' | 'recovery' | 'label' = 'batch'
 ): Promise<{ parsed: any; modelUsed: string; fallbackUsed: boolean; retryAttempts: number }> {
   const { primaryModel, fallbackModels } = resolveWorkerModels(env);
-  const candidateModels = [primaryModel, ...fallbackModels];
+  const allConfiguredModels = [primaryModel, ...fallbackModels];
+  const nowMs = Date.now();
+
+  const candidateModels = [
+    ...allConfiguredModels.filter((m) => (workerModelCooldownUntil.get(m) || 0) <= nowMs),
+    ...allConfiguredModels.filter((m) => (workerModelCooldownUntil.get(m) || 0) > nowMs),
+  ];
 
   let totalRetryAttempts = 0;
   let lastError: any = null;
+  let lastClassification: ReturnType<typeof classifyGeminiError> | null = null;
 
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const model = candidateModels[mIdx];
-    const isFallback = mIdx > 0;
+    const isFallback = model !== primaryModel;
     const maxRetries = MAX_AUTOMATIC_RETRIES;
 
     logWorkerOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
       model,
       isFallback,
+      mode,
     });
 
     for (let retry = 0; retry <= maxRetries; retry++) {
@@ -217,15 +214,16 @@ async function callGeminiRestWithRetryAndFallback(
           model,
           systemInstruction,
           parts,
-          responseSchema
+          responseSchema,
+          GEMINI_REQUEST_TIMEOUT_MS
         );
-        const parsed = validateOcrPayload(rawJsonText);
+        const parsed = validateAndParseOcrJsonResponse(rawJsonText, mode);
         logWorkerOcrEvent('info', 'extraction_succeeded', {
           model,
           isFallback,
           retryAttempts: totalRetryAttempts,
           statusCode: 200,
-          itemsExtracted: parsed.items.length,
+          itemsExtracted: Array.isArray(parsed?.items) ? parsed.items.length : 1,
         });
         return {
           parsed,
@@ -235,40 +233,54 @@ async function callGeminiRestWithRetryAndFallback(
         };
       } catch (err: any) {
         lastError = err;
-        const status = Number(err?.status || 500);
+        const classification = classifyGeminiError(err);
+        lastClassification = classification;
         const msg = String(err?.message || '');
-        const isModelDailyQuotaExhausted =
-          status === 429 &&
-          /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
-            msg
-          );
-        const isRetryable =
-          status === 503 ||
-          status === 429 ||
-          status >= 500 ||
-          /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
+        const isValidationFailure =
+          /Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
 
         logWorkerOcrEvent('warn', 'extraction_attempt_failed', {
           model,
           isFallback,
           attempt: retry + 1,
           maxAttempts: maxRetries + 1,
-          statusCode: status,
-          isRetryable,
-          reason: msg.slice(0, 220),
+          statusCode: classification.statusCode,
+          errorCode: classification.errorCode,
+          isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
+          reason: classification.cleanMessage,
         });
 
-        if (!isRetryable && (status === 400 || status === 401 || status === 403)) {
-          throw err;
+        // Never retry 401/403 authentication errors or 400 malformed requests
+        if (!isValidationFailure && (classification.isAuthError || classification.statusCode === 400)) {
+          const permErr: any = new Error(classification.cleanMessage);
+          permErr.status = classification.statusCode;
+          permErr.code = classification.errorCode;
+          permErr.retryable = false;
+          throw permErr;
         }
+
+        // Never retry 404 invalid model, daily quota exhaustion, or 22s timeout on the same model:
+        // record cooldown and immediately fail over to the next model.
         if (
-          (!isRetryable && status === 404) ||
-          (isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1)
+          !isValidationFailure &&
+          (classification.isInvalidModel ||
+            classification.isModelDailyQuotaExhausted ||
+            classification.isTimeout)
         ) {
+          workerModelCooldownUntil.set(
+            model,
+            Date.now() + (classification.isTimeout ? WORKER_TRANSIENT_COOLDOWN_MS : WORKER_MODEL_COOLDOWN_MS)
+          );
+          logWorkerOcrEvent('info', 'model_fast_failover', {
+            failedModel: model,
+            nextModel: candidateModels[mIdx + 1] || 'none',
+            statusCode: classification.statusCode,
+            errorCode: classification.errorCode,
+          });
           break;
         }
 
-        if (retry < maxRetries) {
+        if ((classification.isRetryableAvailabilityError || isValidationFailure) && retry < maxRetries) {
           totalRetryAttempts++;
           const waitMs = computeExponentialBackoffWithJitter(retry + 1, INITIAL_BACKOFF_MS);
           logWorkerOcrEvent('info', 'retrying_after_backoff', {
@@ -276,22 +288,38 @@ async function callGeminiRestWithRetryAndFallback(
             retryAttempt: retry + 1,
             maxRetries,
             waitMs,
-            statusCode: status,
+            statusCode: classification.statusCode,
           });
           await sleep(waitMs);
+          continue;
+        }
+
+        if (classification.isHighDemand503 || classification.isRateLimit) {
+          workerModelCooldownUntil.set(model, Date.now() + WORKER_TRANSIENT_COOLDOWN_MS);
         }
       }
     }
   }
 
+  const finalClassification = lastClassification || classifyGeminiError(lastError);
+
   logWorkerOcrEvent('error', 'all_models_and_retries_exhausted', {
     primaryModel,
     fallbackModels: fallbackModels.join(','),
     totalRetryAttempts,
-    error: String(lastError?.message || 'Unknown error').slice(0, 220),
+    statusCode: finalClassification.statusCode,
+    errorCode: finalClassification.errorCode,
+    error: finalClassification.cleanMessage,
   });
 
-  throw lastError || new Error('Gemini AI could not process the docket after automatic retries and model fallback.');
+  const finalErr: any = new Error(
+    finalClassification.cleanMessage ||
+      'Gemini AI could not process the docket after automatic retries and model fallback.'
+  );
+  finalErr.status = finalClassification.statusCode;
+  finalErr.code = finalClassification.errorCode;
+  finalErr.retryable = finalClassification.isRetryableAvailabilityError || finalClassification.isTimeout;
+  throw finalErr;
 }
 
 const CORS_HEADERS = {
@@ -363,14 +391,15 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   }
 
   const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array. Never invent, guess, or fabricate parts or quantities. If blank, return items: [].
-CRITICAL MULTI-DOCKET RULE: Uploaded pages may contain MULTIPLE SEPARATE delivery dockets OR a multi-page single docket. Populate 'pageHeaders' for EVERY page (${pageDescriptions.join(', ')}) with the exact printed docketNumber / delivery note / packing slip / invoice # visible on that page.`;
+Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array.
+STRICT PART NUMBER INTEGRITY RULE: Preserve original part numbers, revisions, and quantities exactly as printed. Never invent, complete, or silently correct uncertain part numbers. If blank, return items: [].
+CRITICAL MULTI-DOCKET RULE: Uploaded pages may contain MULTIPLE SEPARATE delivery dockets OR a multi-page single docket. Populate 'pageHeaders' for EVERY page (${pageDescriptions.join(', ')}) with the exact printed docketNumber / delivery note / packing slip / invoice # / Job No visible on that page.`;
 
   const promptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in the table.
 Rules:
-1. For EVERY page 1..${totalPages}, record an entry in 'pageHeaders' with: page, docketNumber (exact printed docket/delivery/invoice number if visible on that page, else ""), supplier, deliveryDate (YYYY-MM-DD if visible), orderNumber, and startsNewDocket (true if this page clearly begins a new docket/header).
+1. For EVERY page 1..${totalPages}, record an entry in 'pageHeaders' with: page, docketNumber (exact printed docket/delivery/invoice/Job No if visible on that page, else ""), supplier, deliveryDate (YYYY-MM-DD if visible), orderNumber (Client Order No / PO No), and startsNewDocket (true if this page clearly begins a new docket/header).
 2. Extract every numbered part row from top to bottom.
-3. For each row: record 'page', 'no' (exact printed row number), 'part' (part number or profile name), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer quantity).
+3. For each row: record 'page', 'no' (exact printed row/Line number), 'part' (exact part number, Client Part Code, Part Code, or profile name as printed — never invent or silently alter uncertain characters), 'desc' (full description), 'rev' (revision if listed), 'mat' (material if listed), 'thk' (thickness if listed), 'dim' (dimensions if listed), 'wt' (weight if listed), and 'qty' (integer dispatched/delivered quantity).
 4. Ignore header consignment barcodes and tax summary lines (Freight, GST, Total, Balance Due).`;
 
   parts.push({ text: promptText });
@@ -760,7 +789,8 @@ async function handleRecoverDocketItems(request: Request, env: Env): Promise<Res
       env,
       'You are a precision industrial docket row recovery engine.',
       parts,
-      responseSchema
+      responseSchema,
+      'recovery'
     );
     const rawItems: any[] = Array.isArray(parsed?.items) ? parsed.items : [];
 
@@ -951,27 +981,32 @@ export default {
       try {
         return await handleExtractDocket(request, env);
       } catch (err: any) {
-        const rawMsg = err?.message || String(err || '');
-        const isMissingKey = rawMsg.includes('GEMINI_API_KEY') || rawMsg.includes('API key');
-        const isHighDemand = /503|UNAVAILABLE|high demand|overloaded/i.test(rawMsg);
-        const isRateLimit = /429|RESOURCE_EXHAUSTED|rate limit/i.test(rawMsg);
+        const classification = classifyGeminiError(err);
+        const errorMessage =
+          classification.errorCode === 'MISSING_GEMINI_API_KEY'
+            ? 'Gemini AI API key is not configured in the Cloudflare Worker. Please set the GEMINI_API_KEY secret.'
+            : classification.errorCode === 'GEMINI_AUTH_ERROR'
+            ? `Gemini API authentication or permission error (HTTP ${classification.statusCode}): Please verify your GEMINI_API_KEY secret.`
+            : classification.errorCode === 'GEMINI_INVALID_MODEL'
+            ? `Designated Gemini model is unavailable or unsupported (HTTP 404): ${classification.cleanMessage}`
+            : classification.errorCode === 'GEMINI_QUOTA_EXHAUSTED'
+            ? `Gemini API quota exceeded (HTTP 429): ${classification.cleanMessage}`
+            : classification.errorCode === 'GEMINI_RATE_LIMIT_429'
+            ? 'Gemini AI rate limit reached (HTTP 429). Your uploaded docket has been preserved — please wait a few seconds and click "Retry Extraction".'
+            : classification.errorCode === 'GEMINI_TIMEOUT'
+            ? `Gemini AI request timed out after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s (HTTP 504). Your uploaded docket has been preserved — please click "Retry Extraction".`
+            : classification.errorCode === 'GEMINI_HIGH_DEMAND_503'
+            ? 'Gemini AI is currently experiencing temporary high demand (HTTP 503). Your uploaded docket has been preserved — please click "Retry Extraction".'
+            : classification.cleanMessage || 'Gemini AI invoice extraction failed.';
+
         return new Response(
           JSON.stringify({
-            error: isMissingKey
-              ? 'Gemini AI API key is not configured in the Cloudflare Worker. Please set the GEMINI_API_KEY secret.'
-              : isHighDemand
-              ? 'Gemini AI is currently experiencing high demand (HTTP 503) after automatic retries and model fallback. Your uploaded docket has been preserved — please click "Retry Extraction".'
-              : rawMsg || 'Gemini AI invoice extraction failed.',
-            code: isMissingKey
-              ? 'MISSING_GEMINI_API_KEY'
-              : isHighDemand
-              ? 'GEMINI_HIGH_DEMAND_503'
-              : isRateLimit
-              ? 'GEMINI_RATE_LIMIT_429'
-              : 'AI_EXTRACTION_FAILED',
+            error: errorMessage,
+            code: classification.errorCode,
+            retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
           }),
           {
-            status: isMissingKey || isHighDemand ? 503 : isRateLimit ? 429 : 500,
+            status: classification.statusCode,
             headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
           }
         );
@@ -998,7 +1033,12 @@ export default {
       }
       try {
         const body: any = await request.json().catch(() => ({}));
-        const imageDataUrl = body?.imageDataUrl;
+        const imageDataUrl =
+          typeof body?.image === 'string' && body.image
+            ? body.image
+            : typeof body?.imageBase64 === 'string' && body.imageBase64
+            ? `data:${body?.mimeType || 'image/jpeg'};base64,${body.imageBase64}`
+            : body?.imageDataUrl;
         if (!imageDataUrl || typeof imageDataUrl !== 'string') {
           return new Response(JSON.stringify({ error: 'Missing imageDataUrl' }), {
             status: 400,
@@ -1009,32 +1049,43 @@ export default {
         const schema = {
           type: 'OBJECT',
           properties: {
-            partNumber: { type: 'STRING' },
-            quantity: { type: 'NUMBER' },
-            itemNumber: { type: 'STRING' },
-            rawText: { type: 'STRING' },
+            detectedCode: { type: 'STRING' },
+            confidence: { type: 'STRING' },
           },
-          required: ['partNumber', 'quantity', 'rawText'],
+          required: ['detectedCode'],
         };
         const { parsed } = await callGeminiRestWithRetryAndFallback(
           apiKey,
           env,
-          'You are an industrial manufacturing label OCR reader. Extract partNumber, quantity, itemNumber, and rawText.',
+          'Read the barcode or part code from the image.',
           [
             { inlineData: { mimeType: parsedImg.mimeType, data: parsedImg.base64Data } },
-            { text: 'Read this industrial part or pallet label.' },
+            { text: 'Read the barcode value, QR code text, or Part Number shown on this part label photo.' },
           ],
-          schema
+          schema,
+          'label'
         );
-        return new Response(JSON.stringify(parsed || {}), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
-        });
-      } catch (err: any) {
+        const detectedCode = String(parsed?.detectedCode || '').trim();
         return new Response(
-          JSON.stringify({ error: err?.message || 'Failed to read part label' }),
+          JSON.stringify({
+            detectedCode,
+            scannedCode: detectedCode,
+            confidence: String(parsed?.confidence || 'high'),
+          }),
           {
-            status: 500,
+            status: 200,
+            headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+          }
+        );
+      } catch (err: any) {
+        const classification = classifyGeminiError(err);
+        return new Response(
+          JSON.stringify({
+            error: classification.cleanMessage || 'Failed to read part label',
+            code: classification.errorCode,
+          }),
+          {
+            status: classification.statusCode,
             headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
           }
         );

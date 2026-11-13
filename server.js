@@ -1,28 +1,64 @@
-// server.ts
-import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
-import dotenv from "dotenv";
-import path2 from "path";
-import { fileURLToPath } from "url";
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 
 // src/server/docketOcr.ts
-var DEFAULT_PRIMARY_VISION_MODEL = "gemini-3.8-flash";
-var DEFAULT_FALLBACK_VISION_MODELS = [
-  "gemini-3-flash-preview",
-  "gemini-3.1-flash-lite-preview",
-  "gemini-flash-latest"
-];
-var MAX_AUTOMATIC_RETRIES = 3;
-var INITIAL_BACKOFF_MS = 2e3;
+var docketOcr_exports = {};
+__export(docketOcr_exports, {
+  DEFAULT_FALLBACK_VISION_MODELS: () => DEFAULT_FALLBACK_VISION_MODELS,
+  DEFAULT_PRIMARY_VISION_MODEL: () => DEFAULT_PRIMARY_VISION_MODEL,
+  GEMINI_REQUEST_TIMEOUT_MS: () => GEMINI_REQUEST_TIMEOUT_MS,
+  INITIAL_BACKOFF_MS: () => INITIAL_BACKOFF_MS,
+  MAX_AUTOMATIC_RETRIES: () => MAX_AUTOMATIC_RETRIES,
+  classifyGeminiError: () => classifyGeminiError,
+  clearGeminiModelCooldownsForTesting: () => clearGeminiModelCooldownsForTesting,
+  computeExponentialBackoffWithJitter: () => computeExponentialBackoffWithJitter,
+  extractDocketWithGeminiVision: () => extractDocketWithGeminiVision,
+  extractPartCodeWithGeminiVision: () => extractPartCodeWithGeminiVision,
+  generateWithRetryAndFallback: () => generateWithRetryAndFallback,
+  logOcrEvent: () => logOcrEvent,
+  recoverMissingDocketItems: () => recoverMissingDocketItems,
+  resolveConfiguredVisionModels: () => resolveConfiguredVisionModels,
+  sanitizeVisionModelIdentifier: () => sanitizeVisionModelIdentifier,
+  validateAndParseOcrJsonResponse: () => validateAndParseOcrJsonResponse
+});
+function sanitizeVisionModelIdentifier(rawModel, role = "primary") {
+  const trimmed = (rawModel || "").trim();
+  if (!trimmed) {
+    return role === "primary" ? DEFAULT_PRIMARY_VISION_MODEL : DEFAULT_FALLBACK_VISION_MODELS[0];
+  }
+  const lower = trimmed.toLowerCase();
+  if (role === "primary" && OBSOLETE_PRIMARY_MODELS.has(lower)) {
+    return DEFAULT_PRIMARY_VISION_MODEL;
+  }
+  if (role === "fallback" && OBSOLETE_FALLBACK_MODELS.has(lower)) {
+    return DEFAULT_FALLBACK_VISION_MODELS[0];
+  }
+  return trimmed;
+}
 function resolveConfiguredVisionModels(envOverride) {
   const procEnv = typeof process !== "undefined" && process.env ? process.env : {};
-  const rawPrimary = typeof envOverride?.GEMINI_PRIMARY_MODEL === "string" && envOverride.GEMINI_PRIMARY_MODEL.trim() || typeof procEnv.GEMINI_PRIMARY_MODEL === "string" && procEnv.GEMINI_PRIMARY_MODEL.trim() || DEFAULT_PRIMARY_VISION_MODEL;
+  const rawPrimaryInput = typeof envOverride?.GEMINI_PRIMARY_MODEL === "string" && envOverride.GEMINI_PRIMARY_MODEL.trim() || typeof procEnv.GEMINI_PRIMARY_MODEL === "string" && procEnv.GEMINI_PRIMARY_MODEL.trim() || DEFAULT_PRIMARY_VISION_MODEL;
+  const primaryModel = sanitizeVisionModelIdentifier(rawPrimaryInput, "primary");
   const rawFallbacks = typeof envOverride?.GEMINI_FALLBACK_MODEL === "string" && envOverride.GEMINI_FALLBACK_MODEL.trim() || typeof envOverride?.GEMINI_FALLBACK_MODELS === "string" && envOverride.GEMINI_FALLBACK_MODELS.trim() || typeof procEnv.GEMINI_FALLBACK_MODEL === "string" && procEnv.GEMINI_FALLBACK_MODEL.trim() || typeof procEnv.GEMINI_FALLBACK_MODELS === "string" && procEnv.GEMINI_FALLBACK_MODELS.trim() || DEFAULT_FALLBACK_VISION_MODELS.join(",");
-  const fallbackModels = rawFallbacks.split(",").map((m) => m.trim()).filter((m) => Boolean(m) && m !== rawPrimary);
+  const seen = /* @__PURE__ */ new Set([primaryModel]);
+  const fallbackModels = [];
+  for (const token of rawFallbacks.split(",")) {
+    const cleaned = sanitizeVisionModelIdentifier(token, "fallback");
+    if (cleaned && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      fallbackModels.push(cleaned);
+    }
+  }
   return {
-    primaryModel: rawPrimary,
-    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_VISION_MODELS]
+    primaryModel,
+    fallbackModels: fallbackModels.length > 0 ? fallbackModels : DEFAULT_FALLBACK_VISION_MODELS.filter((m) => m !== primaryModel)
   };
 }
 function logOcrEvent(level, event, meta = {}) {
@@ -51,11 +87,12 @@ function sleep(ms) {
 function computeExponentialBackoffWithJitter(retryAttempt, baseDelayMs = INITIAL_BACKOFF_MS) {
   const exponent = Math.max(0, retryAttempt - 1);
   const exponentialDelay = baseDelayMs * Math.pow(2, exponent);
-  const jitter = Math.floor(Math.random() * 650);
-  return Math.min(2e4, exponentialDelay + jitter);
+  const jitter = Math.floor(Math.random() * 450);
+  return Math.min(8e3, exponentialDelay + jitter);
 }
-var modelQuotaCooldownUntil = /* @__PURE__ */ new Map();
-var MODEL_COOLDOWN_DURATION_MS = 10 * 60 * 1e3;
+function clearGeminiModelCooldownsForTesting() {
+  modelQuotaCooldownUntil.clear();
+}
 function classifyGeminiError(err) {
   const rawMessage = String(err?.message || err || "Unknown Gemini API error").replace(
     /key=[A-Za-z0-9_\-]+/gi,
@@ -68,26 +105,61 @@ function classifyGeminiError(err) {
       statusCode = parseInt(codeMatch[1], 10);
     }
   }
-  const isHighDemand503 = statusCode === 503 || /503|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity/i.test(
+  const isTimeout = Boolean(err?.isTimeout) || err?.name === "AbortError" || statusCode === 504 || /504|DEADLINE_EXCEEDED|gateway timeout|timed out|AbortError|The operation was aborted|request timed out/i.test(
     rawMessage
   );
+  const isAuthError = statusCode === 401 || statusCode === 403 || /401|403|UNAUTHENTICATED|PERMISSION_DENIED|API_KEY_INVALID|API key not valid|invalid api key|unauthorized|forbidden/i.test(
+    rawMessage
+  );
+  const isInvalidModel = statusCode === 404 || /404|NOT_FOUND|models\/[^\s]+ is not found|not supported for generateContent|model not found/i.test(
+    rawMessage
+  );
+  const isHighDemand503 = !isTimeout && (statusCode === 503 || statusCode === 502 || /503|502|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity|bad gateway/i.test(
+    rawMessage
+  ));
   const isRateLimit = statusCode === 429 || /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
-  const isModelDailyQuotaExhausted = isRateLimit && /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
+  const isModelDailyQuotaExhausted = isRateLimit && /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day|daily quota|exceeded your current quota|billing|plan and billing|limit:\s*0\b|Please retry in \d+h/i.test(
     rawMessage
   );
-  const isTemporary5xx = statusCode === 500 || statusCode === 502 || statusCode === 504 || /500|502|504|INTERNAL|DEADLINE_EXCEEDED|bad gateway|gateway timeout|timed out|AbortError|fetch failed/i.test(
-    rawMessage
-  );
+  const isTemporary500 = !isTimeout && !isAuthError && !isInvalidModel && (statusCode === 500 || /\b500\b|INTERNAL|fetch failed/i.test(rawMessage));
   if (!statusCode) {
-    if (isHighDemand503) statusCode = 503;
+    if (isTimeout) statusCode = 504;
+    else if (isAuthError) statusCode = 401;
+    else if (isInvalidModel) statusCode = 404;
+    else if (isHighDemand503) statusCode = 503;
     else if (isRateLimit) statusCode = 429;
-    else if (isTemporary5xx) statusCode = 502;
+    else if (isTemporary500) statusCode = 502;
+    else statusCode = 500;
   }
+  let errorCode = "AI_EXTRACTION_FAILED";
+  if (err?.code === "MISSING_GEMINI_API_KEY" || /GEMINI_API_KEY/i.test(rawMessage)) {
+    errorCode = "MISSING_GEMINI_API_KEY";
+    statusCode = 503;
+  } else if (isAuthError) {
+    errorCode = "GEMINI_AUTH_ERROR";
+  } else if (isInvalidModel) {
+    errorCode = "GEMINI_INVALID_MODEL";
+  } else if (statusCode === 400) {
+    errorCode = "GEMINI_BAD_REQUEST";
+  } else if (isModelDailyQuotaExhausted) {
+    errorCode = "GEMINI_QUOTA_EXHAUSTED";
+  } else if (isRateLimit) {
+    errorCode = "GEMINI_RATE_LIMIT_429";
+  } else if (isTimeout) {
+    errorCode = "GEMINI_TIMEOUT";
+  } else if (isHighDemand503) {
+    errorCode = "GEMINI_HIGH_DEMAND_503";
+  }
+  const isRetryableAvailabilityError = !isAuthError && !isInvalidModel && !isModelDailyQuotaExhausted && !isTimeout && statusCode !== 400 && (isHighDemand503 || isRateLimit || isTemporary500);
   return {
-    statusCode: statusCode || 500,
-    isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
+    statusCode,
+    errorCode,
+    isRetryableAvailabilityError,
     isRateLimit,
     isHighDemand503,
+    isTimeout,
+    isAuthError,
+    isInvalidModel,
     isModelDailyQuotaExhausted,
     cleanMessage: rawMessage.slice(0, 260)
   };
@@ -169,7 +241,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
   ] : allConfiguredModels;
   let totalRetryAttempts = 0;
   let lastError = null;
-  let lastStatusCode = 500;
+  let lastClassification = null;
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const currentModel = candidateModels[mIdx];
     const isFallbackModel = currentModel !== primaryModel;
@@ -181,7 +253,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     });
     for (let retry = 0; retry <= maxRetriesForModel; retry++) {
       const controller = new AbortController();
-      const timeoutMs = isFallbackModel ? 22e3 : 26e3;
+      const timeoutMs = GEMINI_REQUEST_TIMEOUT_MS;
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const config = {
@@ -190,8 +262,8 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           responseSchema,
           abortSignal: controller.signal
         };
-        if (ThinkingLevel && (currentModel.includes("3.8") || currentModel.includes("argon"))) {
-          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
+        if (ThinkingLevel && currentModel.includes("gemini-4-hydrogen")) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW || ThinkingLevel.MEDIUM };
         }
         const response = await ai.models.generateContent({
           model: currentModel,
@@ -216,9 +288,18 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
         };
       } catch (err) {
         clearTimeout(timer);
+        if (controller.signal.aborted && !err?.isTimeout) {
+          const timeoutErr = new Error(
+            `Gemini API request to ${currentModel} timed out after ${Math.round(timeoutMs / 1e3)}s (HTTP 504).`
+          );
+          timeoutErr.status = 504;
+          timeoutErr.code = "GEMINI_TIMEOUT";
+          timeoutErr.isTimeout = true;
+          err = timeoutErr;
+        }
         lastError = err;
         const classification = classifyGeminiError(err);
-        lastStatusCode = classification.statusCode;
+        lastClassification = classification;
         const isValidationFailure = String(err?.message || "").includes("Malformed") || String(err?.message || "").includes("Incomplete OCR") || String(err?.message || "").includes("Invalid OCR item");
         logOcrEvent("warn", "extraction_attempt_failed", {
           model: currentModel,
@@ -226,27 +307,33 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           attempt: retry + 1,
           maxAttemptsForModel: maxRetriesForModel + 1,
           statusCode: classification.statusCode,
+          errorCode: classification.errorCode,
           isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
           reason: classification.cleanMessage
         });
-        if (!classification.isRetryableAvailabilityError && !isValidationFailure && (classification.statusCode === 400 || classification.statusCode === 401 || classification.statusCode === 403)) {
-          const permErr = new Error(classification.cleanMessage);
+        if (!isValidationFailure && (classification.isAuthError || classification.statusCode === 400)) {
+          const permErr = new Error(
+            classification.isAuthError ? `Gemini API authentication/permission error (HTTP ${classification.statusCode}): ${classification.cleanMessage}` : `Gemini API malformed request error (HTTP 400): ${classification.cleanMessage}`
+          );
           permErr.status = classification.statusCode;
-          permErr.code = classification.statusCode === 401 || classification.statusCode === 403 ? "GEMINI_AUTH_ERROR" : "GEMINI_BAD_REQUEST";
+          permErr.code = classification.errorCode;
+          permErr.retryable = false;
           throw permErr;
         }
-        if (classification.statusCode === 404 && !classification.isRetryableAvailabilityError && !isValidationFailure || classification.isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1) {
+        if (!isValidationFailure && (classification.isInvalidModel || classification.isModelDailyQuotaExhausted || classification.isTimeout)) {
           if (useCooldownMemory) {
-            modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_COOLDOWN_DURATION_MS);
+            const cooldownMs = classification.isTimeout ? MODEL_TRANSIENT_COOLDOWN_MS : MODEL_COOLDOWN_DURATION_MS;
+            modelQuotaCooldownUntil.set(currentModel, Date.now() + cooldownMs);
           }
-          logOcrEvent("info", "model_daily_quota_or_404_fast_failover", {
-            exhaustedModel: currentModel,
-            nextModel: candidateModels[mIdx + 1],
-            statusCode: classification.statusCode
+          logOcrEvent("info", "model_fast_failover", {
+            failedModel: currentModel,
+            nextModel: candidateModels[mIdx + 1] || "none",
+            statusCode: classification.statusCode,
+            errorCode: classification.errorCode
           });
           break;
         }
-        if (retry < maxRetriesForModel) {
+        if ((classification.isRetryableAvailabilityError || isValidationFailure) && retry < maxRetriesForModel) {
           totalRetryAttempts++;
           const waitMs = computeExponentialBackoffWithJitter(retry + 1, baseDelayMs);
           logOcrEvent("info", "retrying_after_backoff", {
@@ -259,36 +346,72 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           await sleep(waitMs);
           continue;
         }
+        if (useCooldownMemory && (classification.isHighDemand503 || classification.isRateLimit)) {
+          modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_TRANSIENT_COOLDOWN_MS);
+        }
       }
     }
   }
+  const finalClassification = lastClassification || classifyGeminiError(lastError);
   logOcrEvent("error", "all_models_and_retries_exhausted", {
     primaryModel,
     fallbackModels: fallbackModels.join(","),
     totalRetryAttempts,
-    lastStatusCode,
-    error: String(lastError?.message || lastError || "Unknown error").slice(0, 240)
+    lastStatusCode: finalClassification.statusCode,
+    errorCode: finalClassification.errorCode,
+    error: finalClassification.cleanMessage
   });
-  const finalClassification = classifyGeminiError(lastError);
+  if (finalClassification.isInvalidModel) {
+    const modelErr = new Error(
+      `Gemini model unavailable or invalid (HTTP 404): ${finalClassification.cleanMessage}`
+    );
+    modelErr.status = 404;
+    modelErr.code = "GEMINI_INVALID_MODEL";
+    modelErr.retryable = false;
+    throw modelErr;
+  }
+  if (finalClassification.isModelDailyQuotaExhausted) {
+    const quotaErr = new Error(
+      `Gemini AI quota exceeded (HTTP 429): ${finalClassification.cleanMessage}`
+    );
+    quotaErr.status = 429;
+    quotaErr.code = "GEMINI_QUOTA_EXHAUSTED";
+    quotaErr.retryable = false;
+    throw quotaErr;
+  }
+  if (finalClassification.isTimeout) {
+    const timeoutErr = new Error(
+      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1e3)}s per request. Your uploaded docket has been preserved \u2014 please click "Retry Extraction".`
+    );
+    timeoutErr.status = 504;
+    timeoutErr.code = "GEMINI_TIMEOUT";
+    timeoutErr.retryable = true;
+    throw timeoutErr;
+  }
   if (finalClassification.isHighDemand503) {
     const busyErr = new Error(
-      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retries and fallback to ${fallbackModels[0] || "secondary model"}. Your uploaded docket has been preserved \u2014 please click "Retry Extraction" in a moment.`
+      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retry and fallback to ${fallbackModels[0] || "secondary model"}. Your uploaded docket has been preserved \u2014 please click "Retry Extraction" in a moment.`
     );
     busyErr.status = 503;
     busyErr.code = "GEMINI_HIGH_DEMAND_503";
+    busyErr.retryable = true;
     throw busyErr;
   }
   if (finalClassification.isRateLimit) {
     const rateErr = new Error(
-      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retries. Your uploaded docket has been preserved \u2014 please wait a few seconds and click "Retry Extraction".`
+      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retry. Your uploaded docket has been preserved \u2014 please wait a few seconds and click "Retry Extraction".`
     );
     rateErr.status = 429;
     rateErr.code = "GEMINI_RATE_LIMIT_429";
+    rateErr.retryable = true;
     throw rateErr;
   }
-  throw new Error(
+  const genericErr = new Error(
     finalClassification.cleanMessage || 'Gemini AI could not extract the docket after automatic retries. Please click "Retry Extraction".'
   );
+  genericErr.status = finalClassification.statusCode || 500;
+  genericErr.code = finalClassification.errorCode || "AI_EXTRACTION_FAILED";
+  throw genericErr;
 }
 async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages) {
   const parts = [];
@@ -318,7 +441,10 @@ ${payload.pdfSelectableText.slice(0, 18e3)}`
   }
   const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
 Your job is to transcribe EVERY single physical part row literally visible across the provided page image(s) and/or extracted PDF text into the JSON 'items' array without skipping or merging any rows.
-STRICT ANTI-HALLUCINATION RULE: Only extract rows and text that are literally present in the provided document. Never invent, guess, or fabricate parts, codes, descriptions, materials, thicknesses, dimensions, or quantities. If a document is blank or contains no physical part rows, return an empty items array [].`;
+STRICT ANTI-HALLUCINATION & PART NUMBER INTEGRITY RULE:
+- Preserve original part numbers, revisions, and quantities exactly as printed.
+- Never invent, complete, or silently correct uncertain part numbers.
+- Only extract rows and text that are literally present in the provided document. If a document is blank or contains no physical part rows, return an empty items array [].`;
   const promptText = `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in the table in top-to-bottom order. If the image is blank or has no part rows, return items: [].
 
 MANDATORY 100%-RECALL EXTRACTION RULES:
@@ -331,17 +457,21 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
 3. IGNORE NON-PART LINES:
    - Ignore document header barcodes, consignment notes, and column headers.
    - On Tax Invoices, ignore non-physical charge/summary lines (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Tax, Total, Balance Due).
-4. FIELD MAPPING FOR EACH PART ROW:
+4. MULTIPLE DOCKETS / PAGE HEADERS:
+   - The upload may contain MULTIPLE separate delivery dockets (each with its own docket/invoice number) OR a multi-page single docket.
+   - Record one entry in 'pageHeaders' for EVERY page (${batchPages.map((b) => b.pageNumber).join(", ")}) with that page's exact 'docketNumber' (e.g., Docket No, Delivery Note, Tax Invoice No, or Job No; or "" if a continuation page has no docket header printed), 'supplier', 'deliveryDate', 'orderNumber' (e.g., Client Order No / PO No), 'carrier', 'palletCount', and 'startsNewDocket' (true if a new docket/invoice starts on that page).
+   - Never fabricate a docket number if none is printed on a continuation page.
+5. FIELD MAPPING FOR EACH PART ROW:
    - page: The page number (${batchPages.map((b) => b.pageNumber).join(" or ")}) this row is on.
-   - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. Never restart numbering at "1" on the lower half or on subsequent pages if printed row numbers continue across the document.
-   - part: The Part Number, Drawing Number, Mark, Code, or DXF/Profile Name written on the row. If the table only has ONE text column (e.g. "Description" or "Part / Description"), put the part code/name in 'part' and the full text in 'desc'. NEVER put the row number in 'part'.
+   - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. If a NEW docket starts on a page and its row numbers restart at 1, keep the printed "1".
+   - part: The exact Part Number, Client Part Code, Part Code, Drawing Number, Mark, or DXF/Profile Name as printed on the row. Preserve original part numbers exactly as printed; never invent, complete, or silently correct uncertain part numbers. NEVER put the row number or quantity in 'part'.
    - desc: The full part description or name written on the row.
-   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "01", "Rev B"), else "".
+   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "B", "01"), else "".
    - mat: Material grade ONLY if written on the row, else "".
    - thk: Thickness ONLY if written on the row, else "".
    - dim: Dimensions/length/size ONLY if written on the row, else "".
    - wt: Weight ONLY if written on the row, else "".
-   - qty: Integer quantity for this part row (convert invoice decimals like 4.00 to 4; never use Unit Price $ or Line Total $).`;
+   - qty: Integer dispatched/delivered quantity for this part row (prefer "Desp" / "Despatched" / "Shipped" / "Qty" column; convert decimals like 4.00 to 4; never use Unit Price $ or Line Total $).`;
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
@@ -351,6 +481,24 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
       orderNumber: { type: Type.STRING },
       carrier: { type: Type.STRING },
       palletCount: { type: Type.INTEGER },
+      pageHeaders: {
+        type: Type.ARRAY,
+        description: "Per-page docket header metadata used to keep multi-page dockets together and separate distinct dockets.",
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            page: { type: Type.INTEGER },
+            docketNumber: { type: Type.STRING },
+            supplier: { type: Type.STRING },
+            deliveryDate: { type: Type.STRING },
+            orderNumber: { type: Type.STRING },
+            carrier: { type: Type.STRING },
+            palletCount: { type: Type.INTEGER },
+            startsNewDocket: { type: Type.BOOLEAN }
+          },
+          required: ["page"]
+        }
+      },
       hasPrintedNoColumn: {
         type: Type.BOOLEAN,
         description: "True if the table has a printed No / Item / Pos / Line number column."
@@ -393,6 +541,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
       "orderNumber",
       "carrier",
       "palletCount",
+      "pageHeaders",
       "hasPrintedNoColumn",
       "firstVisibleRowNo",
       "lastVisibleRowNo",
@@ -415,6 +564,7 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
     carrier: parsed.carrier,
     orderNumber: parsed.orderNumber,
     palletCount: parsed.palletCount,
+    pageHeaders: Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [],
     hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
     firstVisibleRowNo: parsed.firstVisibleRowNo,
     lastVisibleRowNo: parsed.lastVisibleRowNo,
@@ -588,12 +738,11 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     );
     batchResponses.push(...pairRes);
   }
-  const globalByNo = /* @__PURE__ */ new Map();
-  const unnumberedItems = [];
-  const pageMinNo = /* @__PURE__ */ new Map();
-  const pageMaxNo = /* @__PURE__ */ new Map();
+  const pageMetaMap = /* @__PURE__ */ new Map();
+  for (let p = 1; p <= totalPages; p++) {
+    pageMetaMap.set(p, { pageNumber: p, explicitDocketNumber: "", rawItems: [] });
+  }
   let anyPrintedNoColumn = false;
-  let globalMaxCandidate = 0;
   let modelUsed = DEFAULT_PRIMARY_VISION_MODEL;
   let fallbackUsed = false;
   let totalRetries = 0;
@@ -602,35 +751,152 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     modelUsed = bRes.modelUsed || modelUsed;
     fallbackUsed = fallbackUsed || Boolean(bRes.fallbackUsed);
     totalRetries += bRes.retryAttempts || 0;
-    const defaultPage = batches[bIdx][0].pageNumber;
     if (bRes.hasPrintedNoColumn !== false) {
       anyPrintedNoColumn = true;
     }
-    const fNo = parseInt(parseCleanRowNo(bRes.firstVisibleRowNo), 10);
-    const lNo = parseInt(parseCleanRowNo(bRes.lastVisibleRowNo), 10);
-    if (!Number.isNaN(fNo) && fNo > 0) {
-      pageMinNo.set(defaultPage, Math.min(pageMinNo.get(defaultPage) ?? fNo, fNo));
-      if (fNo > globalMaxCandidate && fNo <= 1500) globalMaxCandidate = fNo;
+    const batchPageNums = batches[bIdx].map((b) => b.pageNumber);
+    const defaultPage = batchPageNums[0];
+    for (const ph of bRes.pageHeaders || []) {
+      const pNum = Math.min(totalPages, Math.max(1, Number(ph.page) || defaultPage));
+      const meta = pageMetaMap.get(pNum);
+      const dn = String(ph.docketNumber || "").trim();
+      if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
+      if (ph.supplier && ph.supplier.trim() && !meta.supplier) meta.supplier = ph.supplier.trim();
+      if (ph.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(ph.deliveryDate.trim()) && !meta.deliveryDate) {
+        meta.deliveryDate = ph.deliveryDate.trim();
+      }
+      if (ph.orderNumber && ph.orderNumber.trim() && !meta.orderNumber) meta.orderNumber = ph.orderNumber.trim();
+      if (ph.carrier && ph.carrier.trim() && !meta.carrier) meta.carrier = ph.carrier.trim();
+      if (ph.palletCount && ph.palletCount > 0 && !meta.palletCount) meta.palletCount = ph.palletCount;
+      if (ph.startsNewDocket) meta.startsNewDocket = true;
     }
-    if (!Number.isNaN(lNo) && lNo > 0) {
-      const lastPageInBatch = batches[bIdx][batches[bIdx].length - 1].pageNumber;
-      pageMaxNo.set(lastPageInBatch, Math.max(pageMaxNo.get(lastPageInBatch) ?? lNo, lNo));
-      if (lNo > globalMaxCandidate && lNo <= 1500) globalMaxCandidate = lNo;
+    const firstMeta = pageMetaMap.get(defaultPage);
+    if (!firstMeta.explicitDocketNumber && bRes.docketNumber?.trim() && batchPageNums.length === 1) {
+      firstMeta.explicitDocketNumber = bRes.docketNumber.trim();
     }
+    if (!firstMeta.supplier && bRes.supplier?.trim()) firstMeta.supplier = bRes.supplier.trim();
+    if (!firstMeta.deliveryDate && bRes.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(bRes.deliveryDate.trim())) {
+      firstMeta.deliveryDate = bRes.deliveryDate.trim();
+    }
+    if (!firstMeta.orderNumber && bRes.orderNumber?.trim()) firstMeta.orderNumber = bRes.orderNumber.trim();
+    if (!firstMeta.carrier && bRes.carrier?.trim()) firstMeta.carrier = bRes.carrier.trim();
     for (const rawIt of bRes.items || []) {
-      const norm = normalizeRawBatchItem(rawIt, defaultPage);
+      const targetPage = Math.min(totalPages, Math.max(1, Number(rawIt.page) || defaultPage));
+      const meta = pageMetaMap.get(targetPage);
+      meta.rawItems.push({ ...rawIt, page: targetPage });
+      const nVal = parseInt(parseCleanRowNo(rawIt.no), 10);
+      if (!Number.isNaN(nVal) && nVal > 0 && nVal <= 1500) {
+        meta.minRowNo = meta.minRowNo === void 0 ? nVal : Math.min(meta.minRowNo, nVal);
+        meta.maxRowNo = meta.maxRowNo === void 0 ? nVal : Math.max(meta.maxRowNo, nVal);
+      }
+    }
+  }
+  const segments = [];
+  const normDocketKey = (s) => s.trim().toUpperCase().replace(/\s+/g, "");
+  for (let p = 1; p <= totalPages; p++) {
+    const meta = pageMetaMap.get(p);
+    const explicitKey = normDocketKey(meta.explicitDocketNumber);
+    const hasExplicit = explicitKey.length > 0;
+    if (segments.length === 0) {
+      const fallbackDk = `DK-${Math.floor(1e4 + Math.random() * 9e4)}`;
+      segments.push({
+        docketKey: hasExplicit ? explicitKey : fallbackDk,
+        explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
+        hasExplicitDocketNumber: hasExplicit,
+        supplier: meta.supplier || "Steel Fabrication Supplier",
+        deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: !hasExplicit && totalPages > 1,
+        separationReason: !hasExplicit && totalPages > 1 ? "Docket number not detected on page 1 \u2014 verify page boundaries." : void 0
+      });
+      continue;
+    }
+    if (hasExplicit) {
+      const existingSameDocket = segments.find(
+        (seg) => seg.hasExplicitDocketNumber && seg.docketKey === explicitKey
+      );
+      if (existingSameDocket) {
+        existingSameDocket.pageNumbers.push(p);
+        existingSameDocket.rawItems.push(...meta.rawItems);
+        existingSameDocket.maxRowSeen = Math.max(existingSameDocket.maxRowSeen, meta.maxRowNo || 0);
+        if (!existingSameDocket.carrier && meta.carrier) existingSameDocket.carrier = meta.carrier;
+        if (!existingSameDocket.orderNumber && meta.orderNumber) existingSameDocket.orderNumber = meta.orderNumber;
+        existingSameDocket.palletCount = Math.max(existingSameDocket.palletCount, meta.palletCount || 1);
+      } else {
+        segments.push({
+          docketKey: explicitKey,
+          explicitDocketNumber: meta.explicitDocketNumber,
+          hasExplicitDocketNumber: true,
+          supplier: meta.supplier || "Steel Fabrication Supplier",
+          deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          separationUncertain: false
+        });
+      }
+      continue;
+    }
+    const prevSeg = segments[segments.length - 1];
+    const rowResetDetected = meta.minRowNo !== void 0 && meta.minRowNo <= 2 && prevSeg.maxRowSeen >= 3;
+    const orderChanged = Boolean(meta.orderNumber && prevSeg.orderNumber && meta.orderNumber !== prevSeg.orderNumber);
+    const shouldSplitUncertain = Boolean(meta.startsNewDocket || rowResetDetected || orderChanged);
+    if (shouldSplitUncertain) {
+      const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
+      const reason = `Page ${p} appears to start a new docket (${rowResetDetected ? "row numbering restarted at 1" : orderChanged ? "order number changed" : "new header detected"}), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
+      prevSeg.separationUncertain = true;
+      prevSeg.separationReason = prevSeg.separationReason || "Verify multi-page boundary against adjoining pages.";
+      segments.push({
+        docketKey: fallbackDk,
+        explicitDocketNumber: fallbackDk,
+        hasExplicitDocketNumber: false,
+        supplier: meta.supplier || prevSeg.supplier,
+        deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+        carrier: meta.carrier,
+        orderNumber: meta.orderNumber,
+        palletCount: Math.max(1, meta.palletCount || 1),
+        pageNumbers: [p],
+        maxRowSeen: meta.maxRowNo || 0,
+        rawItems: [...meta.rawItems],
+        separationUncertain: true,
+        separationReason: reason
+      });
+    } else {
+      prevSeg.pageNumbers.push(p);
+      prevSeg.rawItems.push(...meta.rawItems);
+      prevSeg.maxRowSeen = Math.max(prevSeg.maxRowSeen, meta.maxRowNo || 0);
+      prevSeg.palletCount = Math.max(prevSeg.palletCount, meta.palletCount || 1);
+    }
+  }
+  const builtDockets = [];
+  for (const seg of segments) {
+    const segByNo = /* @__PURE__ */ new Map();
+    const segUnnumbered = [];
+    const segPageMin = /* @__PURE__ */ new Map();
+    const segPageMax = /* @__PURE__ */ new Map();
+    let segMaxCandidate = 0;
+    for (const rawIt of seg.rawItems) {
+      const norm = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
       if (!norm) continue;
       const numNo = parseInt(norm.cleanNo, 10);
-      const itemPage = norm.item.pageNumber || defaultPage;
+      const itemPage = norm.item.pageNumber || seg.pageNumbers[0];
       if (!Number.isNaN(numNo) && numNo > 0 && numNo <= 1500) {
-        if (numNo > globalMaxCandidate) globalMaxCandidate = numNo;
-        pageMinNo.set(itemPage, Math.min(pageMinNo.get(itemPage) ?? numNo, numNo));
-        pageMaxNo.set(itemPage, Math.max(pageMaxNo.get(itemPage) ?? numNo, numNo));
-        const existing = globalByNo.get(numNo);
+        if (numNo > segMaxCandidate) segMaxCandidate = numNo;
+        segPageMin.set(itemPage, Math.min(segPageMin.get(itemPage) ?? numNo, numNo));
+        segPageMax.set(itemPage, Math.max(segPageMax.get(itemPage) ?? numNo, numNo));
+        const existing = segByNo.get(numNo);
         if (!existing) {
-          globalByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
+          segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
         } else if (existing.pageNumber === itemPage) {
-          globalByNo.set(numNo, {
+          segByNo.set(numNo, {
             ...existing,
             partNumber: existing.partNumber && existing.partNumber !== "PART" ? existing.partNumber : norm.item.partNumber,
             description: norm.item.description.length > existing.description.length ? norm.item.description : existing.description,
@@ -642,117 +908,101 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
             quantity: existing.quantity || norm.item.quantity
           });
         } else {
-          unnumberedItems.push(norm.item);
+          segUnnumbered.push(norm.item);
         }
       } else {
-        unnumberedItems.push(norm.item);
+        segUnnumbered.push(norm.item);
       }
     }
-  }
-  if (anyPrintedNoColumn && globalMaxCandidate > 1 && globalMaxCandidate <= 600 && unnumberedItems.length === 0) {
-    const missingNos = [];
-    for (let n = 1; n <= globalMaxCandidate; n++) {
-      if (!globalByNo.has(n)) {
-        missingNos.push(n);
+    if (anyPrintedNoColumn && segMaxCandidate > 1 && segMaxCandidate <= 600 && segUnnumbered.length === 0) {
+      const missingNos = [];
+      for (let n = 1; n <= segMaxCandidate; n++) {
+        if (!segByNo.has(n)) missingNos.push(n);
       }
-    }
-    if (missingNos.length > 0 && missingNos.length <= 60) {
-      const missingPerPage = /* @__PURE__ */ new Map();
-      const assignToPage = (pNum, val) => {
-        if (pNum < 1 || pNum > totalPages) return;
-        if (!missingPerPage.has(pNum)) missingPerPage.set(pNum, /* @__PURE__ */ new Set());
-        missingPerPage.get(pNum).add(val);
-      };
-      for (const mNo of missingNos) {
-        let matched = false;
-        for (let p = 1; p <= totalPages; p++) {
-          const pMin = pageMinNo.get(p) ?? 1;
-          const pMax = pageMaxNo.get(p) ?? globalMaxCandidate;
-          if (mNo >= pMin && mNo <= pMax) {
-            assignToPage(p, mNo);
-            matched = true;
+      if (missingNos.length > 0 && missingNos.length <= 60) {
+        const missingPerPage = /* @__PURE__ */ new Map();
+        for (const mNo of missingNos) {
+          let targetP = seg.pageNumbers[0];
+          for (const p of seg.pageNumbers) {
+            const pMin = segPageMin.get(p) ?? 1;
+            const pMax = segPageMax.get(p) ?? segMaxCandidate;
+            if (mNo >= pMin && mNo <= pMax) {
+              targetP = p;
+              break;
+            }
           }
+          if (!missingPerPage.has(targetP)) missingPerPage.set(targetP, /* @__PURE__ */ new Set());
+          missingPerPage.get(targetP).add(mNo);
         }
-        if (!matched) {
-          for (let p = 1; p < totalPages; p++) {
-            const pMax = pageMaxNo.get(p);
-            const nextMin = pageMinNo.get(p + 1);
-            if (pMax !== void 0 && nextMin !== void 0 && mNo > pMax && mNo < nextMin) {
-              assignToPage(p, mNo);
-              assignToPage(p + 1, mNo);
-              matched = true;
+        const recoveryPayloads = Array.from(missingPerPage.entries()).map(([pNum, set]) => ({
+          pageNumber: pNum,
+          payload: resolvedPayloads[pNum - 1],
+          missingNos: Array.from(set).sort((a, b) => a - b)
+        }));
+        for (let i = 0; i < recoveryPayloads.length; i += 3) {
+          const chunk = recoveryPayloads.slice(i, i + 3);
+          const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
+          for (const r of recoveredRaw) {
+            const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
+            if (!norm) continue;
+            const numNo = parseInt(norm.cleanNo, 10);
+            if (!Number.isNaN(numNo) && numNo > 0 && !segByNo.has(numNo)) {
+              segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
             }
           }
         }
-        if (!matched) {
-          assignToPage(mNo <= (pageMaxNo.get(1) ?? 50) ? 1 : totalPages, mNo);
-        }
-      }
-      const recoveryPayloads = Array.from(missingPerPage.entries()).map(([pNum, set]) => ({
-        pageNumber: pNum,
-        payload: resolvedPayloads[pNum - 1],
-        missingNos: Array.from(set).sort((a, b) => a - b)
-      }));
-      for (let i = 0; i < recoveryPayloads.length; i += 3) {
-        const chunk = recoveryPayloads.slice(i, i + 3);
-        const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
-        for (const r of recoveredRaw) {
-          const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
-          if (!norm) continue;
-          const numNo = parseInt(norm.cleanNo, 10);
-          if (!Number.isNaN(numNo) && numNo > 0 && !globalByNo.has(numNo)) {
-            globalByNo.set(numNo, {
-              ...norm.item,
-              itemNumber: String(numNo)
-            });
-          }
-        }
       }
     }
-  }
-  const validItems = [];
-  const sortedNos = Array.from(globalByNo.keys()).sort((a, b) => a - b);
-  for (const n of sortedNos) {
-    validItems.push(globalByNo.get(n));
-  }
-  let nextSeq = (sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : startItemIndex - 1) + 1;
-  for (const unnum of unnumberedItems) {
-    validItems.push({
-      ...unnum,
-      itemNumber: String(nextSeq++)
+    const validItems = [];
+    const sortedNos = Array.from(segByNo.keys()).sort((a, b) => a - b);
+    for (const n of sortedNos) {
+      validItems.push(segByNo.get(n));
+    }
+    let nextSeq = (sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : startItemIndex - 1) + 1;
+    for (const unnum of segUnnumbered) {
+      validItems.push({ ...unnum, itemNumber: String(nextSeq++) });
+    }
+    builtDockets.push({
+      docketNumber: seg.explicitDocketNumber,
+      supplier: seg.supplier,
+      deliveryDate: seg.deliveryDate,
+      carrier: seg.carrier,
+      orderNumber: seg.orderNumber,
+      palletCount: seg.palletCount,
+      items: validItems,
+      confidenceScore: validItems.length > 0 ? seg.separationUncertain ? 75 : 100 : 0,
+      needsManualReview: validItems.length === 0 || seg.separationUncertain,
+      separationUncertain: seg.separationUncertain,
+      separationReason: seg.separationReason,
+      sourcePageNumbers: [...seg.pageNumbers],
+      extractionMethod: "ai-vision",
+      aiModelUsed: modelUsed,
+      fallbackUsed,
+      retryAttempts: totalRetries,
+      pagesScanned: seg.pageNumbers.length,
+      hasPrintedNoColumn: anyPrintedNoColumn,
+      firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : void 0,
+      lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : void 0
     });
   }
-  const rawDocketNo = batchResponses.find((p) => p.docketNumber && p.docketNumber.trim())?.docketNumber || `DK-${Math.floor(1e4 + Math.random() * 9e4)}`;
-  const cleanedDocketNumber = rawDocketNo.trim();
-  const supplier = batchResponses.find((p) => p.supplier && p.supplier.trim())?.supplier?.trim() || "Steel Fabrication Supplier";
-  const rawDate = batchResponses.find(
-    (p) => p.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(p.deliveryDate.trim())
-  )?.deliveryDate;
-  const deliveryDate = rawDate ? rawDate.trim() : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-  const carrier = batchResponses.find((p) => p.carrier && p.carrier.trim())?.carrier?.trim();
-  const orderNumber = batchResponses.find((p) => p.orderNumber && p.orderNumber.trim())?.orderNumber?.trim();
-  const maxPalletCount = Math.max(
-    1,
-    ...batchResponses.map((p) => parseInt(String(p.palletCount || 1), 10) || 1)
-  );
-  return {
-    docketNumber: cleanedDocketNumber,
-    supplier,
-    deliveryDate,
-    carrier,
-    orderNumber,
-    palletCount: maxPalletCount,
-    items: validItems,
-    confidenceScore: validItems.length > 0 ? 100 : 0,
-    needsManualReview: validItems.length === 0,
+  const primary = builtDockets[0] || {
+    docketNumber: `DK-${Math.floor(1e4 + Math.random() * 9e4)}`,
+    supplier: "Steel Fabrication Supplier",
+    deliveryDate: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+    palletCount: 1,
+    items: [],
+    confidenceScore: 0,
+    needsManualReview: true,
     extractionMethod: "ai-vision",
     aiModelUsed: modelUsed,
     fallbackUsed,
     retryAttempts: totalRetries,
+    pagesScanned: totalPages
+  };
+  return {
+    ...primary,
     pagesScanned: totalPages,
-    hasPrintedNoColumn: anyPrintedNoColumn,
-    firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : void 0,
-    lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : void 0
+    separatedDockets: builtDockets
   };
 }
 async function recoverMissingDocketItems(slicePayload, pageNumber, missingNos, overrideApiKey) {
@@ -843,6 +1093,43 @@ Return ONLY the barcode string (e.g. "482910-3") or Part Number in 'detectedCode
     return { detectedCode: "", confidence: "low" };
   }
 }
+var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS;
+var init_docketOcr = __esm({
+  "src/server/docketOcr.ts"() {
+    DEFAULT_PRIMARY_VISION_MODEL = "gemini-4-hydrogen";
+    DEFAULT_FALLBACK_VISION_MODELS = ["gemini-3.1-flash-lite"];
+    GEMINI_REQUEST_TIMEOUT_MS = 22e3;
+    MAX_AUTOMATIC_RETRIES = 1;
+    INITIAL_BACKOFF_MS = 1800;
+    OBSOLETE_PRIMARY_MODELS = /* @__PURE__ */ new Set([
+      "gemini-3.8-flash",
+      "gemini-1.5-flash",
+      "gemini-1.5-pro",
+      "gemini-2.0-flash",
+      "gemini-pro-vision"
+    ]);
+    OBSOLETE_FALLBACK_MODELS = /* @__PURE__ */ new Set([
+      "gemini-3.8-flash",
+      "gemini-3-flash-preview",
+      "gemini-3.1-flash-lite-preview",
+      "gemini-flash-latest",
+      "gemini-1.5-flash",
+      "gemini-2.0-flash"
+    ]);
+    modelQuotaCooldownUntil = /* @__PURE__ */ new Map();
+    MODEL_COOLDOWN_DURATION_MS = 5 * 60 * 1e3;
+    MODEL_TRANSIENT_COOLDOWN_MS = 60 * 1e3;
+  }
+});
+
+// server.ts
+init_docketOcr();
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import dotenv from "dotenv";
+import path2 from "path";
+import { fileURLToPath } from "url";
 
 // src/server/db/nodeSqliteAdapter.ts
 import fs from "node:fs";
@@ -1156,6 +1443,18 @@ async function verifySetupSecretConstantTime(providedSecret, expectedSecret) {
   return timingSafeEqual(bufToHex(hashA), bufToHex(hashB));
 }
 
+// src/utils/ignoredQrCodes.ts
+var IGNORED_NON_PART_QR_PAYLOADS = [
+  "https://www.novacel-solutions.com/qr/46"
+];
+var IGNORED_NON_PART_QR_PAYLOAD_SET = new Set(IGNORED_NON_PART_QR_PAYLOADS);
+function isIgnoredNonPartQrPayload(rawPayload) {
+  if (typeof rawPayload !== "string") return false;
+  const trimmed = rawPayload.trim();
+  if (!trimmed) return false;
+  return IGNORED_NON_PART_QR_PAYLOAD_SET.has(trimmed);
+}
+
 // src/server/api/palletTrackDbService.ts
 var PalletTrackDbService = class _PalletTrackDbService {
   constructor(db) {
@@ -1230,9 +1529,56 @@ var PalletTrackDbService = class _PalletTrackDbService {
     };
   }
   /**
+   * Build chronological multi-user scan attributions for a specific part from scan_events.
+   * Ensures subsequent scans by another user NEVER erase prior scanners' attribution.
+   */
+  buildPartScanAttributions(partId, deliveryScans, partRow) {
+    const relevant = deliveryScans.filter(
+      (s) => s.part_id === partId && s.scan_status !== "part_added" && s.scan_status !== "part_edited" && s.scan_status !== "part_deleted" && s.scan_status !== "duplicate_blocked"
+    ).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const byUser = /* @__PURE__ */ new Map();
+    for (const s of relevant) {
+      if (s.scan_status === "undo_performed" || Number(s.received_quantity_after) === 0) {
+        if (Number(s.received_quantity_after || 0) === 0) {
+          byUser.clear();
+        }
+        continue;
+      }
+      const empName = (s.employee_name || "").trim() || "Worker";
+      const key = s.user_id ? `uid:${s.user_id}` : `name:${empName.toLowerCase()}`;
+      const qtyAdded = Number(s.quantity_added) > 0 ? Number(s.quantity_added) : Number(s.received_quantity_after) > 0 && byUser.size === 0 ? Number(s.received_quantity_after) : 0;
+      const existing = byUser.get(key);
+      if (existing) {
+        existing.quantityScanned += qtyAdded;
+        existing.lastScannedAt = s.timestamp;
+        existing.scanCount += 1;
+      } else {
+        byUser.set(key, {
+          userId: s.user_id || void 0,
+          employeeName: empName,
+          quantityScanned: qtyAdded,
+          lastScannedAt: s.timestamp,
+          scanCount: 1
+        });
+      }
+    }
+    if (byUser.size === 0 && partRow && (partRow.status === "received" || Number(partRow.received_quantity) > 0) && partRow.last_scanned_by_name) {
+      return [
+        {
+          userId: partRow.last_scanned_by_id || void 0,
+          employeeName: partRow.last_scanned_by_name,
+          quantityScanned: Number(partRow.received_quantity) || 0,
+          lastScannedAt: partRow.scanned_at || partRow.updated_at,
+          scanCount: 1
+        }
+      ];
+    }
+    return Array.from(byUser.values());
+  }
+  /**
    * Helper to format delivery header from DB row
    */
-  mapDeliveryRow(row, stats, parts = []) {
+  mapDeliveryRow(row, stats, parts = [], scanHistory = []) {
     return {
       id: row.id,
       docketNumber: row.docket_number,
@@ -1246,6 +1592,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
       palletCount: row.pallet_count,
       supplierProfile: row.supplier_profile || "laser_central",
       notes: row.notes || void 0,
+      needsReview: Boolean(row.needs_review),
+      separationReason: row.review_reason || void 0,
       version: Number(row.version || 1),
       createdBy: row.created_by || void 0,
       createdAt: row.created_at,
@@ -1255,13 +1603,13 @@ var PalletTrackDbService = class _PalletTrackDbService {
       verifiedParts: stats?.verifiedParts ?? parts.filter((p) => p.verificationStatus === "verified").length,
       stats: stats || { totalParts: parts.length, receivedParts: 0, verifiedParts: 0 },
       parts,
-      scanHistory: [],
+      scanHistory,
       unexpectedParts: [],
       docketAttachments: []
     };
   }
   /**
-   * List all deliveries with aggregated stats and full parts array
+   * List all deliveries with aggregated stats, full parts array, and scan attribution
    */
   async listDeliveries() {
     const deliveriesQuery = `
@@ -1276,14 +1624,27 @@ var PalletTrackDbService = class _PalletTrackDbService {
     `;
     const res = await this.db.prepare(deliveriesQuery).all();
     const allPartsRes = await this.db.prepare("SELECT * FROM delivery_parts ORDER BY docket_line_index ASC").all();
+    const allScansRes = await this.db.prepare("SELECT * FROM scan_events ORDER BY timestamp DESC LIMIT 5000").all();
+    const rawScansByDelivery = /* @__PURE__ */ new Map();
+    for (const s of allScansRes.results || []) {
+      const arr = rawScansByDelivery.get(s.delivery_id) || [];
+      arr.push(s);
+      rawScansByDelivery.set(s.delivery_id, arr);
+    }
     const partsByDelivery = /* @__PURE__ */ new Map();
     for (const p of allPartsRes.results || []) {
+      const delScans = rawScansByDelivery.get(p.delivery_id) || [];
+      const mapped = {
+        ...this.mapPartRow(p),
+        scannedByUsers: this.buildPartScanAttributions(p.id, delScans, p)
+      };
       const arr = partsByDelivery.get(p.delivery_id) || [];
-      arr.push(this.mapPartRow(p));
+      arr.push(mapped);
       partsByDelivery.set(p.delivery_id, arr);
     }
     return (res.results || []).map((row) => {
       const parts = partsByDelivery.get(row.id) || [];
+      const delScans = (rawScansByDelivery.get(row.id) || []).slice(0, 300).map((s) => this.mapScanRow(s));
       return this.mapDeliveryRow(
         row,
         {
@@ -1291,25 +1652,30 @@ var PalletTrackDbService = class _PalletTrackDbService {
           receivedParts: Number(row.received_parts) || parts.filter((p) => p.status === "received").length,
           verifiedParts: Number(row.verified_parts) || parts.filter((p) => p.verificationStatus === "verified").length
         },
-        parts
+        parts,
+        delScans
       );
     });
   }
   /**
-   * Get single delivery by ID, including parts and scan history
+   * Get single delivery by ID, including parts, attribution, and scan history
    */
   async getDeliveryById(id) {
     const delivery = await this.db.prepare("SELECT * FROM deliveries WHERE id = ?").bind(id).first();
     if (!delivery) return null;
     const partsRes = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? ORDER BY docket_line_index ASC").bind(id).all();
-    const scansRes = await this.db.prepare("SELECT * FROM scan_events WHERE delivery_id = ? ORDER BY timestamp DESC LIMIT 300").bind(id).all();
-    const parts = (partsRes.results || []).map((p) => this.mapPartRow(p));
-    const scanHistory = (scansRes.results || []).map((s) => this.mapScanRow(s));
+    const scansRes = await this.db.prepare("SELECT * FROM scan_events WHERE delivery_id = ? ORDER BY timestamp DESC LIMIT 500").bind(id).all();
+    const rawScans = scansRes.results || [];
+    const parts = (partsRes.results || []).map((p) => ({
+      ...this.mapPartRow(p),
+      scannedByUsers: this.buildPartScanAttributions(p.id, rawScans, p)
+    }));
+    const scanHistory = rawScans.map((s) => this.mapScanRow(s));
     const totalParts = parts.length;
     const receivedParts = parts.filter((p) => p.status === "received").length;
     const verifiedParts = parts.filter((p) => p.verificationStatus === "verified").length;
     return {
-      ...this.mapDeliveryRow(delivery, { totalParts, receivedParts, verifiedParts }, parts),
+      ...this.mapDeliveryRow(delivery, { totalParts, receivedParts, verifiedParts }, parts, scanHistory),
       parts,
       scanHistory,
       unexpectedParts: [],
@@ -1334,14 +1700,27 @@ var PalletTrackDbService = class _PalletTrackDbService {
     if (!docketNumber) {
       throw new Error("docketNumber is required");
     }
+    const duplicateDocket = await this.db.prepare("SELECT id, docket_number FROM deliveries WHERE LOWER(TRIM(docket_number)) = LOWER(TRIM(?)) LIMIT 1").bind(docketNumber).first();
+    if (duplicateDocket) {
+      const dupErr = new Error(
+        `Docket #${docketNumber} already exists in the system. Duplicate docket creation is blocked.`
+      );
+      dupErr.code = "DUPLICATE_DOCKET";
+      dupErr.status = 409;
+      dupErr.existingDeliveryId = duplicateDocket.id;
+      throw dupErr;
+    }
     const stmts = [];
+    const needsReviewFlag = input.needsReview ? 1 : 0;
+    const reviewReason = input.separationReason ? String(input.separationReason).trim() : null;
     stmts.push(
       this.db.prepare(
         `INSERT INTO deliveries (
             id, docket_number, supplier, purchase_order_number, delivery_date,
             delivery_status, carrier, pallet_count, supplier_profile, notes,
+            needs_review, review_reason,
             created_by, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         id,
         docketNumber,
@@ -1353,6 +1732,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         palletCount,
         supplierProfile,
         notes,
+        needsReviewFlag,
+        reviewReason,
         createdBy,
         now,
         now
@@ -1462,10 +1843,13 @@ var PalletTrackDbService = class _PalletTrackDbService {
     const carrier = updates.carrier !== void 0 ? updates.carrier : existing.carrier;
     const palletCount = updates.palletCount !== void 0 ? updates.palletCount : existing.pallet_count;
     const notes = updates.notes !== void 0 ? updates.notes : existing.notes;
+    const needsReview = updates.needsReview !== void 0 ? updates.needsReview ? 1 : 0 : Number(existing.needs_review || 0);
+    const reviewReason = updates.separationReason !== void 0 ? updates.separationReason : existing.review_reason ?? null;
     await this.db.prepare(
       `UPDATE deliveries
          SET docket_number = ?, supplier = ?, purchase_order_number = ?, delivery_date = ?,
              delivery_status = ?, carrier = ?, pallet_count = ?, notes = ?,
+             needs_review = ?, review_reason = ?,
              version = COALESCE(version, 1) + 1, updated_at = ?
          WHERE id = ?`
     ).bind(
@@ -1477,6 +1861,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
       carrier,
       palletCount,
       notes,
+      needsReview,
+      reviewReason,
       now,
       id
     ).run();
@@ -2166,21 +2552,49 @@ var PalletTrackDbService = class _PalletTrackDbService {
     }
   }
   /**
-   * Delete a delivery and its associated parts/scans atomically
+   * Delete a delivery and its associated parts, scan events, M1 sync rows, and docket group links atomically
    */
   async deleteDelivery(id) {
     await this.ensureSchemaReady();
-    const existing = await this.db.prepare("SELECT id, docket_number FROM deliveries WHERE id = ?").bind(id).first();
+    const existing = await this.db.prepare("SELECT id, docket_number, delivery_status FROM deliveries WHERE id = ?").bind(id).first();
     if (!existing) {
       return { deleted: false, id };
     }
     await this.db.batch([
+      this.db.prepare("DELETE FROM docket_group_items WHERE delivery_id = ?").bind(id),
       this.db.prepare("DELETE FROM scan_events WHERE delivery_id = ?").bind(id),
       this.db.prepare("DELETE FROM delivery_parts WHERE delivery_id = ?").bind(id),
       this.db.prepare("DELETE FROM m1_synchronisations WHERE delivery_id = ?").bind(id),
       this.db.prepare("DELETE FROM deliveries WHERE id = ?").bind(id)
     ]);
-    return { deleted: true, id, docketNumber: existing.docket_number };
+    return {
+      deleted: true,
+      id,
+      docketNumber: existing.docket_number,
+      previousStatus: existing.delivery_status
+    };
+  }
+  /**
+   * Clear ALL delivery dockets, parts, scan events, M1 sync records, and docket groups
+   * while preserving users, active sessions, and configuration.
+   */
+  async clearAllDeliveries() {
+    await this.ensureSchemaReady();
+    const countRow = await this.db.prepare("SELECT COUNT(*) as count FROM deliveries").first();
+    const groupCountRow = await this.db.prepare("SELECT COUNT(*) as count FROM docket_groups").first();
+    await this.db.batch([
+      this.db.prepare("DELETE FROM docket_group_items"),
+      this.db.prepare("DELETE FROM docket_groups"),
+      this.db.prepare("DELETE FROM scan_events"),
+      this.db.prepare("DELETE FROM delivery_parts"),
+      this.db.prepare("DELETE FROM m1_synchronisations"),
+      this.db.prepare("DELETE FROM deliveries")
+    ]);
+    return {
+      cleared: true,
+      deletedDeliveriesCount: Number(countRow?.count || 0),
+      deletedGroupsCount: Number(groupCountRow?.count || 0)
+    };
   }
   async executeUpdatePartReceivedQuantityAtomic(deliveryId, partId, input) {
     await this.ensureSchemaReady();
@@ -2196,12 +2610,21 @@ var PalletTrackDbService = class _PalletTrackDbService {
         if (existingScan) {
           const currentPart = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(deliveryId, partId).first();
           const currentDelivery = await this.db.prepare("SELECT version FROM deliveries WHERE id = ?").bind(deliveryId).first();
+          const partScansRes2 = await this.db.prepare("SELECT * FROM scan_events WHERE delivery_id = ? AND part_id = ? ORDER BY timestamp ASC").bind(deliveryId, partId).all();
+          const scannedByUsers2 = this.buildPartScanAttributions(
+            partId,
+            partScansRes2.results || [],
+            currentPart || void 0
+          );
           return {
             duplicate: false,
             idempotentReplay: true,
             status: "updated",
             deliveryVersion: Number(currentDelivery?.version || 1),
-            part: currentPart ? this.mapPartRow(currentPart) : null,
+            part: currentPart ? {
+              ...this.mapPartRow(currentPart),
+              scannedByUsers: scannedByUsers2
+            } : null,
             scanEvent: this.mapScanRow(existingScan)
           };
         }
@@ -2357,6 +2780,12 @@ var PalletTrackDbService = class _PalletTrackDbService {
       const totalCount = Number(statsRow?.total_count || 0);
       const receivedCount = Number(statsRow?.received_count || 0);
       const outstandingCount = Math.max(0, totalCount - receivedCount);
+      const partScansRes = await this.db.prepare("SELECT * FROM scan_events WHERE delivery_id = ? AND part_id = ? ORDER BY timestamp ASC").bind(deliveryId, partId).all();
+      const scannedByUsers = this.buildPartScanAttributions(
+        partId,
+        partScansRes.results || [],
+        updatedPart || void 0
+      );
       return {
         duplicate: false,
         status: "updated",
@@ -2366,7 +2795,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
           receivedCount,
           outstandingCount
         },
-        part: updatedPart ? this.mapPartRow(updatedPart) : null,
+        part: updatedPart ? {
+          ...this.mapPartRow(updatedPart),
+          scannedByUsers
+        } : null,
         scanEvent: {
           id: scanId,
           deliveryId,
@@ -2387,6 +2819,298 @@ var PalletTrackDbService = class _PalletTrackDbService {
       };
     }
     throw new Error("Failed to commit part quantity after concurrent retries");
+  }
+  // =========================================================================
+  // DOCKET GROUPS (Manually created grouping without merging underlying dockets)
+  // =========================================================================
+  async listGroups() {
+    await this.ensureSchemaReady();
+    const groupsRes = await this.db.prepare("SELECT * FROM docket_groups ORDER BY created_at DESC").all();
+    const itemsRes = await this.db.prepare("SELECT * FROM docket_group_items ORDER BY added_at ASC").all();
+    const deliveryIdsByGroup = /* @__PURE__ */ new Map();
+    for (const item of itemsRes.results || []) {
+      const arr = deliveryIdsByGroup.get(item.group_id) || [];
+      arr.push(item.delivery_id);
+      deliveryIdsByGroup.set(item.group_id, arr);
+    }
+    return (groupsRes.results || []).map((g) => ({
+      id: g.id,
+      name: g.name,
+      deliveryIds: deliveryIdsByGroup.get(g.id) || [],
+      createdBy: g.created_by || null,
+      createdAt: g.created_at,
+      updatedAt: g.updated_at
+    }));
+  }
+  async getGroupById(groupId) {
+    await this.ensureSchemaReady();
+    const group = await this.db.prepare("SELECT * FROM docket_groups WHERE id = ?").bind(groupId).first();
+    if (!group) return null;
+    const itemsRes = await this.db.prepare("SELECT delivery_id FROM docket_group_items WHERE group_id = ? ORDER BY added_at ASC").bind(groupId).all();
+    return {
+      id: group.id,
+      name: group.name,
+      deliveryIds: (itemsRes.results || []).map((r) => r.delivery_id),
+      createdBy: group.created_by || null,
+      createdAt: group.created_at,
+      updatedAt: group.updated_at
+    };
+  }
+  async createGroup(input) {
+    await this.ensureSchemaReady();
+    const cleanName = String(input.name || "").trim();
+    if (!cleanName) {
+      throw new Error("Group name is required.");
+    }
+    const id = `grp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const uniqueIds = Array.from(
+      new Set((Array.isArray(input.deliveryIds) ? input.deliveryIds : []).map((d) => String(d).trim()).filter(Boolean))
+    );
+    const stmts = [
+      this.db.prepare("INSERT INTO docket_groups (id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").bind(id, cleanName, input.createdBy || null, now, now)
+    ];
+    for (const delId of uniqueIds) {
+      const exists = await this.db.prepare("SELECT id FROM deliveries WHERE id = ?").bind(delId).first();
+      if (exists) {
+        stmts.push(
+          this.db.prepare(
+            "INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)"
+          ).bind(id, delId, input.createdBy || null, now)
+        );
+      }
+    }
+    await this.db.batch(stmts);
+    return await this.getGroupById(id);
+  }
+  async updateGroup(groupId, updates, actorId) {
+    await this.ensureSchemaReady();
+    const existing = await this.db.prepare("SELECT * FROM docket_groups WHERE id = ?").bind(groupId).first();
+    if (!existing) {
+      throw new Error(`Docket group not found: ${groupId}`);
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const nextName = updates.name !== void 0 ? String(updates.name).trim() || existing.name : existing.name;
+    const stmts = [
+      this.db.prepare("UPDATE docket_groups SET name = ?, updated_at = ? WHERE id = ?").bind(nextName, now, groupId)
+    ];
+    if (Array.isArray(updates.deliveryIds)) {
+      stmts.push(
+        this.db.prepare("DELETE FROM docket_group_items WHERE group_id = ?").bind(groupId)
+      );
+      const uniqueIds = Array.from(
+        new Set(updates.deliveryIds.map((d) => String(d).trim()).filter(Boolean))
+      );
+      for (const delId of uniqueIds) {
+        const exists = await this.db.prepare("SELECT id FROM deliveries WHERE id = ?").bind(delId).first();
+        if (exists) {
+          stmts.push(
+            this.db.prepare(
+              "INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)"
+            ).bind(groupId, delId, actorId || null, now)
+          );
+        }
+      }
+    }
+    await this.db.batch(stmts);
+    return await this.getGroupById(groupId);
+  }
+  async addDeliveryToGroup(groupId, deliveryId, addedBy) {
+    await this.ensureSchemaReady();
+    const group = await this.db.prepare("SELECT id FROM docket_groups WHERE id = ?").bind(groupId).first();
+    if (!group) throw new Error(`Docket group not found: ${groupId}`);
+    const delivery = await this.db.prepare("SELECT id FROM deliveries WHERE id = ?").bind(deliveryId).first();
+    if (!delivery) throw new Error(`Delivery docket not found: ${deliveryId}`);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    await this.db.batch([
+      this.db.prepare(
+        "INSERT OR IGNORE INTO docket_group_items (group_id, delivery_id, added_by, added_at) VALUES (?, ?, ?, ?)"
+      ).bind(groupId, deliveryId, addedBy || null, now),
+      this.db.prepare("UPDATE docket_groups SET updated_at = ? WHERE id = ?").bind(now, groupId)
+    ]);
+    return await this.getGroupById(groupId);
+  }
+  async removeDeliveryFromGroup(groupId, deliveryId) {
+    await this.ensureSchemaReady();
+    const group = await this.db.prepare("SELECT id FROM docket_groups WHERE id = ?").bind(groupId).first();
+    if (!group) throw new Error(`Docket group not found: ${groupId}`);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    await this.db.batch([
+      this.db.prepare("DELETE FROM docket_group_items WHERE group_id = ? AND delivery_id = ?").bind(groupId, deliveryId),
+      this.db.prepare("UPDATE docket_groups SET updated_at = ? WHERE id = ?").bind(now, groupId)
+    ]);
+    return await this.getGroupById(groupId);
+  }
+  async deleteGroup(groupId) {
+    await this.ensureSchemaReady();
+    const existing = await this.db.prepare("SELECT id, name FROM docket_groups WHERE id = ?").bind(groupId).first();
+    if (!existing) {
+      return { deleted: false, id: groupId };
+    }
+    await this.db.batch([
+      this.db.prepare("DELETE FROM docket_group_items WHERE group_id = ?").bind(groupId),
+      this.db.prepare("DELETE FROM docket_groups WHERE id = ?").bind(groupId)
+    ]);
+    return { deleted: true, id: groupId, name: existing.name };
+  }
+  normalizePartMatchCode(raw) {
+    return String(raw || "").trim().toUpperCase().replace(/^P(?:ART)?\s*[:#-]?\s*/i, "").trim();
+  }
+  /**
+   * Scan a part code against a manually curated Docket Group.
+   * - Identifies which member docket owns the part.
+   * - Rejects parts not belonging to any docket in the group.
+   * - Requires explicit operator docket allocation (`targetDeliveryId` + `targetPartId`) when >1 docket matches.
+   * - Strictly commits using the authenticated server session user.
+   */
+  async scanGroupPart(groupId, input) {
+    const group = await this.getGroupById(groupId);
+    if (!group) {
+      throw new Error(`Docket group not found: ${groupId}`);
+    }
+    if (group.deliveryIds.length === 0) {
+      return {
+        status: "not_found",
+        matched: false,
+        message: `Group "${group.name}" has no dockets assigned.`
+      };
+    }
+    const cleanCode = String(input.code || "").trim();
+    if (!cleanCode) {
+      throw new Error("Scanned code is required.");
+    }
+    if (isIgnoredNonPartQrPayload(cleanCode)) {
+      return {
+        status: "ignored_non_part_qr",
+        matched: false,
+        message: "Ignored protective film QR payload."
+      };
+    }
+    if (input.targetDeliveryId && input.targetPartId) {
+      if (!group.deliveryIds.includes(input.targetDeliveryId)) {
+        throw new Error(
+          `Forbidden: Docket ${input.targetDeliveryId} is not a member of group "${group.name}".`
+        );
+      }
+      const delivery = await this.db.prepare("SELECT id, docket_number, supplier FROM deliveries WHERE id = ?").bind(input.targetDeliveryId).first();
+      const part = await this.db.prepare("SELECT * FROM delivery_parts WHERE delivery_id = ? AND id = ?").bind(input.targetDeliveryId, input.targetPartId).first();
+      if (!delivery || !part) {
+        throw new Error("Selected target part could not be found on the chosen docket.");
+      }
+      const qtyToCommit2 = input.receivedQuantity !== void 0 ? Number(input.receivedQuantity) : part.required_quantity;
+      const commitRes2 = await this.updatePartReceivedQuantity(delivery.id, part.id, {
+        receivedQuantity: qtyToCommit2,
+        mode: input.mode,
+        idempotencyKey: input.idempotencyKey,
+        scannedVia: input.scannedVia || "qr",
+        scannedCode: cleanCode,
+        status: "received",
+        notes: input.notes,
+        rawOcrText: input.rawOcrText,
+        userId: input.userId,
+        employeeName: input.employeeName,
+        employeeRole: input.employeeRole,
+        eventAction: "group_part_scan"
+      });
+      return {
+        ...commitRes2,
+        matched: true,
+        deliveryId: delivery.id,
+        docketNumber: delivery.docket_number,
+        supplier: delivery.supplier,
+        groupId
+      };
+    }
+    const placeholders = group.deliveryIds.map(() => "?").join(", ");
+    const deliveriesRes = await this.db.prepare(`SELECT id, docket_number, supplier FROM deliveries WHERE id IN (${placeholders})`).bind(...group.deliveryIds).all();
+    const partsRes = await this.db.prepare(
+      `SELECT * FROM delivery_parts WHERE delivery_id IN (${placeholders}) ORDER BY docket_line_index ASC`
+    ).bind(...group.deliveryIds).all();
+    const delById = new Map((deliveriesRes.results || []).map((d) => [d.id, d]));
+    const normUpper = cleanCode.toUpperCase();
+    const normCode = this.normalizePartMatchCode(cleanCode);
+    const barcodeIdxMatch = cleanCode.match(/^\d{4,10}-(\d{1,5})$/);
+    const docketNoSuffix = barcodeIdxMatch ? String(parseInt(barcodeIdxMatch[1], 10)) : null;
+    const candidates = [];
+    for (const part of partsRes.results || []) {
+      const del = delById.get(part.delivery_id);
+      if (!del) continue;
+      const pNorm = this.normalizePartMatchCode(part.part_number);
+      const pRawUpper = String(part.part_number || "").trim().toUpperCase();
+      const itemNorm = String(part.item_number || "").trim();
+      let matchedMode = null;
+      if (pRawUpper === normUpper || normCode && pNorm === normCode) {
+        matchedMode = "exact-part";
+      } else if (docketNoSuffix && itemNorm === docketNoSuffix) {
+        matchedMode = "docket-no";
+      } else if (itemNorm === cleanCode) {
+        matchedMode = "exact-item";
+      }
+      if (matchedMode) {
+        candidates.push({
+          deliveryId: del.id,
+          docketNumber: del.docket_number,
+          supplier: del.supplier,
+          part,
+          matchedMode
+        });
+      }
+    }
+    if (candidates.length === 0) {
+      return {
+        status: "not_found",
+        matched: false,
+        message: `Part "${cleanCode}" does not belong to any docket in group "${group.name}".`
+      };
+    }
+    const distinctDeliveries = new Set(candidates.map((c) => c.deliveryId));
+    if (distinctDeliveries.size > 1 || candidates.length > 1) {
+      if (distinctDeliveries.size > 1) {
+        return {
+          status: "ambiguous",
+          ambiguous: true,
+          matched: true,
+          message: `Part "${cleanCode}" appears in ${distinctDeliveries.size} dockets in group "${group.name}". Please select which docket to allocate this scan to.`,
+          conflictCandidates: candidates.map((c) => ({
+            deliveryId: c.deliveryId,
+            docketNumber: c.docketNumber,
+            supplier: c.supplier,
+            partId: c.part.id,
+            partNumber: c.part.part_number,
+            itemNumber: c.part.item_number,
+            description: c.part.description,
+            requiredQuantity: c.part.required_quantity,
+            receivedQuantity: c.part.received_quantity,
+            status: c.part.status,
+            matchedMode: c.matchedMode
+          }))
+        };
+      }
+    }
+    const chosen = candidates.find((c) => c.part.status === "outstanding") || candidates[0];
+    const qtyToCommit = input.receivedQuantity !== void 0 ? Number(input.receivedQuantity) : chosen.part.required_quantity;
+    const commitRes = await this.updatePartReceivedQuantity(chosen.deliveryId, chosen.part.id, {
+      receivedQuantity: qtyToCommit,
+      mode: input.mode,
+      idempotencyKey: input.idempotencyKey,
+      scannedVia: input.scannedVia || "qr",
+      scannedCode: cleanCode,
+      status: "received",
+      notes: input.notes,
+      rawOcrText: input.rawOcrText,
+      userId: input.userId,
+      employeeName: input.employeeName,
+      employeeRole: input.employeeRole,
+      eventAction: "group_part_scan"
+    });
+    return {
+      ...commitRes,
+      matched: true,
+      deliveryId: chosen.deliveryId,
+      docketNumber: chosen.docketNumber,
+      supplier: chosen.supplier,
+      groupId
+    };
   }
   /**
    * Record a scan event directly into the audit log
@@ -2523,8 +3247,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
             (SELECT COUNT(*) FROM (SELECT id, employee_code, role, active FROM users LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id FROM sessions LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id, revision, manually_edited, original_ocr_values, last_edited_by, last_edited_at, version, last_scanned_by_id, last_scanned_by_name FROM delivery_parts LIMIT 1)) +
-            (SELECT COUNT(*) FROM (SELECT id, version FROM deliveries LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, version, needs_review, review_reason FROM deliveries LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT id, idempotency_key, sequence_number FROM scan_events LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT id, name FROM docket_groups LIMIT 1)) +
+            (SELECT COUNT(*) FROM (SELECT group_id, delivery_id FROM docket_group_items LIMIT 1)) +
             (SELECT COUNT(*) FROM (SELECT seq, id FROM realtime_events LIMIT 1)) AS schema_ready`
       ).first();
       return true;
@@ -2574,6 +3300,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         supplier_profile TEXT NOT NULL DEFAULT 'laser_central',
         notes TEXT,
         version INTEGER NOT NULL DEFAULT 1,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        review_reason TEXT,
         created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -2654,6 +3382,20 @@ var PalletTrackDbService = class _PalletTrackDbService {
         delivery_version INTEGER,
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS docket_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS docket_group_items (
+        group_id TEXT NOT NULL REFERENCES docket_groups(id) ON DELETE CASCADE,
+        delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        added_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, delivery_id)
       )`
     ];
     const schemaBootstrapStatements = [
@@ -2676,7 +3418,10 @@ var PalletTrackDbService = class _PalletTrackDbService {
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_events_idempotency ON scan_events(idempotency_key) WHERE idempotency_key IS NOT NULL",
       "CREATE INDEX IF NOT EXISTS idx_m1_delivery ON m1_synchronisations(delivery_id)",
       "CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events(seq ASC)",
-      "CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)"
+      "CREATE INDEX IF NOT EXISTS idx_realtime_events_delivery_seq ON realtime_events(delivery_id, seq ASC)",
+      "CREATE INDEX IF NOT EXISTS idx_docket_groups_created_at ON docket_groups(created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_docket_group_items_delivery ON docket_group_items(delivery_id)",
+      "CREATE INDEX IF NOT EXISTS idx_docket_group_items_group ON docket_group_items(group_id)"
     ];
     try {
       await this.db.batch(schemaBootstrapStatements.map((sql) => this.db.prepare(sql)));
@@ -2704,6 +3449,8 @@ var PalletTrackDbService = class _PalletTrackDbService {
         { table: "scan_events", col: "idempotency_key", sql: "ALTER TABLE scan_events ADD COLUMN idempotency_key TEXT" },
         { table: "scan_events", col: "sequence_number", sql: "ALTER TABLE scan_events ADD COLUMN sequence_number INTEGER" },
         { table: "deliveries", col: "version", sql: "ALTER TABLE deliveries ADD COLUMN version INTEGER NOT NULL DEFAULT 1" },
+        { table: "deliveries", col: "needs_review", sql: "ALTER TABLE deliveries ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0" },
+        { table: "deliveries", col: "review_reason", sql: "ALTER TABLE deliveries ADD COLUMN review_reason TEXT" },
         { table: "delivery_parts", col: "revision", sql: "ALTER TABLE delivery_parts ADD COLUMN revision TEXT" },
         { table: "delivery_parts", col: "manually_edited", sql: "ALTER TABLE delivery_parts ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0" },
         { table: "delivery_parts", col: "original_ocr_values", sql: "ALTER TABLE delivery_parts ADD COLUMN original_ocr_values TEXT" },
@@ -3829,7 +4576,7 @@ var PalletTrackRealtimeBroker = class {
       if (deliveryId) {
         rowsRes = await db.prepare(
           `SELECT * FROM realtime_events
-             WHERE seq > ? AND (delivery_id = ? OR delivery_id IS NULL OR event_type LIKE 'delivery:%')
+             WHERE seq > ? AND (delivery_id = ? OR delivery_id IS NULL OR event_type LIKE 'delivery:%' OR event_type LIKE 'deliveries:%' OR event_type LIKE 'group:%')
              ORDER BY seq ASC
              LIMIT 300`
         ).bind(sinceSeq, deliveryId).all();
@@ -3997,6 +4744,10 @@ function buildClearCookieHeader() {
 }
 function isAdminRole(role) {
   return role === "super_admin" || role === "admin";
+}
+function isSupervisorOrAdminRole(role) {
+  const r = (role || "").trim().toLowerCase();
+  return r === "super_admin" || r === "admin" || r === "supervisor";
 }
 function isEmployeeRole(role) {
   return role === "employee" || role === "operator";
@@ -4358,24 +5109,71 @@ async function handlePalletTrackApiRequest(request, db, env) {
           return errorResponse("Missing required delivery docketNumber", 400);
         }
         body.createdBy = currentUser.id;
-        const created = await service.createDelivery(body);
-        if (created) {
-          const rtEvent = await realtimeBroker.publishEvent(db, {
-            type: "delivery:created",
-            deliveryId: created.id,
-            userId: currentUser.id,
-            employeeName: currentUser.employeeName,
-            employeeRole: currentUser.role,
-            deliveryVersion: created.version || 1,
-            payload: {
-              delivery: created,
-              createdByName: currentUser.employeeName
-            }
-          });
-          return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+        try {
+          const created = await service.createDelivery(body);
+          if (created) {
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "delivery:created",
+              deliveryId: created.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: created.version || 1,
+              payload: {
+                delivery: created,
+                createdByName: currentUser.employeeName
+              }
+            });
+            return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+          }
+          return jsonResponse(created, 201);
+        } catch (err) {
+          if (err?.code === "DUPLICATE_DOCKET" || err?.status === 409) {
+            return new Response(
+              JSON.stringify({
+                error: err.message,
+                code: "DUPLICATE_DOCKET",
+                existingDeliveryId: err.existingDeliveryId
+              }),
+              {
+                status: 409,
+                headers: { "Content-Type": "application/json", ...CORS_HEADERS }
+              }
+            );
+          }
+          throw err;
         }
-        return jsonResponse(created, 201);
       }
+    }
+    if (path3 === "/api/deliveries/clear-all" && method === "POST") {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+      if (!isSupervisorOrAdminRole(currentUser.role)) {
+        return errorResponse(
+          "Forbidden: Only Super Admin, Admin, or Supervisor roles can clear all dockets.",
+          403,
+          "FORBIDDEN"
+        );
+      }
+      const cleared = await service.clearAllDeliveries();
+      const rtEvent = await realtimeBroker.publishEvent(db, {
+        type: "deliveries:cleared",
+        userId: currentUser.id,
+        employeeName: currentUser.employeeName,
+        employeeRole: currentUser.role,
+        payload: {
+          deletedDeliveriesCount: cleared.deletedDeliveriesCount,
+          clearedBy: currentUser.employeeName
+        }
+      });
+      return jsonResponse({
+        success: true,
+        deletedDeliveries: cleared.deletedDeliveriesCount,
+        deletedGroups: cleared.deletedGroupsCount,
+        ...cleared,
+        sequenceNumber: rtEvent.sequenceNumber
+      });
     }
     const deliveryPathMatch = path3.match(/^\/api\/deliveries\/([^/]+)(.*)$/);
     if (deliveryPathMatch) {
@@ -4425,18 +5223,52 @@ async function handlePalletTrackApiRequest(request, db, env) {
           return jsonResponse(updated);
         }
         if (method === "DELETE") {
-          if (isEmployeeRole(currentUser.role)) {
+          if (!isSupervisorOrAdminRole(currentUser.role)) {
             return errorResponse(
-              "Forbidden: Employees cannot delete deliveries.",
+              "Forbidden: Only Super Admin, Admin, or Supervisor roles can delete dockets.",
               403,
               "FORBIDDEN"
             );
           }
+          if (url.searchParams.get("completedOnly") === "1") {
+            const targetDel = await service.getDeliveryById(deliveryId);
+            if (!targetDel) {
+              return errorResponse(`Delivery not found: ${deliveryId}`, 404, "NOT_FOUND");
+            }
+            const isDone = targetDel.status === "completed" || targetDel.parts.length > 0 && targetDel.parts.every(
+              (p) => p.status === "received" && (p.verificationStatus === "verified" || (p.receivedQuantity ?? 0) >= Math.max(1, p.quantity ?? 1))
+            );
+            if (!isDone) {
+              return errorResponse(
+                "Only completed dockets can be deleted individually. Complete all parts or use Clear All Dockets.",
+                409,
+                "INCOMPLETE_DOCKET_DELETE_BLOCKED"
+              );
+            }
+          }
           const deleted = await service.deleteDelivery(deliveryId);
-          if (!deleted) {
+          if (!deleted || !deleted.deleted) {
             return errorResponse(`Delivery not found: ${deliveryId}`, 404, "NOT_FOUND");
           }
-          return jsonResponse({ success: true, id: deliveryId });
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: "delivery:deleted",
+            deliveryId,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: {
+              deliveryId,
+              docketNumber: deleted.docketNumber,
+              deletedBy: currentUser.employeeName
+            }
+          });
+          return jsonResponse({
+            success: true,
+            deleted: true,
+            id: deliveryId,
+            docketNumber: deleted.docketNumber,
+            sequenceNumber: rtEvent.sequenceNumber
+          });
         }
       }
       if (subPath === "/parts" || subPath === "/parts/") {
@@ -4674,6 +5506,231 @@ async function handlePalletTrackApiRequest(request, db, env) {
         }
       }
     }
+    if (path3 === "/api/groups") {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+      if (method === "GET") {
+        const groups = await service.listGroups();
+        return jsonResponse(groups);
+      }
+      if (method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        if (!body?.name || !String(body.name).trim()) {
+          return errorResponse("Group name is required.", 400);
+        }
+        const created = await service.createGroup({
+          name: String(body.name).trim(),
+          deliveryIds: Array.isArray(body.deliveryIds) ? body.deliveryIds : [],
+          createdBy: currentUser.id
+        });
+        const rtEvent = await realtimeBroker.publishEvent(db, {
+          type: "group:created",
+          userId: currentUser.id,
+          employeeName: currentUser.employeeName,
+          employeeRole: currentUser.role,
+          payload: { group: created, actorName: currentUser.employeeName }
+        });
+        return jsonResponse({ ...created, sequenceNumber: rtEvent.sequenceNumber }, 201);
+      }
+    }
+    const groupMatch = path3.match(/^\/api\/groups\/([^/]+)(.*)$/);
+    if (groupMatch) {
+      const authResult = await authenticateSession();
+      if (authResult instanceof Response) return authResult;
+      const currentUser = authResult;
+      const groupId = decodeURIComponent(groupMatch[1]);
+      const subPath = groupMatch[2] || "";
+      if (subPath === "" || subPath === "/") {
+        if (method === "GET") {
+          const group = await service.getGroupById(groupId);
+          if (!group) {
+            return errorResponse(`Docket group not found: ${groupId}`, 404, "NOT_FOUND");
+          }
+          return jsonResponse(group);
+        }
+        if (method === "PATCH" || method === "PUT") {
+          const body = await request.json().catch(() => ({}));
+          try {
+            const updated = await service.updateGroup(
+              groupId,
+              {
+                name: body.name,
+                deliveryIds: Array.isArray(body.deliveryIds) ? body.deliveryIds : void 0
+              },
+              currentUser.id
+            );
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: "group:updated",
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              payload: { group: updated, actorName: currentUser.employeeName }
+            });
+            return jsonResponse({ ...updated, sequenceNumber: rtEvent.sequenceNumber });
+          } catch (err) {
+            return errorResponse(err?.message || "Failed to update docket group", 404, "NOT_FOUND");
+          }
+        }
+        if (method === "DELETE") {
+          const deleted = await service.deleteGroup(groupId);
+          if (!deleted.deleted) {
+            return errorResponse(`Docket group not found: ${groupId}`, 404, "NOT_FOUND");
+          }
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: "group:deleted",
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { groupId, name: deleted.name, deletedBy: currentUser.employeeName }
+          });
+          return jsonResponse({
+            success: true,
+            id: groupId,
+            sequenceNumber: rtEvent.sequenceNumber
+          });
+        }
+      }
+      if (subPath === "/dockets" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const idsToAdd = Array.isArray(body?.deliveryIds) ? body.deliveryIds : body?.deliveryId ? [body.deliveryId] : [];
+        if (idsToAdd.length === 0) {
+          return errorResponse("deliveryId or deliveryIds is required.", 400);
+        }
+        try {
+          let updatedGroup = null;
+          for (const dId of idsToAdd) {
+            updatedGroup = await service.addDeliveryToGroup(groupId, String(dId), currentUser.id);
+          }
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: "group:updated",
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { group: updatedGroup, actorName: currentUser.employeeName }
+          });
+          return jsonResponse({ ...updatedGroup, sequenceNumber: rtEvent.sequenceNumber });
+        } catch (err) {
+          return errorResponse(err?.message || "Failed to add docket to group", 404, "NOT_FOUND");
+        }
+      }
+      const removeMemberMatch = subPath.match(/^\/dockets\/([^/]+)\/?$/);
+      if (removeMemberMatch && method === "DELETE") {
+        const deliveryIdToRemove = decodeURIComponent(removeMemberMatch[1]);
+        try {
+          const updatedGroup = await service.removeDeliveryFromGroup(groupId, deliveryIdToRemove);
+          const rtEvent = await realtimeBroker.publishEvent(db, {
+            type: "group:updated",
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role,
+            payload: { group: updatedGroup, actorName: currentUser.employeeName }
+          });
+          return jsonResponse({ ...updatedGroup, sequenceNumber: rtEvent.sequenceNumber });
+        } catch (err) {
+          return errorResponse(err?.message || "Failed to remove docket from group", 404, "NOT_FOUND");
+        }
+      }
+      if (subPath === "/scan" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const scannedCode = String(body?.code ?? body?.scannedCode ?? "").trim();
+        if (!scannedCode) {
+          return errorResponse("Scanned part code is required.", 400);
+        }
+        try {
+          const result = await service.scanGroupPart(groupId, {
+            code: scannedCode,
+            scannedVia: body.scannedVia || body.scanType || "qr",
+            receivedQuantity: body.receivedQuantity !== void 0 ? Number(body.receivedQuantity) : void 0,
+            mode: body.mode,
+            targetDeliveryId: typeof body.targetDeliveryId === "string" ? body.targetDeliveryId : void 0,
+            targetPartId: typeof body.targetPartId === "string" ? body.targetPartId : void 0,
+            idempotencyKey: typeof body.idempotencyKey === "string" ? body.idempotencyKey : void 0,
+            notes: typeof body.notes === "string" ? body.notes : void 0,
+            rawOcrText: typeof body.rawOcrText === "string" ? body.rawOcrText : void 0,
+            userId: currentUser.id,
+            employeeName: currentUser.employeeName,
+            employeeRole: currentUser.role
+          });
+          if (result.status === "not_found") {
+            return new Response(
+              JSON.stringify({
+                ...result,
+                code: "PART_NOT_IN_GROUP",
+                error: result.message
+              }),
+              {
+                status: 404,
+                headers: { "Content-Type": "application/json", ...CORS_HEADERS }
+              }
+            );
+          }
+          if (result.status === "ambiguous") {
+            return new Response(
+              JSON.stringify({
+                ...result,
+                candidates: result.conflictCandidates || result.candidates || [],
+                code: "AMBIGUOUS_GROUP_PART",
+                error: result.message
+              }),
+              {
+                status: 409,
+                headers: { "Content-Type": "application/json", ...CORS_HEADERS }
+              }
+            );
+          }
+          if (result.duplicate) {
+            await realtimeBroker.publishEvent(db, {
+              type: "part:duplicate_rejected",
+              deliveryId: result.deliveryId,
+              partId: result.part?.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              payload: {
+                part: result.part,
+                alreadyScannedBy: result.alreadyScannedBy,
+                alreadyScannedAt: result.alreadyScannedAt,
+                attemptedBy: currentUser.employeeName,
+                message: result.message
+              }
+            });
+            return jsonResponse(result, 409);
+          }
+          if (!result.idempotentReplay && result.part && result.deliveryId) {
+            const eventType = body.scannedVia === "manual" || result.part.verificationStatus === "quantity_mismatch" && Number(result.part.receivedQuantity) < Number(result.part.quantity) ? "quantity:updated" : "part:scanned";
+            const rtEvent = await realtimeBroker.publishEvent(db, {
+              type: eventType,
+              deliveryId: result.deliveryId,
+              partId: result.part.id,
+              userId: currentUser.id,
+              employeeName: currentUser.employeeName,
+              employeeRole: currentUser.role,
+              deliveryVersion: result.deliveryVersion || 1,
+              payload: {
+                part: result.part,
+                scanEvent: result.scanEvent,
+                scannedByName: currentUser.employeeName,
+                receivedQuantity: result.part.receivedQuantity,
+                requiredQuantity: result.part.quantity,
+                deliveryStats: result.deliveryStats,
+                deliveryVersion: result.deliveryVersion || 1,
+                groupId
+              }
+            });
+            return jsonResponse({ ...result, sequenceNumber: rtEvent.sequenceNumber }, 200);
+          }
+          return jsonResponse(result, 200);
+        } catch (err) {
+          const isForbidden = String(err?.message || "").startsWith("Forbidden:");
+          return errorResponse(
+            err?.message || "Group scan failed",
+            isForbidden ? 403 : 400,
+            isForbidden ? "FORBIDDEN" : "BAD_REQUEST"
+          );
+        }
+      }
+    }
     return null;
   } catch (err) {
     console.error("PartTrack API Error:", err);
@@ -4708,7 +5765,7 @@ app.use(express.static(path2.resolve(__dirname, "public")));
 app.use("/tesseract", express.static(path2.resolve(__dirname, "node_modules/tesseract.js/dist")));
 var localDb = getLocalDevDatabase();
 app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path.startsWith("/api/realtime") || req.path === "/api/health") {
+  if (req.path.startsWith("/api/deliveries") || req.path.startsWith("/api/groups") || req.path.startsWith("/api/users") || req.path.startsWith("/api/auth") || req.path.startsWith("/api/realtime") || req.path === "/api/health") {
     try {
       const url = `${req.protocol}://${req.get("host") || "localhost:3000"}${req.originalUrl}`;
       const headers = new Headers();
@@ -4807,17 +5864,17 @@ app.post("/api/extract-docket", async (req, res) => {
     );
     return res.status(200).json(result);
   } catch (err) {
-    const rawMsg = err?.message || String(err || "");
-    console.error("Gemini AI docket extraction error:", rawMsg);
-    const isMissingKey = rawMsg.includes("GEMINI_API_KEY");
-    const isRateLimited = err?.status === 429 || err?.code === "GEMINI_RATE_LIMIT_429" || rawMsg.includes("429") || rawMsg.includes("RESOURCE_EXHAUSTED");
-    const isHighDemand = !isMissingKey && (err?.status === 503 || err?.code === "GEMINI_HIGH_DEMAND_503" || rawMsg.includes("503") || rawMsg.toLowerCase().includes("high demand") || rawMsg.toLowerCase().includes("overloaded"));
-    const httpStatus = isMissingKey ? 503 : isHighDemand ? 503 : isRateLimited ? 429 : 500;
-    const errorCode = isMissingKey ? "MISSING_GEMINI_API_KEY" : isHighDemand ? "GEMINI_HIGH_DEMAND_503" : isRateLimited ? "GEMINI_RATE_LIMIT_429" : err?.code || "AI_EXTRACTION_FAILED";
-    return res.status(httpStatus).json({
-      error: isMissingKey ? "Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings." : rawMsg || "Gemini AI docket extraction failed.",
-      code: errorCode,
-      retryable: !isMissingKey
+    const { classifyGeminiError: classifyGeminiError2 } = await Promise.resolve().then(() => (init_docketOcr(), docketOcr_exports));
+    const classification = classifyGeminiError2(err);
+    console.error(
+      `Gemini AI docket extraction error [${classification.errorCode} / HTTP ${classification.statusCode}]:`,
+      classification.cleanMessage
+    );
+    const errorMessage = classification.errorCode === "MISSING_GEMINI_API_KEY" ? "Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings." : classification.errorCode === "GEMINI_AUTH_ERROR" ? `Gemini API authentication or permission error (HTTP ${classification.statusCode}): ${classification.cleanMessage}` : classification.errorCode === "GEMINI_INVALID_MODEL" ? `Designated Gemini model is unavailable or invalid (HTTP 404): ${classification.cleanMessage}` : classification.errorCode === "GEMINI_QUOTA_EXHAUSTED" ? `Gemini API quota exceeded (HTTP 429): ${classification.cleanMessage}` : classification.cleanMessage || "Gemini AI docket extraction failed.";
+    return res.status(classification.statusCode).json({
+      error: errorMessage,
+      code: classification.errorCode,
+      retryable: classification.isRetryableAvailabilityError || classification.isTimeout
     });
   }
 });

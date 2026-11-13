@@ -196,37 +196,28 @@ app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse
     );
     return res.status(200).json(result);
   } catch (err: any) {
-    const rawMsg = err?.message || String(err || '');
-    console.error('Gemini AI docket extraction error:', rawMsg);
-    const isMissingKey = rawMsg.includes('GEMINI_API_KEY');
-    const isRateLimited =
-      err?.status === 429 ||
-      err?.code === 'GEMINI_RATE_LIMIT_429' ||
-      rawMsg.includes('429') ||
-      rawMsg.includes('RESOURCE_EXHAUSTED');
-    const isHighDemand =
-      !isMissingKey &&
-      (err?.status === 503 ||
-        err?.code === 'GEMINI_HIGH_DEMAND_503' ||
-        rawMsg.includes('503') ||
-        rawMsg.toLowerCase().includes('high demand') ||
-        rawMsg.toLowerCase().includes('overloaded'));
+    const { classifyGeminiError } = await import('./src/server/docketOcr.ts');
+    const classification = classifyGeminiError(err);
+    console.error(
+      `Gemini AI docket extraction error [${classification.errorCode} / HTTP ${classification.statusCode}]:`,
+      classification.cleanMessage
+    );
 
-    const httpStatus = isMissingKey ? 503 : isHighDemand ? 503 : isRateLimited ? 429 : 500;
-    const errorCode = isMissingKey
-      ? 'MISSING_GEMINI_API_KEY'
-      : isHighDemand
-      ? 'GEMINI_HIGH_DEMAND_503'
-      : isRateLimited
-      ? 'GEMINI_RATE_LIMIT_429'
-      : err?.code || 'AI_EXTRACTION_FAILED';
-
-    return res.status(httpStatus).json({
-      error: isMissingKey
+    const errorMessage =
+      classification.errorCode === 'MISSING_GEMINI_API_KEY'
         ? 'Gemini AI API key is not configured on the server. Please set GEMINI_API_KEY in your server environment settings.'
-        : rawMsg || 'Gemini AI docket extraction failed.',
-      code: errorCode,
-      retryable: !isMissingKey,
+        : classification.errorCode === 'GEMINI_AUTH_ERROR'
+        ? `Gemini API authentication or permission error (HTTP ${classification.statusCode}): ${classification.cleanMessage}`
+        : classification.errorCode === 'GEMINI_INVALID_MODEL'
+        ? `Designated Gemini model is unavailable or invalid (HTTP 404): ${classification.cleanMessage}`
+        : classification.errorCode === 'GEMINI_QUOTA_EXHAUSTED'
+        ? `Gemini API quota exceeded (HTTP 429): ${classification.cleanMessage}`
+        : classification.cleanMessage || 'Gemini AI docket extraction failed.';
+
+    return res.status(classification.statusCode).json({
+      error: errorMessage,
+      code: classification.errorCode,
+      retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
     });
   }
 });

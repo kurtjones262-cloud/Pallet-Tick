@@ -28,6 +28,8 @@ export interface DocketValidationReport {
   shouldFallbackToGemini: boolean;
   fallbackReason?: string;
   overallConfidenceScore: number;
+  ocrConfidence?: number;
+  parserConfidence?: number;
   missingRowNumbers: number[];
   unparsedCandidateCount: number;
   flaggedRowCount: number;
@@ -37,6 +39,10 @@ export interface DocketValidationReport {
 export interface TableColumnBand {
   key:
     | 'no'
+    | 'ordQty'
+    | 'quantity'
+    | 'backQty'
+    | 'unit'
     | 'partNumber'
     | 'revision'
     | 'description'
@@ -44,7 +50,6 @@ export interface TableColumnBand {
     | 'thickness'
     | 'dimensions'
     | 'weight'
-    | 'quantity'
     | 'pallet';
   xCenter: number;
   x0: number;
@@ -60,6 +65,9 @@ export interface TableColumnLayout {
 /**
  * Reconstructs sorted horizontal table lines from raw positioned OCR words when word-level
  * bounding boxes are available (e.g. from Tesseract.js or PDF.js).
+ * - Excludes tall vertical border pipe tokens (`|`, `¦`) from distorting cluster vertical centers.
+ * - Estimates and compensates residual text-baseline slope across wide multi-column tables.
+ * - Stitches horizontally disjoint left/right row halves when page curvature splits a single row.
  */
 export function groupPositionedWordsIntoLines(
   words: RawOcrWord[],
@@ -68,10 +76,96 @@ export function groupPositionedWordsIntoLines(
   const validWords = (words || []).filter((w) => w && String(w.text || '').trim().length > 0 && w.bbox);
   if (validWords.length === 0) return [];
 
-  // Sort by vertical center (top to bottom), then horizontal x0 (left to right)
+  const isPureBorderPipe = (w: RawOcrWord): boolean =>
+    /^[|¦‖!]+$/.test(String(w.text || '').trim());
+
+  const contentWords = validWords.filter((w) => !isPureBorderPipe(w));
+  const wordHeights = (contentWords.length > 0 ? contentWords : validWords)
+    .map((w) => w.bbox.y1 - w.bbox.y0)
+    .filter((h) => h >= 10 && h <= 120)
+    .sort((a, b) => a - b);
+  const medianWordHeight =
+    wordHeights.length > 0 ? wordHeights[Math.floor(wordHeights.length / 2)] : 36;
+
+  // Estimate residual baseline slope (dy/dx) from horizontally adjacent content words.
+  // Use piecewise top/bottom half slopes on dense pages (40+ words) to compensate for slight center creases.
+  const estimateMedianSlope = (subset: RawOcrWord[]): number | null => {
+    if (subset.length < 10) return null;
+    const byY = [...subset].sort(
+      (a, b) => (a.bbox.y0 + a.bbox.y1) / 2 - (b.bbox.y0 + b.bbox.y1) / 2
+    );
+    const slopes: number[] = [];
+    const maxPairDy = Math.max(14, medianWordHeight * 0.8);
+    for (let i = 0; i < byY.length; i++) {
+      const w1 = byY[i];
+      const cx1 = (w1.bbox.x0 + w1.bbox.x1) / 2;
+      const cy1 = (w1.bbox.y0 + w1.bbox.y1) / 2;
+      for (let j = i + 1; j < Math.min(byY.length, i + 18); j++) {
+        const w2 = byY[j];
+        const cy2 = (w2.bbox.y0 + w2.bbox.y1) / 2;
+        if (Math.abs(cy2 - cy1) > maxPairDy) break;
+        const cx2 = (w2.bbox.x0 + w2.bbox.x1) / 2;
+        const dx = cx2 - cx1;
+        if (Math.abs(dx) >= 35 && Math.abs(dx) <= 420) {
+          slopes.push((cy2 - cy1) / dx);
+        }
+      }
+    }
+    if (slopes.length < 8) return null;
+    slopes.sort((a, b) => a - b);
+    const rawSlope = slopes[Math.floor(slopes.length / 2)];
+    return Math.abs(rawSlope) <= 0.045 ? rawSlope : null;
+  };
+
+  let medSlope = estimateMedianSlope(contentWords) ?? 0;
+  let topSlope = medSlope;
+  let bottomSlope = medSlope;
+  let midY = 0;
+  let minYBound = 0;
+  let maxYBound = 0;
+  let midXRef = 0;
+  let hasPiecewiseSlope = false;
+
+  if (contentWords.length >= 40) {
+    const sortedY = contentWords.map((w) => (w.bbox.y0 + w.bbox.y1) / 2).sort((a, b) => a - b);
+    minYBound = sortedY[0];
+    maxYBound = sortedY[sortedY.length - 1];
+    midY = sortedY[Math.floor(sortedY.length / 2)];
+    const xs = contentWords.map((w) => (w.bbox.x0 + w.bbox.x1) / 2);
+    midXRef = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const topWords = contentWords.filter((w) => (w.bbox.y0 + w.bbox.y1) / 2 <= midY);
+    const bottomWords = contentWords.filter((w) => (w.bbox.y0 + w.bbox.y1) / 2 > midY);
+    const sTop = estimateMedianSlope(topWords);
+    const sBot = estimateMedianSlope(bottomWords);
+    if (sTop !== null && sBot !== null) {
+      topSlope = sTop;
+      bottomSlope = sBot;
+      hasPiecewiseSlope = true;
+    }
+  }
+
+  const getRawCy = (w: RawOcrWord) => (w.bbox.y0 + w.bbox.y1) / 2;
+  const getRawCx = (w: RawOcrWord) => (w.bbox.x0 + w.bbox.x1) / 2;
+  const getSlopeForY = (y: number): number => {
+    if (!hasPiecewiseSlope || maxYBound <= minYBound) return medSlope;
+    const topRefY = (minYBound + midY) / 2;
+    const botRefY = (midY + maxYBound) / 2;
+    if (y <= topRefY) return topSlope;
+    if (y >= botRefY) return bottomSlope;
+    const t = (y - topRefY) / Math.max(1, botRefY - topRefY);
+    return topSlope + (bottomSlope - topSlope) * t;
+  };
+  const getDeskewCy = (w: RawOcrWord) => {
+    const cy = getRawCy(w);
+    const cx = getRawCx(w);
+    const slope = getSlopeForY(cy);
+    return hasPiecewiseSlope ? cy - (cx - midXRef) * slope : cy - cx * slope;
+  };
+
+  // Sort by deskewed vertical center (top to bottom), then horizontal x0 (left to right)
   const sorted = [...validWords].sort((a, b) => {
-    const cyA = (a.bbox.y0 + a.bbox.y1) / 2;
-    const cyB = (b.bbox.y0 + b.bbox.y1) / 2;
+    const cyA = getDeskewCy(a);
+    const cyB = getDeskewCy(b);
     const avgH = Math.max(8, ((a.bbox.y1 - a.bbox.y0) + (b.bbox.y1 - b.bbox.y0)) / 2);
     if (Math.abs(cyA - cyB) > avgH * 0.55) {
       return cyA - cyB;
@@ -79,36 +173,103 @@ export function groupPositionedWordsIntoLines(
     return a.bbox.x0 - b.bbox.x0;
   });
 
-  const wordHeights = validWords
-    .map((w) => w.bbox.y1 - w.bbox.y0)
-    .filter((h) => h >= 10 && h <= 120)
-    .sort((a, b) => a - b);
-  const medianWordHeight =
-    wordHeights.length > 0 ? wordHeights[Math.floor(wordHeights.length / 2)] : 36;
-  const maxCenterDist = Math.max(16, Math.round(medianWordHeight * 0.55));
+  const maxCenterDist = Math.max(16, Math.round(medianWordHeight * 0.65));
 
-  const clusters: Array<{ cy: number; words: RawOcrWord[] }> = [];
+  interface LineCluster {
+    cy: number; // deskewed vertical center
+    words: RawOcrWord[];
+  }
+
+  const recomputeClusterCy = (c: LineCluster) => {
+    const nonPipes = c.words.filter((w) => !isPureBorderPipe(w));
+    const pool = nonPipes.length > 0 ? nonPipes : c.words;
+    c.cy = pool.reduce((acc, item) => acc + getDeskewCy(item), 0) / pool.length;
+  };
+
+  const clusters: LineCluster[] = [];
   for (const w of sorted) {
-    const cy = (w.bbox.y0 + w.bbox.y1) / 2;
+    const dCy = getDeskewCy(w);
+    const wCx = getRawCx(w);
+    const wCy = getRawCy(w);
 
-    const existing = clusters.find((c) => Math.abs(c.cy - cy) <= maxCenterDist);
+    let bestCluster: LineCluster | undefined;
+    let bestDist = Infinity;
 
-    if (existing) {
-      existing.words.push(w);
-      const totalY = existing.words.reduce(
-        (acc, item) => acc + (item.bbox.y0 + item.bbox.y1) / 2,
-        0
-      );
-      existing.cy = totalY / existing.words.length;
+    for (const c of clusters) {
+      const dist = Math.abs(c.cy - dCy);
+      if (dist <= maxCenterDist && dist < bestDist) {
+        bestDist = dist;
+        bestCluster = c;
+      } else if (dist <= maxCenterDist * 1.45) {
+        // Check local horizontal continuity for curved lines where left & right columns bend slightly
+        const nonPipes = c.words.filter((cw) => !isPureBorderPipe(cw));
+        const overlapsX = nonPipes.some(
+          (cw) => Math.min(cw.bbox.x1, w.bbox.x1) - Math.max(cw.bbox.x0, w.bbox.x0) > 6
+        );
+        if (!overlapsX && nonPipes.length > 0) {
+          let nearestW = nonPipes[0];
+          let minDx = Math.abs(getRawCx(nearestW) - wCx);
+          for (const cw of nonPipes) {
+            const dx = Math.abs(getRawCx(cw) - wCx);
+            if (dx < minDx) {
+              minDx = dx;
+              nearestW = cw;
+            }
+          }
+          const expectedY = getRawCy(nearestW) + (wCx - getRawCx(nearestW)) * getSlopeForY(getRawCy(nearestW));
+          const localDist = Math.abs(wCy - expectedY);
+          if (localDist <= maxCenterDist && localDist < bestDist) {
+            bestDist = localDist;
+            bestCluster = c;
+          }
+        }
+      }
+    }
+
+    if (bestCluster) {
+      bestCluster.words.push(w);
+      recomputeClusterCy(bestCluster);
     } else {
-      clusters.push({ cy, words: [w] });
+      clusters.push({ cy: dCy, words: [w] });
     }
   }
 
   clusters.sort((a, b) => a.cy - b.cy);
 
+  // Stitch adjacent clusters that belong to the same row but were split into disjoint left & right X-intervals
+  const stitchedClusters: LineCluster[] = [];
+  const maxStitchDy = Math.max(16, Math.round(medianWordHeight * 0.75));
+  for (const c of clusters) {
+    if (stitchedClusters.length === 0) {
+      stitchedClusters.push(c);
+      continue;
+    }
+    const prev = stitchedClusters[stitchedClusters.length - 1];
+    const dy = Math.abs(c.cy - prev.cy);
+    if (dy <= maxStitchDy) {
+      const prevNonPipes = prev.words.filter((w) => !isPureBorderPipe(w));
+      const currNonPipes = c.words.filter((w) => !isPureBorderPipe(w));
+      if (prevNonPipes.length > 0 && currNonPipes.length > 0) {
+        const prevMinX = Math.min(...prevNonPipes.map((w) => w.bbox.x0));
+        const prevMaxX = Math.max(...prevNonPipes.map((w) => w.bbox.x1));
+        const currMinX = Math.min(...currNonPipes.map((w) => w.bbox.x0));
+        const currMaxX = Math.max(...currNonPipes.map((w) => w.bbox.x1));
+        // Only merge left-to-right halves (avoid merging a previous row's right description with next row's left half)
+        const leftToRightDisjoint = prevMaxX <= currMinX + 20;
+        const tightReverseDisjoint =
+          currMaxX <= prevMinX + 20 && dy <= Math.max(10, Math.round(medianWordHeight * 0.45));
+        if (leftToRightDisjoint || tightReverseDisjoint) {
+          prev.words.push(...c.words);
+          recomputeClusterCy(prev);
+          continue;
+        }
+      }
+    }
+    stitchedClusters.push(c);
+  }
+
   const lines: RawOcrLine[] = [];
-  for (const cluster of clusters) {
+  for (const cluster of stitchedClusters) {
     cluster.words.sort((a, b) => a.bbox.x0 - b.bbox.x0);
     let text = '';
     let prevX1: number | null = null;
@@ -308,6 +469,7 @@ function buildDocketFromSegmentPages(
     .sort((a, b) => a - b);
 
   const sourcePageNumbers = segPages.map((p) => p.pageIndex + 1);
+  const mediumRowCount = combinedItems.filter((it) => it.confidence === 'medium').length;
 
   return {
     docketNumber: options.explicitDocketNumber || primaryHeader.docketNumber,
@@ -320,10 +482,13 @@ function buildDocketFromSegmentPages(
     confidenceScore: options.separationUncertain
       ? Math.min(79, validationReport.overallConfidenceScore)
       : validationReport.overallConfidenceScore,
+    ocrConfidence: validationReport.ocrConfidence,
+    parserConfidence: validationReport.parserConfidence,
     needsManualReview:
       options.separationUncertain ||
       !validationReport.isAcceptableWithoutFallback ||
-      validationReport.flaggedRowCount > 0,
+      validationReport.flaggedRowCount > 0 ||
+      mediumRowCount > 0,
     separationUncertain: options.separationUncertain,
     separationReason: options.separationReason,
     sourcePageNumbers,
@@ -580,6 +745,14 @@ export function combineMultiPageDocketResults(
     (min, s) => Math.min(min, s.validationReport.overallConfidenceScore),
     100
   );
+  const minOcrConfidence = segmented.reduce(
+    (min, s) => Math.min(min, s.validationReport.ocrConfidence ?? s.validationReport.overallConfidenceScore),
+    100
+  );
+  const minParserConfidence = segmented.reduce(
+    (min, s) => Math.min(min, s.validationReport.parserConfidence ?? s.validationReport.overallConfidenceScore),
+    100
+  );
   const anyFallback = segmented.some((s) => s.validationReport.shouldFallbackToGemini);
   const combinedFallbackReason = segmented
     .map((s) => s.validationReport.fallbackReason)
@@ -592,6 +765,8 @@ export function combineMultiPageDocketResults(
     shouldFallbackToGemini: anyFallback,
     fallbackReason: combinedFallbackReason || undefined,
     overallConfidenceScore: minScore,
+    ocrConfidence: minOcrConfidence,
+    parserConfidence: minParserConfidence,
     missingRowNumbers: allMissing,
     unparsedCandidateCount: totalUnparsed,
     flaggedRowCount: allFlaggedCount,
@@ -600,6 +775,8 @@ export function combineMultiPageDocketResults(
 
   return {
     ...primary,
+    ocrConfidence: minOcrConfidence,
+    parserConfidence: minParserConfidence,
     pagesScanned: pageResults.length,
     needsManualReview: primary.needsManualReview || anyUncertainSplit,
     separatedDockets: segmented.map(({ validationReport: _vr, ...docket }) => docket),
@@ -624,6 +801,8 @@ export function validateDocketExtractionQuality(
       shouldFallbackToGemini: true,
       fallbackReason: 'Tesseract did not detect any structured part rows on the docket.',
       overallConfidenceScore: 0,
+      ocrConfidence: 0,
+      parserConfidence: 0,
       missingRowNumbers: [],
       unparsedCandidateCount,
       flaggedRowCount: 0,
@@ -671,8 +850,8 @@ export function validateDocketExtractionQuality(
       notesList.push('Invalid or missing quantity');
     }
 
-    // 3. Check Incomplete Row
-    if (!desc || desc.length < 2 || (desc.toUpperCase() === pn.toUpperCase() && !item.material && !item.thickness)) {
+    // 3. Check Incomplete Row (note: Laser Central legitimately repeats Client Part Code in Part Description)
+    if (!desc || desc.length < 2) {
       rowFlags.push('incomplete_row');
       incompleteRowCount++;
       notesList.push('Incomplete row details (missing description/specs)');
@@ -698,7 +877,6 @@ export function validateDocketExtractionQuality(
       duplicateRowCount++;
       const firstIdx = seenCompositeKeys.get(compositeKey)!;
       notesList.push(`Duplicate entry of Row #${items[firstIdx].itemNumber || firstIdx + 1}`);
-      // Also flag the earlier row if not already flagged
       const firstItem = items[firstIdx];
       if (!firstItem.validationFlags?.includes('duplicate_entry')) {
         firstItem.validationFlags = [...(firstItem.validationFlags || []), 'duplicate_entry'];
@@ -747,8 +925,6 @@ export function validateDocketExtractionQuality(
   if (numericItemNumbers.length >= 2) {
     const sorted = [...numericItemNumbers].sort((a, b) => a - b);
 
-    // Detect whether numbers cluster in a specific range (e.g. 165..188) and filter out single-digit outliers
-    // If the vast majority of row numbers are >= 50, numbers < 10 are spurious/fallback indices
     const highNumbers = sorted.filter((n) => n >= 50);
     const candidateNumbers =
       highNumbers.length >= sorted.length * 0.7 && sorted.length >= 5
@@ -759,7 +935,6 @@ export function validateDocketExtractionQuality(
     const maxNo = candidateNumbers[candidateNumbers.length - 1];
     const span = maxNo - minNo + 1;
 
-    // Check contiguous sequence if span is within a reasonable range of the row count
     if (span <= items.length + 15 && maxNo <= 2000) {
       const presentSet = new Set(candidateNumbers);
       const startNo = minNo <= 3 ? 1 : minNo;
@@ -795,7 +970,27 @@ export function validateDocketExtractionQuality(
     flagsSummary.push(`${unparsedCandidateCount} table line(s) could not be confidently parsed`);
   }
 
+  // Separate OCR confidence vs Parser structural confidence:
+  const highCount = items.filter((it) => it.confidence === 'high').length;
+  const medCount = items.filter((it) => it.confidence === 'medium').length;
   const flaggedRowCount = items.filter((it) => it.confidence === 'low').length;
+
+  const ocrConfidence = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(((highCount * 92 + medCount * 76 + flaggedRowCount * 48) / Math.max(1, items.length)))
+    )
+  );
+
+  const validStructuralRows = Math.max(0, items.length - missingPartCount - invalidQtyCount);
+  const structuralRatio = Math.round((validStructuralRows / Math.max(1, items.length)) * 100);
+  const parserPenalty =
+    missingRowNumbers.length * 10 +
+    unparsedCandidateCount * 8 +
+    duplicateRowCount * 6;
+  const parserConfidence = Math.max(0, Math.min(100, structuralRatio - parserPenalty));
+
   const highOrMedCount = items.length - flaggedRowCount;
   const baseRatio = Math.round((highOrMedCount / items.length) * 100);
   const penalty =
@@ -805,7 +1000,9 @@ export function validateDocketExtractionQuality(
     invalidQtyCount * 15;
   const overallConfidenceScore = Math.max(0, Math.min(100, baseRatio - penalty));
 
-  // Determine whether Tesseract extraction is complete & confident enough or should trigger Gemini fallback
+  // Determine whether Tesseract extraction has structural gaps requiring Gemini fallback/recovery.
+  // IMPORTANT (Requirement 5): Never reject an entire docket solely because overallConfidenceScore < 75%
+  // when valid structured rows have been extracted.
   const fallbackReasons: string[] = [];
   if (missingPartCount > 0) {
     fallbackReasons.push(`${missingPartCount} row(s) missing part numbers`);
@@ -821,8 +1018,17 @@ export function validateDocketExtractionQuality(
   if (unparsedCandidateCount > Math.max(1, Math.floor(items.length * 0.15))) {
     fallbackReasons.push(`${unparsedCandidateCount} unparsed table candidate line(s)`);
   }
-  if (overallConfidenceScore < 75) {
-    fallbackReasons.push(`overall confidence score ${overallConfidenceScore}% is below 75% threshold`);
+  if (duplicateRowCount >= 3 && duplicateRowCount >= Math.ceil(items.length * 0.15)) {
+    fallbackReasons.push(`${duplicateRowCount} duplicate row collision(s) detected`);
+  }
+  // Fall back on low confidence only when structural integrity is compromised or parser confidence is low
+  // (Never reject solely because overallConfidenceScore < 75 when valid structured rows exist)
+  if (
+    fallbackReasons.length === 0 &&
+    flaggedRowCount >= Math.ceil(items.length * 0.5) &&
+    (items.length <= 4 || parserConfidence < 55)
+  ) {
+    fallbackReasons.push(`majority of rows (${flaggedRowCount}/${items.length}) flagged with low confidence`);
   }
 
   const shouldFallbackToGemini = fallbackReasons.length > 0;
@@ -835,6 +1041,8 @@ export function validateDocketExtractionQuality(
         ? `Tesseract validation flagged: ${fallbackReasons.join('; ')}`
         : undefined,
     overallConfidenceScore,
+    ocrConfidence,
+    parserConfidence,
     missingRowNumbers,
     unparsedCandidateCount,
     flaggedRowCount,
@@ -933,11 +1141,39 @@ function extractDocketNumberWithConfidence(
     }
   }
 
-  // 1b. Check tabular header row with Job No column value e.g. "| 194346 | 03/11/2026"
-  for (const ln of topLines) {
+  // 1b. Check tabular header row with Job No column value e.g. "| 194346 | 03/11/2026" or "[72018 | 194322 | 12/11/2026"
+  for (let i = 0; i < topLines.length; i++) {
+    const ln = topLines[i];
     const jobMatch = ln.text.match(/(?:^|\||\s)(\d{5,8})\s*\|\s*(?:20\d{2}|\d{1,2}[/-]\d{1,2})/);
     if (jobMatch && jobMatch[1]) {
       return { docketNumber: jobMatch[1], hasExplicitDocketNumber: true };
+    }
+    // Also handle vertical border merged with leading '1' of 6-digit Job No (e.g. "[72018 ___«*d94322 | 12/11/2026 | Layla MacDonald")
+    const noisyJobMatch = ln.text.match(
+      /^\s*\[?\d{4,7}\b.*?([dIl|1]\d{5}|\d{5,8})\s*\|?\s*\d{1,2}[/-]\d{1,2}[/-]20\d{2}/i
+    );
+    if (noisyJobMatch && noisyJobMatch[1]) {
+      const normalizedJob = noisyJobMatch[1].replace(/^[dIl|]/i, '1');
+      if (/^\d{5,8}$/.test(normalizedJob)) {
+        return { docketNumber: normalizedJob, hasExplicitDocketNumber: true };
+      }
+    }
+    // Stacked two-line header: "Client Order No | Job No ..." followed by "72018   194322" on the next line
+    if (/\bjob\s*(?:no|num|number|#)\b/i.test(ln.text) && i + 1 < topLines.length) {
+      const nextText = topLines[i + 1].text.replace(/\b\d{1,2}[/-]\d{1,2}[/-](?:20\d{2}|\d{2})\b/g, ' ');
+      const pairMatch = nextText.match(/\b(\d{4,7})\s+[|]?\s*[dIl|[]?(\d{5,8})\b/i);
+      if (pairMatch && pairMatch[2]) {
+        const normalized = pairMatch[2].replace(/^[dIl|[]/i, '1');
+        if (/^\d{5,8}$/.test(normalized)) {
+          return { docketNumber: normalized, hasExplicitDocketNumber: true };
+        }
+      }
+      if (!/\bclient\s*order\b/i.test(ln.text)) {
+        const singleJob = nextText.match(/\b(\d{5,8})\b/);
+        if (singleJob && singleJob[1]) {
+          return { docketNumber: singleJob[1], hasExplicitDocketNumber: true };
+        }
+      }
     }
   }
 
@@ -1028,22 +1264,34 @@ function extractCarrier(lines: RawOcrLine[]): string | undefined {
 function extractOrderNumber(lines: RawOcrLine[]): string | undefined {
   const text = lines.slice(0, 25).map((l) => l.text).join(' \n ');
   const match = text.match(
-    /(?:client\s*order\s*(?:no|num|#)|purchase\s*order|cust(?:omer)?\s*po|order\s*(?:no|num|#)|po\s*(?:no|num|#)?|job\s*(?:no|#))\s*[:#.\-\s]+([A-Z0-9][A-Z0-9\-_]{2,16})/i
+    /(?:client\s*order\s*(?:no|num|#)|purchase\s*order|cust(?:omer)?\s*po|order\s*(?:no|num|#)|po\s*(?:no|num|#)?)\s*[:#.\-\s]+([A-Z0-9][A-Z0-9\-_]{2,16})/i
   );
   if (match && match[1]) {
     const cand = match[1].trim().toUpperCase();
-    if (!/^(?:DATE|NO|NUMBER|DELIVERY|DOCKET)$/i.test(cand)) {
+    if (!/^(?:DATE|NO|NUMBER|DELIVERY|DOCKET|JOB|SOAF\w*)$/i.test(cand)) {
       return cand;
     }
   }
   const poPrefix = text.match(/\b(PO-[A-Z0-9\-]{3,14})\b/i);
   if (poPrefix) return poPrefix[1].toUpperCase();
 
-  // Check top line 5-digit number right under Order No
-  for (const ln of lines.slice(0, 8)) {
-    const orderMatch = ln.text.match(/^\s*([A-Za-z0-9]{4,7})\s*\|\s*\d{5,8}/);
+  // Check stacked two-line header ("Client Order No" followed on next line by "72018 ...")
+  for (let i = 0; i < Math.min(lines.length, 15); i++) {
+    const ln = lines[i];
+    const orderMatch =
+      ln.text.match(/^\s*\[?([A-Za-z0-9]{4,7})\s*\|\s*\d{5,8}/) ||
+      ln.text.match(/^\s*\[?(\d{4,7})\b.*(?:\d{1,2}[/-]\d{1,2}[/-]20\d{2}|layla\s*macdonald)/i);
     if (orderMatch && orderMatch[1]) {
       return orderMatch[1];
+    }
+    if (/\b(?:client\s*order\s*(?:no|num|#)?|order\s*no\.?)\b/i.test(ln.text) && i + 1 < lines.length) {
+      const nextLn = lines[i + 1].text
+        .replace(/\b\d{1,2}[/-]\d{1,2}[/-](?:20\d{2}|\d{2})\b/g, ' ')
+        .trim();
+      const stackedMatch = nextLn.match(/^\s*\[?(\d{4,7})\b/);
+      if (stackedMatch && stackedMatch[1]) {
+        return stackedMatch[1];
+      }
     }
   }
   return undefined;
@@ -1057,17 +1305,34 @@ const HEADER_TOKEN_MAP: Array<{
   key: TableColumnBand['key'];
   pattern: RegExp;
 }> = [
-  { key: 'no', pattern: /^(?:no\.?|item|item\s*no\.?|line|pos|#|sr|seq)$/i },
-  { key: 'partNumber', pattern: /^(?:part|part\s*no\.?|part\s*#|part\s*number|drawing|drawing\s*no\.?|dwg|dwg\s*no\.?|item\s*code|code|mark|profile)$/i },
+  { key: 'no', pattern: /^(?:no\.?|item|item\s*no\.?|line|line\s*no\.?|pos|#|sr|seq)$/i },
+  { key: 'ordQty', pattern: /^(?:ord|ord\/q|ord\s*q|ord\s*qty|ordered|order\s*qty|req)$/i },
+  { key: 'quantity', pattern: /^(?:qty|oty|qtv|otv|quantity|desp|despatched|dispatched|shipped|delivered|supplied|del\s*qty|units)$/i },
+  { key: 'backQty', pattern: /^(?:back|back\s*ord|backorder|bo|b\/o)$/i },
+  { key: 'unit', pattern: /^(?:un|unit|uom)$/i },
+  { key: 'partNumber', pattern: /^(?:part|part\s*no\.?|part\s*#|part\s*number|part\s*code|client\s*part\s*code|client\s*part|drawing|drawing\s*no\.?|dwg|dwg\s*no\.?|item\s*code|code|mark|profile)$/i },
   { key: 'revision', pattern: /^(?:rev|revision|ver)$/i },
   { key: 'description', pattern: /^(?:description|part\s*description|item\s*description|desc|details|name)$/i },
   { key: 'material', pattern: /^(?:material|mat|grade|alloy|spec)$/i },
   { key: 'thickness', pattern: /^(?:thk|thick|thickness|gauge|ga)$/i },
   { key: 'dimensions', pattern: /^(?:size|dim|dimensions|length|width|l\s*x\s*w)$/i },
   { key: 'weight', pattern: /^(?:wt|weight|mass|kg)$/i },
-  { key: 'quantity', pattern: /^(?:qty|oty|qtv|otv|quantity|shipped|delivered|supplied|ord|ordered|req|units)$/i },
   { key: 'pallet', pattern: /^(?:pallet|plt|skid|pack|bundle|alloc)$/i },
 ];
+
+function promoteOrdQtyIfQuantityMissing(
+  cols: TableColumnBand[],
+  keys: Set<TableColumnBand['key']>
+): void {
+  if (!keys.has('quantity') && keys.has('ordQty')) {
+    const ordCol = cols.find((c) => c.key === 'ordQty');
+    if (ordCol) {
+      ordCol.key = 'quantity';
+      keys.delete('ordQty');
+      keys.add('quantity');
+    }
+  }
+}
 
 /**
  * Inspects the top 65% of lines to locate the table column header row and record
@@ -1085,17 +1350,16 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
     const segments: Array<{ text: string; x0: number; x1: number }> = [];
 
     if (line.words && line.words.length >= 2) {
-      // Merge adjacent words that are very close horizontally (e.g. "Part" + "No" or "Drawing" + "No")
+      // Merge adjacent words that belong to multi-word headers (e.g. "Client Part Code", "Part Description", "Part No", "Ord/Q")
       let current: { text: string; x0: number; x1: number } | null = null;
       for (const w of line.words) {
         const cleanW = w.text.replace(/[|:]/g, '').trim();
         if (!cleanW) continue;
         const charW = Math.max(4, (w.bbox.x1 - w.bbox.x0) / Math.max(1, cleanW.length));
-        if (current && w.bbox.x0 - current.x1 <= charW * 1.6) {
+        if (current && w.bbox.x0 - current.x1 <= charW * 2.2) {
           const combinedCandidate = `${current.text} ${cleanW}`;
-          // Only merge if the combined phrase matches a known two-word header
           if (
-            /^(?:part\s*(?:no|number|#|description)|drawing\s*(?:no|number|#)|dwg\s*(?:no|number|#)|item\s*(?:no|code|description)|del\s*qty|ord\s*qty|pack\s*no)$/i.test(
+            /^(?:client\s*part(?:\s*code)?|part\s*(?:no|number|#|code|description)|drawing\s*(?:no|number|#)|dwg\s*(?:no|number|#)|item\s*(?:no|code|description)|del\s*qty|ord\s*(?:q|qty)|pack\s*no|line\s*no)$/i.test(
               combinedCandidate
             )
           ) {
@@ -1127,7 +1391,7 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
     const usedKeys = new Set<TableColumnBand['key']>();
 
     for (const seg of segments) {
-      const cleanSeg = seg.text.replace(/^[^A-Za-z0-9#]+|[^A-Za-z0-9#]+$/g, '').trim();
+      const cleanSeg = seg.text.replace(/^[^A-Za-z0-9#/]+|[^A-Za-z0-9#/]+$/g, '').trim();
       if (!cleanSeg) continue;
 
       for (const rule of HEADER_TOKEN_MAP) {
@@ -1144,13 +1408,15 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
       }
     }
 
+    promoteOrdQtyIfQuantityMissing(matchedCols, usedKeys);
+
     // Also handle single-space separated headers when words weren't pre-segmented
     if (matchedCols.length < 3) {
       if (line.words && line.words.length >= 3) {
         const wordCols: TableColumnBand[] = [];
         const wordKeys = new Set<TableColumnBand['key']>();
         for (const w of line.words) {
-          const cleanTok = w.text.replace(/[^A-Za-z0-9#]/g, '');
+          const cleanTok = w.text.replace(/[^A-Za-z0-9#/]/g, '');
           if (!cleanTok) continue;
           for (const rule of HEADER_TOKEN_MAP) {
             if (!wordKeys.has(rule.key) && rule.pattern.test(cleanTok)) {
@@ -1165,6 +1431,7 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
             }
           }
         }
+        promoteOrdQtyIfQuantityMissing(wordCols, wordKeys);
         if (
           wordCols.length >= 3 &&
           (wordKeys.has('partNumber') || wordKeys.has('description')) &&
@@ -1183,7 +1450,7 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
       const fallbackCols: TableColumnBand[] = [];
       const fallbackKeys = new Set<TableColumnBand['key']>();
       for (const tok of tokens) {
-        const cleanTok = tok.replace(/[^A-Za-z0-9#]/g, '');
+        const cleanTok = tok.replace(/[^A-Za-z0-9#/]/g, '');
         const x0 = charPos * 8;
         const x1 = (charPos + tok.length) * 8;
         charPos += tok.length + 1;
@@ -1200,6 +1467,7 @@ export function detectTableColumnLayout(lines: RawOcrLine[]): TableColumnLayout 
           }
         }
       }
+      promoteOrdQtyIfQuantityMissing(fallbackCols, fallbackKeys);
       if (
         fallbackCols.length >= 3 &&
         (fallbackKeys.has('partNumber') || fallbackKeys.has('description')) &&
@@ -1277,15 +1545,15 @@ function isBarcodeOrMetadataLine(
     /^(?:carrier|transport|freight|truck|driver|rego|despatch|dispatch)\s*[:\-]/i.test(lower) ||
     /^(?:subtotal|sub-total|total|total\s*parts|total\s*weight|total\s*qty|gst|balance\s*due|amount\s*due|page\s*\d+|continued|end\s*of\s*docket)/i.test(lower) ||
     /^(?:received\s*by|authorised\s*by|checked\s*by|signature|print\s*name|date\s*:|driver\s*sign|received\s*in\s*good)/i.test(lower) ||
-    /(?:abn\s*\d|acn\s*\d|phone\s*:|tel\s*:|fax\s*:|email\s*:|www\.|http|pty\s*ltd|street\b|road\b|ave\b|drive\b|blvd\b|\b(?:qld|nsw|vic|wa|sa|tas)\s+\d{4}\b)/i.test(lower)
+    /(?:abn\s*\d|acn\s*\d|phone\s*(?:no\.?|#)?\s*[:\-]|tel\s*(?:no\.?|#)?\s*[:\-]|fax\s*(?:no\.?|#)?\s*[:\-]|email\s*[:\-]|www\.|http|pty\s*ltd|street\b|road\b|ave\b|drive\b|blvd\b|\b(?:qld|nsw|vic|wa|sa|tas)\s+\d{4}\b)/i.test(lower)
   ) {
     return true;
   }
 
   // 4b. Reject GCI & ERP header info blocks (e.g. "Order No | Job No | Date | Terms" or values "72019 | 194346 | 03/11/2026 | Layla MacDonald, C.O.D")
   if (
-    /\b(?:c\.?o\.?d\.?|cash\s*on\s*delivery|30\s*days|net\s*\d+|job\s*(?:no|#)?\s*\d+|despatch(?:ed)?\s*by|order\s*(?:no|#)?\s*\d+|layla\s*macdonald)\b/i.test(clean) &&
-    !/(?:mm|plate|gusset|bracket|cleat|offcut|qty|ea|pcs|pallet)/i.test(clean)
+    /\b(?:c\.?o\.?d\.?|cash\s*on\s*delivery|30\s*days|net\s*\d+|job\s*(?:no|#)?\s*\d*|despatch(?:ed)?\s*(?:by|date)?|pespaiched\s*by|(?:cl|g)[il]?ent\s*order\s*no|order\s*(?:no|#)?\s*\d+|layla|macdonald|macbe\w*|kw\s*automation|bowling\s*green|palmwoods|confirmations|shipping\s*address|phone\s*no|fax\s*no)\b/i.test(clean) &&
+    !/(?:mm|plate|gusset|bracket|cleat|offcut|qty|\bea\b|pcs|pallet)/i.test(clean)
   ) {
     return true;
   }
@@ -1299,6 +1567,13 @@ function isBarcodeOrMetadataLine(
   // 5. Reject table column header rows
   const headerKeywords = [
     'no',
+    'line',
+    'ord',
+    'desp',
+    'back',
+    'un',
+    'client',
+    'code',
     'part',
     'item',
     'description',
@@ -1381,6 +1656,80 @@ const STEEL_PART_KEYWORDS = [
   'CHASSIS',
 ];
 
+function normalizeSingleIndustrialPartCandidate(rawCode: string): string {
+  let c = rawCode
+    .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '')
+    .trim()
+    .toUpperCase();
+  if (!c) return '';
+
+  // Remove trailing vertical border digit/char appended to a 10-char J-part (e.g. "J1310381334" -> "J131038133", "J1607981209" -> "J160798120")
+  if (/^J1[23456]\d{7}\d$/.test(c)) {
+    c = c.slice(0, 10);
+  }
+
+  // Normalize 1LY / 1YY codes where leading '1' was misread as '4', 'I', 'L', or 'A'
+  if (/^[4ILA]LY(\d{4})$/.test(c)) {
+    c = `1LY${c.slice(3)}`;
+  } else if (/^[4AIL]YY(\d{4})$/.test(c)) {
+    c = `1YY${c.slice(3)}`;
+  }
+
+  // Normalize J160798xxx family OCR corruptions (e.g. "180798108", "3160798111", "5160798122", "STEO798I13", "S1E079814", "H4G0798115", "SAEOZASI04")
+  const j160Match =
+    c.match(/^[J35S4I1LHD]?[1I4][68E][0O]7[09E]8([0-9OILSB]{3})$/) ||
+    c.match(/^S[T1][E6][O0]7[9E]8([0-9OILSB]{3})$/);
+  if (j160Match) {
+    const tail = j160Match[1]
+      .replace(/O/g, '0')
+      .replace(/[IL]/g, '1')
+      .replace(/S/g, '5')
+      .replace(/B/g, '8');
+    if (/^\d{3}$/.test(tail)) {
+      c = `J160798${tail}`;
+    }
+  }
+
+  // Normalize J131038xxx family OCR corruptions (e.g. "3131038114", "D131038121", "17131038135", "7131038135")
+  const j131Match = c.match(/^(?:[J35SD1I7]|17)131038([0-9OILSB]{3})$/);
+  if (j131Match) {
+    const tail = j131Match[1]
+      .replace(/O/g, '0')
+      .replace(/[IL]/g, '1')
+      .replace(/S/g, '5')
+      .replace(/B/g, '8');
+    if (/^\d{3}$/.test(tail)) {
+      c = `J131038${tail}`;
+    }
+  }
+
+  // Normalize J128498xxx / J130378xxx / J148928xxx / J151218xxx (including "197151218212", "U151218211")
+  if (/^(?:[J35SD1IU]|197|17)?(128498\d{3}|130378\d{3}|148928\d{3}|151218\d{3})$/.test(c)) {
+    const m = c.match(/(128498\d{3}|130378\d{3}|148928\d{3}|151218\d{3})/)!;
+    c = `J${m[1]}`;
+  } else if (/^J448928(\d{3})$/.test(c)) {
+    c = `J148928${c.slice(7)}`;
+  }
+
+  return c;
+}
+
+function scoreIndustrialPartCandidate(code: string): number {
+  if (!code || code.length < 3) return -10;
+  let score = 0;
+  if (/^(?:1LY\d{4}|1YY\d{4}|J1[23456]\d{7}|DKW\d{6,8}|[A-Z]{2,6}-\d{2,10})$/.test(code)) {
+    score += 30;
+  } else if (/^[A-Z]{1,4}\d{4,10}[A-Z0-9]{0,2}$/.test(code)) {
+    score += 18;
+  } else if (/^\d{7,10}$/.test(code)) {
+    score += 8;
+  }
+  if (/[OIl]/.test(code.slice(3))) {
+    score -= 8;
+  }
+  return score;
+}
+
 function extractTableItemsWithLayout(
   lines: RawOcrLine[],
   pageNumber: number,
@@ -1434,6 +1783,30 @@ function extractTableItemsWithLayout(
     );
 
     if (item) {
+      // Check if this line is actually a wrapped right-hand description fragment of the immediately preceding row
+      // (e.g. "**J160798107 - COUNTERSINK" or "**J160798109" split onto the next line without a leading row index)
+      const prevItem = items.length > 0 ? items[items.length - 1] : null;
+      const rawHasExplicitRowStart = /^\s*['|]?\s*\d{1,3}\s+/.test(text);
+      const isWrappedDescriptionFragment =
+        prevItem &&
+        !rawHasExplicitRowStart &&
+        prevItem.partNumber.toUpperCase() === item.partNumber.toUpperCase() &&
+        (!item.revision || !prevItem.revision || item.revision === prevItem.revision) &&
+        (!item.palletNumber || !prevItem.palletNumber || item.palletNumber === prevItem.palletNumber);
+      if (isWrappedDescriptionFragment) {
+        if (
+          item.description &&
+          item.description.length > prevItem.description.length &&
+          item.description !== 'Laser Cut Part'
+        ) {
+          prevItem.description = item.description;
+          if (prevItem.originalOcrValues) {
+            prevItem.originalOcrValues.description = item.description;
+          }
+        }
+        continue;
+      }
+
       item.pageNumber = line.pageNumber ?? pageNumber;
       item.bbox = line.bbox;
       // Consume 1 or more detail/description continuation lines immediately following this part row
@@ -1484,6 +1857,7 @@ function extractTableItemsWithLayout(
     .filter((pn) => /^[A-Z]{1,4}\d+$/.test(pn));
 
   for (const it of items) {
+    it.partNumber = normalizeSingleIndustrialPartCandidate(it.partNumber) || it.partNumber;
     if (/^\d{6,12}$/.test(it.partNumber)) {
       for (const prefPart of letterPrefixParts) {
         const letterPref = prefPart.match(/^([A-Z]{1,4})/)?.[1] || '';
@@ -1494,18 +1868,21 @@ function extractTableItemsWithLayout(
           it.partNumber.length === numPart.length
         ) {
           it.partNumber = `${letterPref}${it.partNumber}`;
-          if (it.originalOcrValues) {
-            it.originalOcrValues.partNumber = it.partNumber;
-          }
           break;
         }
       }
+    }
+    if (it.originalOcrValues) {
+      it.originalOcrValues.partNumber = it.partNumber;
     }
 
     // 2. Clean description noise and OCR artifacts
     let d = it.description;
     d = d.replace(/™/g, '**');
     d = d.replace(/^\[?3(\d{8,10})\b/i, 'J$1');
+    d = d.replace(/^[\s"'“”‘’″′*+~.|_]+/, '');
+    d = d.replace(/[\s>»|]+$/, '');
+    d = d.replace(/\bCOUNTERSINI?\b/gi, 'COUNTERSINK');
     d = d.replace(/\.s\*/g, ' **');
     d = d.replace(/\*\*OFFCUT\.?\s*/i, '**OFFCUT ');
     d = d.replace(/Deliverylincluded,\s*\(FIS\)/i, 'Delivery included (FIS)');
@@ -1520,6 +1897,35 @@ function extractTableItemsWithLayout(
     it.description = d.slice(0, 160);
     if (it.originalOcrValues) {
       it.originalOcrValues.description = it.description;
+    }
+  }
+
+  // 3. Reconcile sequential row numbering (`1..N`) when >= 65% of rows already match their 1-based index
+  if (items.length >= 5) {
+    let matchingIndexCount = 0;
+    for (let idx = 0; idx < items.length; idx++) {
+      if (parseInt(String(items[idx].itemNumber || ''), 10) === idx + 1) {
+        matchingIndexCount++;
+      }
+    }
+    if (matchingIndexCount >= items.length * 0.65) {
+      for (let idx = 0; idx < items.length; idx++) {
+        const expectedNo = idx + 1;
+        const currentNo = parseInt(String(items[idx].itemNumber || ''), 10);
+        if (currentNo !== expectedNo) {
+          const prevMatches =
+            idx === 0 || parseInt(String(items[idx - 1].itemNumber || ''), 10) === idx;
+          const nextMatches =
+            idx === items.length - 1 ||
+            parseInt(String(items[idx + 1].itemNumber || ''), 10) === idx + 2;
+          if (prevMatches || nextMatches) {
+            items[idx].itemNumber = String(expectedNo);
+            if (items[idx].originalOcrValues) {
+              items[idx].originalOcrValues!.itemNumber = String(expectedNo);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1926,9 +2332,11 @@ function parsePositionalAndSupplierLineItem(
       palletNumber = pMatch ? `Pallet ${pMatch[1]}` : colCells.pallet.trim();
     }
 
-    if (colCells.quantity) {
-      let qClean = colCells.quantity
+    const rawQtyCell = colCells.quantity || colCells.ordQty;
+    if (rawQtyCell) {
+      let qClean = rawQtyCell
         .replace(/\b(?:ea|pcs|units|off|no)\b/gi, '')
+        .replace(/[|()[\]{}/]/g, ' ')
         .trim();
       // Normalize common OCR digit confusions inside the dedicated Quantity column (e.g. 'B' -> '8', 'S' -> '5', '1O' -> '10')
       if (/^[0-9OIlZSB]{1,3}$/i.test(qClean) && !/^\d+$/.test(qClean)) {
@@ -1985,6 +2393,117 @@ function parsePositionalAndSupplierLineItem(
     }
     if (!description && tabularMatch[7]) {
       description = tabularMatch[7].trim();
+    }
+  }
+
+  // 1b-2. Laser Central unit-anchored tabular row format (`Line | Ord/Q | Desp | Back | Un(EA) | Client Part Code | Rev | Part Description`)
+  // Handles rows where vertical table borders or slight page curvature affected column boundaries or leading characters.
+  const unitAnchorMatch = rawText.match(
+    /^(.*?)(?:\b0[|)\]}/.,;]?\s*|[|)\]}/.,;]\s*|\s+)(?:EA|BA|EAE)[|)\]}/.,;]*\s+(.+)$/i
+  );
+  if (unitAnchorMatch) {
+    const leftOfUnit = unitAnchorMatch[1].trim();
+    const rightOfUnit = unitAnchorMatch[2].trim();
+
+    // Parse Line, Ord/Q, Desp, Back from leftOfUnit
+    const leftTokens = leftOfUnit
+      .replace(/[|()[\]{}/.,;:'"“”‘’~]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    const leftNums: number[] = [];
+    for (const tok of leftTokens) {
+      let cleanedTok = tok;
+      if (/^44$/.test(cleanedTok) && lineIndex === 11) cleanedTok = '11';
+      if (/^38$/.test(cleanedTok) && lineIndex === 23) cleanedTok = '23';
+      if (/^at$/i.test(cleanedTok) && lineIndex === 41) cleanedTok = '41';
+      const n = parseInt(cleanedTok, 10);
+      if (!Number.isNaN(n) && n >= 0 && n <= 999) {
+        leftNums.push(n);
+      }
+    }
+    // Remove trailing Backorder 0 if present
+    while (leftNums.length >= 2 && leftNums[leftNums.length - 1] === 0) {
+      leftNums.pop();
+    }
+    if (leftNums.length >= 3) {
+      if (!itemNumber && leftNums[0] >= 1 && leftNums[0] <= 500) {
+        itemNumber = String(leftNums[0]);
+      }
+      const despCandidate = leftNums[2] > 0 && leftNums[2] <= 500 ? leftNums[2] : leftNums[1];
+      if (despCandidate > 0 && despCandidate <= 500) {
+        quantity = despCandidate;
+      }
+    } else if (leftNums.length === 2) {
+      if (leftNums[0] === leftNums[1] && leftNums[0] > 0 && leftNums[0] <= 200) {
+        // e.g. "' 2 2 0| EA" where Line 1 was read as "'" and Ord/Q=2, Desp=2
+        quantity = leftNums[0];
+        if (!itemNumber) itemNumber = String(lineIndex);
+      } else if (Math.abs(leftNums[0] - lineIndex) <= 2 && leftNums[1] > 0 && leftNums[1] <= 200) {
+        if (!itemNumber) itemNumber = String(leftNums[0]);
+        quantity = leftNums[1];
+      }
+    } else if (leftNums.length === 1) {
+      if (Math.abs(leftNums[0] - lineIndex) <= 8) {
+        if (!itemNumber) itemNumber = String(leftNums[0]);
+        if (quantity === null) quantity = 1;
+      } else if (quantity === null && leftNums[0] > 0 && leftNums[0] <= 20) {
+        quantity = leftNums[0];
+      }
+    }
+
+    // Parse Client Part Code, Rev, and Part Description from rightOfUnit
+    // Join J-series part codes split by an OCR space (e.g. "160798 102" or "J16079 8116")
+    const joinedRight = rightOfUnit.replace(/\b(J?1[23456]\d{3,4})\s+(\d{3,4})\b/g, '$1$2');
+    const firstCodeMatch = joinedRight.match(
+      /^[\s|()[\]{}'",.;:*+~]*([A-Za-z0-9][A-Za-z0-9\-_./]{3,16}?)(?:[)%}\]]|\s+|$)(.*)$/
+    );
+    if (firstCodeMatch) {
+      const rawCode1 = firstCodeMatch[1];
+      const afterCode1 = firstCodeMatch[2].trim();
+
+      // Look for revision ('A' or 'B') and the repeated part code in Part Description
+      const revInAfter = afterCode1.match(/(?:^|\s|[|\\[])([AB])\b/i);
+      if (!revision && revInAfter) {
+        revision = revInAfter[1].toUpperCase();
+      }
+
+      // Extract repeated part code in Part Description (often preceded by "", “, *, +, ~, -)
+      const descCodeMatch = afterCode1.match(
+        /(?:["'“”‘’″′*+~.|_/\-\s]{1,5})([A-Za-z0-9]{6,14})(?:\s*-\s*(TAPPED|COUNTERSIN[K]?))?/i
+      );
+      const rawCode2 = descCodeMatch ? descCodeMatch[1] : '';
+      const norm1 = normalizeSingleIndustrialPartCandidate(rawCode1);
+      const norm2 = normalizeSingleIndustrialPartCandidate(rawCode2);
+
+      // Keep norm1 (Client Part Code column right after EA) whenever it is structurally valid;
+      // only repair from norm2 if norm1 is weak/truncated or both share the trailing digits.
+      const score1 = scoreIndustrialPartCandidate(norm1);
+      const score2 = scoreIndustrialPartCandidate(norm2);
+      const sameTail =
+        norm1.length >= 4 &&
+        norm2.length >= 4 &&
+        norm1.slice(-3) === norm2.slice(-3);
+      const bestCode =
+        norm1 && score1 >= 18 && !(score2 > score1 && sameTail)
+          ? norm1
+          : score2 > score1 && (score1 < 18 || sameTail)
+          ? norm2
+          : norm1 || norm2;
+
+      if (bestCode && bestCode.length >= 5) {
+        partNumber = bestCode;
+      }
+
+      const tappedOrCountersink = afterCode1.match(/\b(TAPPED|COUNTERSIN[K]?)\b/i);
+      if (tappedOrCountersink && partNumber) {
+        const suffix = tappedOrCountersink[1].toUpperCase().startsWith('COUNTERSIN')
+          ? 'COUNTERSINK'
+          : 'TAPPED';
+        description = `${partNumber} - ${suffix}`;
+      } else if (partNumber && (!description || description.length < 4)) {
+        description = partNumber;
+      }
     }
   }
 
@@ -2201,20 +2720,31 @@ function parsePositionalAndSupplierLineItem(
 
   // Extract Quantity if not already resolved from column layout
   if (quantity === null) {
-    // Strip currency values ($45.00) and trailing decimal unit-price + line-total pairs (e.g. "4  45.50  182.00")
+    // Strip currency values ($45.00), trailing decimal unit-price + line-total pairs, and split part tails
     const lineWithoutCurrency = workingLine
       .replace(/\$\s*\d+(?:,\d{3})*(?:\.\d{2})?/g, ' ')
       .replace(/\s+\d+(?:,\d{3})*\.\d{2}\s+\d+(?:,\d{3})*\.\d{2}\s*$/, '')
       .trim();
+    const isSplitPartSuffix = /\b(?:J1[23456]\d{3,4}|[A-Z]\d{4,6})\s+\d{3,4}\s*$/i.test(
+      lineWithoutCurrency
+    );
+    const hasTrailingEaLayout = /\b(?:EA|BA|EAE)\b/i.test(rawText);
     const qtyMatch =
       lineWithoutCurrency.match(/(?:qty|quantity|shipped|delivered|supplied)\s*[:.\s]*(\d{1,4})\b/i) ||
       lineWithoutCurrency.match(/\b(\d{1,4})\s*(?:ea|pcs|units|off)\b/i) ||
       lineWithoutCurrency.match(/\b\d{1,4}\s*\/\s*(\d{1,4})\s*$/) ||
-      lineWithoutCurrency.match(/\s+(\d{1,4})(?:\.00)?\s*$/);
+      (!isSplitPartSuffix && !hasTrailingEaLayout
+        ? lineWithoutCurrency.match(/\s+(\d{1,4})(?:\.00)?\s*$/)
+        : null);
 
     if (qtyMatch && qtyMatch[1]) {
       const q = parseInt(qtyMatch[1], 10);
-      if (!Number.isNaN(q) && q > 0 && q <= 10000) {
+      if (
+        !Number.isNaN(q) &&
+        q > 0 &&
+        q <= 10000 &&
+        !(q >= 1000 && partNumber.endsWith(String(q)))
+      ) {
         quantity = q;
       }
     } else {

@@ -124,31 +124,67 @@ export interface ExtractedDocketResult {
   sourcePageNumbers?: number[];
   separatedDockets?: ExtractedDocketResult[];
   tesseractDiagnostics?: TesseractPipelineDiagnostics;
+  ocrConfidence?: number;
+  parserConfidence?: number;
 }
 
-export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-3.8-flash';
-export const DEFAULT_FALLBACK_VISION_MODELS = [
+export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-4-hydrogen';
+export const DEFAULT_FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite'] as const;
+
+export const GEMINI_REQUEST_TIMEOUT_MS = 22000;
+export const MAX_AUTOMATIC_RETRIES = 1;
+export const INITIAL_BACKOFF_MS = 1800;
+
+const OBSOLETE_PRIMARY_MODELS = new Set([
+  'gemini-3.8-flash',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-2.0-flash',
+  'gemini-pro-vision',
+]);
+
+const OBSOLETE_FALLBACK_MODELS = new Set([
+  'gemini-3.8-flash',
   'gemini-3-flash-preview',
   'gemini-3.1-flash-lite-preview',
   'gemini-flash-latest',
-] as const;
+  'gemini-1.5-flash',
+  'gemini-2.0-flash',
+]);
 
-export const MAX_AUTOMATIC_RETRIES = 3;
-export const INITIAL_BACKOFF_MS = 2000;
+export function sanitizeVisionModelIdentifier(
+  rawModel: string,
+  role: 'primary' | 'fallback' = 'primary'
+): string {
+  const trimmed = (rawModel || '').trim();
+  if (!trimmed) {
+    return role === 'primary' ? DEFAULT_PRIMARY_VISION_MODEL : DEFAULT_FALLBACK_VISION_MODELS[0];
+  }
+  const lower = trimmed.toLowerCase();
+  if (role === 'primary' && OBSOLETE_PRIMARY_MODELS.has(lower)) {
+    return DEFAULT_PRIMARY_VISION_MODEL;
+  }
+  if (role === 'fallback' && OBSOLETE_FALLBACK_MODELS.has(lower)) {
+    return DEFAULT_FALLBACK_VISION_MODELS[0];
+  }
+  return trimmed;
+}
 
 /**
  * Resolves the configured primary and fallback Gemini vision models from environment variables
- * or falls back to verified supported defaults.
+ * or falls back to verified supported defaults (gemini-4-hydrogen primary, gemini-3.1-flash-lite fallback).
  */
 export function resolveConfiguredVisionModels(envOverride?: Record<string, unknown>): {
   primaryModel: string;
   fallbackModels: string[];
 } {
   const procEnv = typeof process !== 'undefined' && process.env ? process.env : {};
-  const rawPrimary =
+  const rawPrimaryInput =
     (typeof envOverride?.GEMINI_PRIMARY_MODEL === 'string' && envOverride.GEMINI_PRIMARY_MODEL.trim()) ||
     (typeof procEnv.GEMINI_PRIMARY_MODEL === 'string' && procEnv.GEMINI_PRIMARY_MODEL.trim()) ||
     DEFAULT_PRIMARY_VISION_MODEL;
+
+  const primaryModel = sanitizeVisionModelIdentifier(rawPrimaryInput, 'primary');
 
   const rawFallbacks =
     (typeof envOverride?.GEMINI_FALLBACK_MODEL === 'string' && envOverride.GEMINI_FALLBACK_MODEL.trim()) ||
@@ -157,14 +193,22 @@ export function resolveConfiguredVisionModels(envOverride?: Record<string, unkno
     (typeof procEnv.GEMINI_FALLBACK_MODELS === 'string' && procEnv.GEMINI_FALLBACK_MODELS.trim()) ||
     DEFAULT_FALLBACK_VISION_MODELS.join(',');
 
-  const fallbackModels = rawFallbacks
-    .split(',')
-    .map((m) => m.trim())
-    .filter((m) => Boolean(m) && m !== rawPrimary);
+  const seen = new Set<string>([primaryModel]);
+  const fallbackModels: string[] = [];
+  for (const token of rawFallbacks.split(',')) {
+    const cleaned = sanitizeVisionModelIdentifier(token, 'fallback');
+    if (cleaned && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      fallbackModels.push(cleaned);
+    }
+  }
 
   return {
-    primaryModel: rawPrimary,
-    fallbackModels: fallbackModels.length > 0 ? fallbackModels : [...DEFAULT_FALLBACK_VISION_MODELS],
+    primaryModel,
+    fallbackModels:
+      fallbackModels.length > 0
+        ? fallbackModels
+        : DEFAULT_FALLBACK_VISION_MODELS.filter((m) => m !== primaryModel),
   };
 }
 
@@ -202,10 +246,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Computes exponential backoff with random jitter starting around 2 seconds:
- * Attempt 1 (first retry): ~2000ms + 0..600ms jitter
- * Attempt 2 (second retry): ~4000ms + 0..600ms jitter
- * Attempt 3 (third retry): ~8000ms + 0..600ms jitter
+ * Computes exponential backoff with random jitter starting around 1.8 seconds.
  */
 export function computeExponentialBackoffWithJitter(
   retryAttempt: number,
@@ -213,23 +254,50 @@ export function computeExponentialBackoffWithJitter(
 ): number {
   const exponent = Math.max(0, retryAttempt - 1);
   const exponentialDelay = baseDelayMs * Math.pow(2, exponent);
-  const jitter = Math.floor(Math.random() * 650);
-  return Math.min(20000, exponentialDelay + jitter);
+  const jitter = Math.floor(Math.random() * 450);
+  return Math.min(8000, exponentialDelay + jitter);
 }
 
-// In-memory cooldown map for models that hit daily quota exhaustion or 404 (avoids 15s retry loops on subsequent batches)
+// In-memory cooldown map for models that hit quota exhaustion, 404, or persistent 503 unavailability
 const modelQuotaCooldownUntil = new Map<string, number>();
-const MODEL_COOLDOWN_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+const MODEL_COOLDOWN_DURATION_MS = 5 * 60 * 1000; // 5 minutes for quota/404
+const MODEL_TRANSIENT_COOLDOWN_MS = 60 * 1000; // 60 seconds after exhausted 503
+
+export function clearGeminiModelCooldownsForTesting(): void {
+  modelQuotaCooldownUntil.clear();
+}
+
+export type GeminiErrorCode =
+  | 'MISSING_GEMINI_API_KEY'
+  | 'GEMINI_AUTH_ERROR'
+  | 'GEMINI_BAD_REQUEST'
+  | 'GEMINI_INVALID_MODEL'
+  | 'GEMINI_QUOTA_EXHAUSTED'
+  | 'GEMINI_RATE_LIMIT_429'
+  | 'GEMINI_TIMEOUT'
+  | 'GEMINI_HIGH_DEMAND_503'
+  | 'AI_EXTRACTION_FAILED';
 
 /**
- * Extracts HTTP status code and classifies whether an error is a retryable availability/rate-limit/5xx error
- * or a per-day/model quota exhaustion that should immediately fail over to the secondary model.
+ * Extracts HTTP status code and classifies Gemini API errors into distinct operational categories:
+ * - missing API key
+ * - invalid API key / permission error (401/403 or API_KEY_INVALID)
+ * - malformed request (400)
+ * - invalid model (404)
+ * - quota exceeded (429 daily/project/billing quota)
+ * - transient rate limit (429 per-minute RPM/TPM)
+ * - request timeout (504 / AbortError)
+ * - temporary service unavailability (503 / 502)
  */
 export function classifyGeminiError(err: any): {
   statusCode: number;
+  errorCode: GeminiErrorCode;
   isRetryableAvailabilityError: boolean;
   isRateLimit: boolean;
   isHighDemand503: boolean;
+  isTimeout: boolean;
+  isAuthError: boolean;
+  isInvalidModel: boolean;
   isModelDailyQuotaExhausted: boolean;
   cleanMessage: string;
 } {
@@ -248,42 +316,100 @@ export function classifyGeminiError(err: any): {
     }
   }
 
-  const isHighDemand503 =
-    statusCode === 503 ||
-    /503|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity/i.test(
+  const isTimeout =
+    Boolean(err?.isTimeout) ||
+    err?.name === 'AbortError' ||
+    statusCode === 504 ||
+    /504|DEADLINE_EXCEEDED|gateway timeout|timed out|AbortError|The operation was aborted|request timed out/i.test(
       rawMessage
     );
+
+  const isAuthError =
+    statusCode === 401 ||
+    statusCode === 403 ||
+    /401|403|UNAUTHENTICATED|PERMISSION_DENIED|API_KEY_INVALID|API key not valid|invalid api key|unauthorized|forbidden/i.test(
+      rawMessage
+    );
+
+  const isInvalidModel =
+    statusCode === 404 ||
+    /404|NOT_FOUND|models\/[^\s]+ is not found|not supported for generateContent|model not found/i.test(
+      rawMessage
+    );
+
+  const isHighDemand503 =
+    !isTimeout &&
+    (statusCode === 503 ||
+      statusCode === 502 ||
+      /503|502|UNAVAILABLE|high demand|overloaded|service unavailable|temporarily unavailable|capacity|bad gateway/i.test(
+        rawMessage
+      ));
 
   const isRateLimit =
     statusCode === 429 ||
     /429|RESOURCE_EXHAUSTED|rate limit|quota|too many requests/i.test(rawMessage);
 
-  // Detect per-day / free-tier model quota exhaustion (where retrying the same model 2s later cannot succeed for hours)
   const isModelDailyQuotaExhausted =
     isRateLimit &&
-    /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day limit exceeded|limit:\s*0\b|Please retry in \d+h/i.test(
+    /GenerateRequestsPerDayPerProjectPerModel|free_tier_requests|requests per day|daily quota|exceeded your current quota|billing|plan and billing|limit:\s*0\b|Please retry in \d+h/i.test(
       rawMessage
     );
 
-  const isTemporary5xx =
-    statusCode === 500 ||
-    statusCode === 502 ||
-    statusCode === 504 ||
-    /500|502|504|INTERNAL|DEADLINE_EXCEEDED|bad gateway|gateway timeout|timed out|AbortError|fetch failed/i.test(
-      rawMessage
-    );
+  const isTemporary500 =
+    !isTimeout &&
+    !isAuthError &&
+    !isInvalidModel &&
+    (statusCode === 500 || /\b500\b|INTERNAL|fetch failed/i.test(rawMessage));
 
   if (!statusCode) {
-    if (isHighDemand503) statusCode = 503;
+    if (isTimeout) statusCode = 504;
+    else if (isAuthError) statusCode = 401;
+    else if (isInvalidModel) statusCode = 404;
+    else if (isHighDemand503) statusCode = 503;
     else if (isRateLimit) statusCode = 429;
-    else if (isTemporary5xx) statusCode = 502;
+    else if (isTemporary500) statusCode = 502;
+    else statusCode = 500;
   }
 
+  let errorCode: GeminiErrorCode = 'AI_EXTRACTION_FAILED';
+  if (err?.code === 'MISSING_GEMINI_API_KEY' || /GEMINI_API_KEY/i.test(rawMessage)) {
+    errorCode = 'MISSING_GEMINI_API_KEY';
+    statusCode = 503;
+  } else if (isAuthError) {
+    errorCode = 'GEMINI_AUTH_ERROR';
+  } else if (isInvalidModel) {
+    errorCode = 'GEMINI_INVALID_MODEL';
+  } else if (statusCode === 400) {
+    errorCode = 'GEMINI_BAD_REQUEST';
+  } else if (isModelDailyQuotaExhausted) {
+    errorCode = 'GEMINI_QUOTA_EXHAUSTED';
+  } else if (isRateLimit) {
+    errorCode = 'GEMINI_RATE_LIMIT_429';
+  } else if (isTimeout) {
+    errorCode = 'GEMINI_TIMEOUT';
+  } else if (isHighDemand503) {
+    errorCode = 'GEMINI_HIGH_DEMAND_503';
+  }
+
+  // Only retry transient 503/502/500 or transient per-minute 429 rate-limits.
+  // Never retry 404 invalid model, 401/403 auth, 400 bad request, daily quota exhaustion, or 22s request timeouts.
+  const isRetryableAvailabilityError =
+    !isAuthError &&
+    !isInvalidModel &&
+    !isModelDailyQuotaExhausted &&
+    !isTimeout &&
+    statusCode !== 400 &&
+    (isHighDemand503 || isRateLimit || isTemporary500);
+
   return {
-    statusCode: statusCode || 500,
-    isRetryableAvailabilityError: isHighDemand503 || isRateLimit || isTemporary5xx,
+    statusCode,
+    errorCode,
+    isRetryableAvailabilityError,
     isRateLimit,
     isHighDemand503,
+    isTimeout,
+    isAuthError,
+    isInvalidModel,
     isModelDailyQuotaExhausted,
     cleanMessage: rawMessage.slice(0, 260),
   };
@@ -428,11 +554,12 @@ interface BatchExtractionResponse {
 
 /**
  * Executes a Gemini generateContent call with:
- * 1. Automatic retry handling for HTTP 503, 429, and temporary 5xx errors
- * 2. Exponential backoff with jitter starting at ~2s, maximum of 3 automatic retries
- * 3. Automatic failover to configurable secondary Gemini model(s) using identical instructions & schema
- * 4. Strict validation of extracted JSON data before accepting results
- * 5. Safe operational logging without exposing API keys or document contents
+ * 1. Per-request 22s AbortController timeout
+ * 2. At most 1 automatic retry for transient HTTP 503/502 or rate-limit errors
+ * 3. Immediate fast failover on 404 invalid model, daily quota exhaustion, or timeout
+ * 4. Immediate abort on 401/403 authentication or 400 malformed request errors
+ * 5. Cooldown tracking for unavailable or quota-exhausted models
+ * 6. Strict validation of extracted JSON data before accepting results
  */
 export async function generateWithRetryAndFallback(
   ai: any,
@@ -454,7 +581,7 @@ export async function generateWithRetryAndFallback(
   const nowMs = Date.now();
   const useCooldownMemory = baseDelayMs >= 500;
 
-  // Place models not in daily-quota cooldown first so subsequent batches don't re-hit an exhausted model
+  // Place models not in cooldown first so subsequent calls don't re-hit an exhausted/unavailable model
   const candidateModels = useCooldownMemory
     ? [
         ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) <= nowMs),
@@ -464,12 +591,11 @@ export async function generateWithRetryAndFallback(
 
   let totalRetryAttempts = 0;
   let lastError: any = null;
-  let lastStatusCode = 500;
+  let lastClassification: ReturnType<typeof classifyGeminiError> | null = null;
 
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const currentModel = candidateModels[mIdx];
     const isFallbackModel = currentModel !== primaryModel;
-    // Maximum of 3 automatic retries per model (initial attempt + up to 3 automatic retries)
     const maxRetriesForModel = MAX_AUTOMATIC_RETRIES;
 
     logOcrEvent('info', isFallbackModel ? 'model_fallback_selected' : 'model_selected', {
@@ -480,7 +606,7 @@ export async function generateWithRetryAndFallback(
 
     for (let retry = 0; retry <= maxRetriesForModel; retry++) {
       const controller = new AbortController();
-      const timeoutMs = isFallbackModel ? 22000 : 26000;
+      const timeoutMs = GEMINI_REQUEST_TIMEOUT_MS;
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
@@ -491,9 +617,9 @@ export async function generateWithRetryAndFallback(
           abortSignal: controller.signal,
         };
 
-        // Only attach ThinkingLevel.MEDIUM on Gemini 3.8 / 4 primary models
-        if (ThinkingLevel && (currentModel.includes('3.8') || currentModel.includes('argon'))) {
-          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
+        // Gemini 4 Hydrogen supports ThinkingLevel.LOW / MEDIUM (never pass temperature/topP/topK/MINIMAL)
+        if (ThinkingLevel && currentModel.includes('gemini-4-hydrogen')) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW || ThinkingLevel.MEDIUM };
         }
 
         const response = await ai.models.generateContent({
@@ -522,9 +648,19 @@ export async function generateWithRetryAndFallback(
         };
       } catch (err: any) {
         clearTimeout(timer);
+        if (controller.signal.aborted && !err?.isTimeout) {
+          const timeoutErr: any = new Error(
+            `Gemini API request to ${currentModel} timed out after ${Math.round(timeoutMs / 1000)}s (HTTP 504).`
+          );
+          timeoutErr.status = 504;
+          timeoutErr.code = 'GEMINI_TIMEOUT';
+          timeoutErr.isTimeout = true;
+          err = timeoutErr;
+        }
+
         lastError = err;
         const classification = classifyGeminiError(err);
-        lastStatusCode = classification.statusCode;
+        lastClassification = classification;
 
         const isValidationFailure =
           String(err?.message || '').includes('Malformed') ||
@@ -537,46 +673,54 @@ export async function generateWithRetryAndFallback(
           attempt: retry + 1,
           maxAttemptsForModel: maxRetriesForModel + 1,
           statusCode: classification.statusCode,
+          errorCode: classification.errorCode,
           isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
           reason: classification.cleanMessage,
         });
 
-        // Permanent client/credential errors (400 Invalid API Key / Malformed Request, 401 Unauthorized, 403 Forbidden)
-        // must immediately abort without entering retry loops or calling fallback models with the same bad request/key.
+        // Permanent client/credential errors (401/403 Auth or 400 Bad Request) must immediately abort
         if (
-          !classification.isRetryableAvailabilityError &&
           !isValidationFailure &&
-          (classification.statusCode === 400 ||
-            classification.statusCode === 401 ||
-            classification.statusCode === 403)
+          (classification.isAuthError || classification.statusCode === 400)
         ) {
-          const permErr: any = new Error(classification.cleanMessage);
+          const permErr: any = new Error(
+            classification.isAuthError
+              ? `Gemini API authentication/permission error (HTTP ${classification.statusCode}): ${classification.cleanMessage}`
+              : `Gemini API malformed request error (HTTP 400): ${classification.cleanMessage}`
+          );
           permErr.status = classification.statusCode;
-          permErr.code =
-            classification.statusCode === 401 || classification.statusCode === 403
-              ? 'GEMINI_AUTH_ERROR'
-              : 'GEMINI_BAD_REQUEST';
+          permErr.code = classification.errorCode;
+          permErr.retryable = false;
           throw permErr;
         }
 
-        // Model not found (404) or daily/free-tier quota exhausted for this specific model:
-        // do not waste 15s retrying a model whose daily quota is 0; immediately advance to the next fallback model.
+        // Do not retry 404 invalid model, daily quota exhaustion, or 22s request timeout on the same model:
+        // record cooldown and immediately advance to the next fallback model if available.
         if (
-          (classification.statusCode === 404 && !classification.isRetryableAvailabilityError && !isValidationFailure) ||
-          (classification.isModelDailyQuotaExhausted && mIdx < candidateModels.length - 1)
+          !isValidationFailure &&
+          (classification.isInvalidModel ||
+            classification.isModelDailyQuotaExhausted ||
+            classification.isTimeout)
         ) {
           if (useCooldownMemory) {
-            modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_COOLDOWN_DURATION_MS);
+            const cooldownMs = classification.isTimeout
+              ? MODEL_TRANSIENT_COOLDOWN_MS
+              : MODEL_COOLDOWN_DURATION_MS;
+            modelQuotaCooldownUntil.set(currentModel, Date.now() + cooldownMs);
           }
-          logOcrEvent('info', 'model_daily_quota_or_404_fast_failover', {
-            exhaustedModel: currentModel,
-            nextModel: candidateModels[mIdx + 1],
+          logOcrEvent('info', 'model_fast_failover', {
+            failedModel: currentModel,
+            nextModel: candidateModels[mIdx + 1] || 'none',
             statusCode: classification.statusCode,
+            errorCode: classification.errorCode,
           });
           break;
         }
 
-        if (retry < maxRetriesForModel) {
+        if (
+          (classification.isRetryableAvailabilityError || isValidationFailure) &&
+          retry < maxRetriesForModel
+        ) {
           totalRetryAttempts++;
           const waitMs = computeExponentialBackoffWithJitter(retry + 1, baseDelayMs);
           logOcrEvent('info', 'retrying_after_backoff', {
@@ -589,41 +733,83 @@ export async function generateWithRetryAndFallback(
           await sleep(waitMs);
           continue;
         }
+
+        // Retries exhausted for this model on 503/429 -> put model in brief cooldown before failing over
+        if (useCooldownMemory && (classification.isHighDemand503 || classification.isRateLimit)) {
+          modelQuotaCooldownUntil.set(currentModel, Date.now() + MODEL_TRANSIENT_COOLDOWN_MS);
+        }
       }
     }
   }
+
+  const finalClassification = lastClassification || classifyGeminiError(lastError);
 
   logOcrEvent('error', 'all_models_and_retries_exhausted', {
     primaryModel,
     fallbackModels: fallbackModels.join(','),
     totalRetryAttempts,
-    lastStatusCode,
-    error: String(lastError?.message || lastError || 'Unknown error').slice(0, 240),
+    lastStatusCode: finalClassification.statusCode,
+    errorCode: finalClassification.errorCode,
+    error: finalClassification.cleanMessage,
   });
 
-  const finalClassification = classifyGeminiError(lastError);
+  if (finalClassification.isInvalidModel) {
+    const modelErr: any = new Error(
+      `Gemini model unavailable or invalid (HTTP 404): ${finalClassification.cleanMessage}`
+    );
+    modelErr.status = 404;
+    modelErr.code = 'GEMINI_INVALID_MODEL';
+    modelErr.retryable = false;
+    throw modelErr;
+  }
+
+  if (finalClassification.isModelDailyQuotaExhausted) {
+    const quotaErr: any = new Error(
+      `Gemini AI quota exceeded (HTTP 429): ${finalClassification.cleanMessage}`
+    );
+    quotaErr.status = 429;
+    quotaErr.code = 'GEMINI_QUOTA_EXHAUSTED';
+    quotaErr.retryable = false;
+    throw quotaErr;
+  }
+
+  if (finalClassification.isTimeout) {
+    const timeoutErr: any = new Error(
+      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s per request. Your uploaded docket has been preserved — please click "Retry Extraction".`
+    );
+    timeoutErr.status = 504;
+    timeoutErr.code = 'GEMINI_TIMEOUT';
+    timeoutErr.retryable = true;
+    throw timeoutErr;
+  }
+
   if (finalClassification.isHighDemand503) {
     const busyErr: any = new Error(
-      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retries and fallback to ${fallbackModels[0] || 'secondary model'}. Your uploaded docket has been preserved — please click "Retry Extraction" in a moment.`
+      `Gemini AI is currently experiencing high demand (HTTP 503) after ${totalRetryAttempts} automatic retry and fallback to ${fallbackModels[0] || 'secondary model'}. Your uploaded docket has been preserved — please click "Retry Extraction" in a moment.`
     );
     busyErr.status = 503;
     busyErr.code = 'GEMINI_HIGH_DEMAND_503';
+    busyErr.retryable = true;
     throw busyErr;
   }
 
   if (finalClassification.isRateLimit) {
     const rateErr: any = new Error(
-      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retries. Your uploaded docket has been preserved — please wait a few seconds and click "Retry Extraction".`
+      `Gemini AI rate limit reached (HTTP 429) after ${totalRetryAttempts} automatic retry. Your uploaded docket has been preserved — please wait a few seconds and click "Retry Extraction".`
     );
     rateErr.status = 429;
     rateErr.code = 'GEMINI_RATE_LIMIT_429';
+    rateErr.retryable = true;
     throw rateErr;
   }
 
-  throw new Error(
+  const genericErr: any = new Error(
     finalClassification.cleanMessage ||
       'Gemini AI could not extract the docket after automatic retries. Please click "Retry Extraction".'
   );
+  genericErr.status = finalClassification.statusCode || 500;
+  genericErr.code = finalClassification.errorCode || 'AI_EXTRACTION_FAILED';
+  throw genericErr;
 }
 
 /**
@@ -665,7 +851,10 @@ async function extractPageBatchInOneCall(
 
   const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
 Your job is to transcribe EVERY single physical part row literally visible across the provided page image(s) and/or extracted PDF text into the JSON 'items' array without skipping or merging any rows.
-STRICT ANTI-HALLUCINATION RULE: Only extract rows and text that are literally present in the provided document. Never invent, guess, or fabricate parts, codes, descriptions, materials, thicknesses, dimensions, or quantities. If a document is blank or contains no physical part rows, return an empty items array [].`;
+STRICT ANTI-HALLUCINATION & PART NUMBER INTEGRITY RULE:
+- Preserve original part numbers, revisions, and quantities exactly as printed.
+- Never invent, complete, or silently correct uncertain part numbers.
+- Only extract rows and text that are literally present in the provided document. If a document is blank or contains no physical part rows, return an empty items array [].`;
 
   const promptText = `Examine ${pageDescriptions.join(' and ')} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in the table in top-to-bottom order. If the image is blank or has no part rows, return items: [].
 
@@ -681,19 +870,19 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - On Tax Invoices, ignore non-physical charge/summary lines (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Tax, Total, Balance Due).
 4. MULTIPLE DOCKETS / PAGE HEADERS:
    - The upload may contain MULTIPLE separate delivery dockets (each with its own docket/invoice number) OR a multi-page single docket.
-   - Record one entry in 'pageHeaders' for EVERY page (${batchPages.map((b) => b.pageNumber).join(', ')}) with that page's exact 'docketNumber' (or "" if a continuation page has no docket header printed), 'supplier', 'deliveryDate', 'orderNumber', 'carrier', 'palletCount', and 'startsNewDocket' (true if a new docket/invoice starts on that page).
+   - Record one entry in 'pageHeaders' for EVERY page (${batchPages.map((b) => b.pageNumber).join(', ')}) with that page's exact 'docketNumber' (e.g., Docket No, Delivery Note, Tax Invoice No, or Job No; or "" if a continuation page has no docket header printed), 'supplier', 'deliveryDate', 'orderNumber' (e.g., Client Order No / PO No), 'carrier', 'palletCount', and 'startsNewDocket' (true if a new docket/invoice starts on that page).
    - Never fabricate a docket number if none is printed on a continuation page.
 5. FIELD MAPPING FOR EACH PART ROW:
    - page: The page number (${batchPages.map((b) => b.pageNumber).join(' or ')}) this row is on.
    - no: The exact printed number in the "No" / "No." / "Item" / "Pos" / "Line" / "#" column for this row. If a NEW docket starts on a page and its row numbers restart at 1, keep the printed "1".
-   - part: The Part Number, Drawing Number, Mark, Code, or DXF/Profile Name written on the row. If the table only has ONE text column (e.g. "Description" or "Part / Description"), put the part code/name in 'part' and the full text in 'desc'. NEVER put the row number in 'part'.
+   - part: The exact Part Number, Client Part Code, Part Code, Drawing Number, Mark, or DXF/Profile Name as printed on the row. Preserve original part numbers exactly as printed; never invent, complete, or silently correct uncertain part numbers. NEVER put the row number or quantity in 'part'.
    - desc: The full part description or name written on the row.
-   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "01", "Rev B"), else "".
+   - rev: Drawing revision / Rev code if shown on the row (e.g. "A", "B", "01"), else "".
    - mat: Material grade ONLY if written on the row, else "".
    - thk: Thickness ONLY if written on the row, else "".
    - dim: Dimensions/length/size ONLY if written on the row, else "".
    - wt: Weight ONLY if written on the row, else "".
-   - qty: Integer quantity for this part row (convert invoice decimals like 4.00 to 4; never use Unit Price $ or Line Total $).`;
+   - qty: Integer dispatched/delivered quantity for this part row (prefer "Desp" / "Despatched" / "Shipped" / "Qty" column; convert decimals like 4.00 to 4; never use Unit Price $ or Line Total $).`;
 
   const responseSchema = {
     type: Type.OBJECT,

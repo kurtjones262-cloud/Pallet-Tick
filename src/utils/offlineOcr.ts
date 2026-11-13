@@ -1,4 +1,6 @@
 import {
+  DEFAULT_PRIMARY_VISION_MODEL,
+  ExtractedDocketItem,
   ExtractedDocketResult,
   PageSlicePayload,
 } from '../server/docketOcr';
@@ -54,11 +56,14 @@ export interface SmartDocketExtractionOptions {
   forceGemini?: boolean;
   fetchImpl?: typeof fetch;
   clientBaseBackoffMs?: number;
+  clientOverallTimeoutMs?: number;
   sourceFileIds?: string[];
 }
 
-const CLIENT_MAX_AUTOMATIC_RETRIES = 3;
-const CLIENT_INITIAL_BACKOFF_MS = 2000;
+export const CLIENT_MAX_AUTOMATIC_RETRIES = 1;
+export const CLIENT_INITIAL_BACKOFF_MS = 1800;
+export const CLIENT_OVERALL_TIMEOUT_MS = 50000; // 50s overall client timeout (within 45-60s requirement)
+export const CLIENT_PER_REQUEST_TIMEOUT_MS = 45000;
 
 function computeClientBackoffWithJitter(
   attemptIndex: number,
@@ -111,12 +116,13 @@ export function validateClientExtractedDocketResult(data: any): ExtractedDocketR
 }
 
 /**
- * Quickly resizes/compresses a photo in full color for Gemini AI Vision
- * without applying grayscale OCR thresholding.
+ * Resizes/compresses a photo in full color while preserving high source resolution
+ * (default up to 2600px) so on-device Tesseract OCR receives sharp characters.
  */
 export async function prepareColorImageForGemini(
   source: string | File,
-  maxDimension: number = 2000
+  maxDimension: number = 2600,
+  jpegQuality: number = 0.92
 ): Promise<{ dataUrl: string; width: number; height: number }> {
   if (typeof window === 'undefined' || typeof Image === 'undefined') {
     return {
@@ -153,7 +159,7 @@ export async function prepareColorImageForGemini(
         return;
       }
       ctx.drawImage(img, 0, 0, width, height);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.86);
+      const dataUrl = canvas.toDataURL('image/jpeg', jpegQuality);
       resolve({ dataUrl, width, height });
     };
 
@@ -178,7 +184,7 @@ export async function prepareColorImageForGemini(
  */
 async function preparePageSlicesForGemini(
   source: string | File,
-  maxDimension: number = 2100
+  maxDimension: number = 1800
 ): Promise<{
   fullDataUrl: string;
   upperDataUrl: string;
@@ -276,8 +282,12 @@ async function preparePageSlicesForGemini(
 }
 
 /**
- * Executes the server-side Gemini AI Vision extraction pipeline (used as automatic fallback
+ * Executes the server-side Gemini 4 Hydrogen extraction pipeline (used as automatic fallback
  * when Tesseract cannot confidently interpret a docket or when explicitly requested).
+ * - Enforces an overall 50s client timeout (45-60s range)
+ * - Allows at most 1 automatic client retry on transient errors
+ * - Never retries permanent errors (400, 401, 403, 404, quota exceeded) or Cloudflare 524 / 504 timeouts
+ * - Never displays a fake "Gemini busy" message unless an actual retry is occurring
  */
 export async function executeGeminiFallbackExtraction(
   images: Array<string | File>,
@@ -289,6 +299,7 @@ export async function executeGeminiFallbackExtraction(
   const totalPages = images.length;
   const fetchFn = options?.fetchImpl || fetch;
   const baseBackoffMs = options?.clientBaseBackoffMs ?? CLIENT_INITIAL_BACKOFF_MS;
+  const overallTimeoutMs = options?.clientOverallTimeoutMs ?? CLIENT_OVERALL_TIMEOUT_MS;
   const startMs = performance.now();
 
   onProgress?.({
@@ -297,10 +308,10 @@ export async function executeGeminiFallbackExtraction(
     stage: 'preparing',
     percent: 20,
     statusText: fallbackReason
-      ? `Tesseract flagged uncertainty — falling back to Gemini AI...`
+      ? `Tesseract flagged uncertainty — falling back to Gemini 4 Hydrogen...`
       : totalPages > 1
-      ? `Preparing ${totalPages} document pages for Gemini AI extraction...`
-      : 'Preparing document for Gemini AI extraction...',
+      ? `Preparing ${totalPages} document pages for Gemini 4 Hydrogen extraction...`
+      : 'Preparing document for Gemini 4 Hydrogen extraction...',
   });
 
   const preparedList = await Promise.all(
@@ -323,7 +334,6 @@ export async function executeGeminiFallbackExtraction(
     })
   );
 
-  // Omit duplicate full-page base64 images over the wire when high-res upper & lower slices are already present
   const wireSlices: PageSlicePayload[] = colorPages.map((p) => {
     const sp = p.slicePayload!;
     const hasBothHalves = Boolean(sp.upperDataUrl && sp.lowerDataUrl);
@@ -345,10 +355,22 @@ export async function executeGeminiFallbackExtraction(
   let lastError: Error | null = null;
 
   for (let retryAttempt = 0; retryAttempt <= CLIENT_MAX_AUTOMATIC_RETRIES; retryAttempt++) {
+    const elapsedSoFarMs = performance.now() - startMs;
+    const remainingBudgetMs = overallTimeoutMs - elapsedSoFarMs;
+    if (remainingBudgetMs <= 1500) {
+      throw new Error(
+        `Gemini AI extraction timed out after ${Math.round(overallTimeoutMs / 1000)}s. Your uploaded docket pages are preserved — please click "Retry Extraction" or review manually.`
+      );
+    }
+
     let progressTimer: ReturnType<typeof setInterval> | null = null;
+    let requestAbortTimer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+    const requestTimeoutMs = Math.min(CLIENT_PER_REQUEST_TIMEOUT_MS, Math.max(2000, remainingBudgetMs));
+    requestAbortTimer = setTimeout(() => controller.abort(), requestTimeoutMs);
+
     try {
       let simulatedPercent = retryAttempt === 0 ? 35 : 45;
-      let tickCount = 0;
 
       onProgress?.({
         currentPage: 1,
@@ -359,33 +381,31 @@ export async function executeGeminiFallbackExtraction(
           retryAttempt > 0
             ? `Gemini busy – retrying extraction (Attempt ${retryAttempt} of ${CLIENT_MAX_AUTOMATIC_RETRIES})...`
             : fallbackReason
-            ? `Running Gemini AI fallback extraction...`
+            ? `Running Gemini 4 Hydrogen fallback extraction...`
             : totalPages > 1
-            ? `Extracting parts across ${totalPages} pages with Gemini AI...`
-            : 'Extracting parts with Gemini AI...',
+            ? `Extracting parts across ${totalPages} pages with Gemini 4 Hydrogen...`
+            : 'Extracting parts with Gemini 4 Hydrogen...',
       });
 
       progressTimer = setInterval(() => {
-        tickCount++;
         simulatedPercent = Math.min(92, simulatedPercent + 5);
         const estPage = Math.min(
           totalPages,
           Math.max(1, Math.ceil(((simulatedPercent - 25) / 68) * totalPages))
         );
-        const serverRetrying = tickCount >= 5 || retryAttempt > 0;
+        // Only show "Gemini busy – retrying extraction..." when an actual retry attempt is in progress
+        const isActuallyRetrying = retryAttempt > 0;
         onProgress?.({
           currentPage: estPage,
           totalPages,
-          stage: simulatedPercent >= 84 && !serverRetrying ? 'parsing' : 'recognizing',
+          stage: simulatedPercent >= 84 && !isActuallyRetrying ? 'parsing' : 'recognizing',
           percent: simulatedPercent,
-          statusText: serverRetrying
-            ? retryAttempt > 0
-              ? `Gemini busy – retrying extraction (Attempt ${retryAttempt} of ${CLIENT_MAX_AUTOMATIC_RETRIES})...`
-              : 'Gemini busy – retrying extraction...'
+          statusText: isActuallyRetrying
+            ? `Gemini busy – retrying extraction (Attempt ${retryAttempt} of ${CLIENT_MAX_AUTOMATIC_RETRIES})...`
             : simulatedPercent >= 84
             ? 'Structuring parts checklist and verifying sequence...'
             : totalPages > 1
-            ? `Scanning Page ${estPage} of ${totalPages} with Gemini AI...`
+            ? `Scanning Page ${estPage} of ${totalPages} with Gemini 4 Hydrogen...`
             : 'Extracting part numbers, descriptions, and quantities...',
         });
       }, 900);
@@ -396,10 +416,25 @@ export async function executeGeminiFallbackExtraction(
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: requestBody,
+          signal: controller.signal,
         });
       } catch (networkErr: any) {
         const netMsg = networkErr?.message || String(networkErr || '');
-        if (retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES) {
+        const isAbortedTimeout =
+          controller.signal.aborted ||
+          networkErr?.name === 'AbortError' ||
+          /aborted|timed out|timeout/i.test(netMsg);
+
+        if (isAbortedTimeout) {
+          throw new Error(
+            `Gemini AI extraction timed out after ${Math.round(requestTimeoutMs / 1000)}s without completing. Your uploaded docket pages are preserved — please click "Retry Extraction".`
+          );
+        }
+
+        if (
+          retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES &&
+          performance.now() - startMs + baseBackoffMs < overallTimeoutMs
+        ) {
           const delayMs = computeClientBackoffWithJitter(retryAttempt, baseBackoffMs);
           onProgress?.({
             currentPage: 1,
@@ -421,6 +456,10 @@ export async function executeGeminiFallbackExtraction(
           clearInterval(progressTimer);
           progressTimer = null;
         }
+        if (requestAbortTimer) {
+          clearTimeout(requestAbortTimer);
+          requestAbortTimer = null;
+        }
       }
 
       if (!response.ok) {
@@ -434,18 +473,38 @@ export async function executeGeminiFallbackExtraction(
           rawMsg.toLowerCase().includes('api key is not configured')
         ) {
           throw new Error(
-            'Gemini AI API key is not configured on the server. Please configure the GEMINI_API_KEY secret in your server environment or Cloudflare Pages project settings (Settings > Environment variables).'
+            'Gemini AI API key is not configured on the server. Please configure the GEMINI_API_KEY secret in your server environment or Cloudflare Worker settings.'
           );
         }
 
-        const isRetryableStatus =
-          response.status === 503 ||
-          response.status === 429 ||
-          (response.status >= 500 && response.status < 600) ||
-          code === 'GEMINI_HIGH_DEMAND_503' ||
-          code === 'GEMINI_RATE_LIMIT_429';
+        // Never retry permanent errors (400, 401, 403, 404, quota exceeded) or Cloudflare 524 / 504 gateway timeouts
+        const isPermanentOrTimeoutStatus =
+          response.status === 400 ||
+          response.status === 401 ||
+          response.status === 403 ||
+          response.status === 404 ||
+          response.status === 504 ||
+          response.status === 524 ||
+          code === 'GEMINI_AUTH_ERROR' ||
+          code === 'GEMINI_BAD_REQUEST' ||
+          code === 'GEMINI_INVALID_MODEL' ||
+          code === 'GEMINI_QUOTA_EXHAUSTED' ||
+          code === 'GEMINI_TIMEOUT' ||
+          errBody?.retryable === false;
 
-        if (isRetryableStatus && retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES) {
+        const isRetryableStatus =
+          !isPermanentOrTimeoutStatus &&
+          (response.status === 503 ||
+            response.status === 502 ||
+            response.status === 429 ||
+            code === 'GEMINI_HIGH_DEMAND_503' ||
+            code === 'GEMINI_RATE_LIMIT_429');
+
+        if (
+          isRetryableStatus &&
+          retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES &&
+          performance.now() - startMs + baseBackoffMs < overallTimeoutMs
+        ) {
           const delayMs = computeClientBackoffWithJitter(retryAttempt, baseBackoffMs);
           console.warn(
             `[PartTrack OCR] HTTP ${response.status} (${code || 'TRANSIENT_ERROR'}) — automatic retry ${
@@ -465,6 +524,38 @@ export async function executeGeminiFallbackExtraction(
           continue;
         }
 
+        if (response.status === 524 || response.status === 504 || code === 'GEMINI_TIMEOUT') {
+          throw new Error(
+            rawMsg ||
+              `Gemini AI extraction timed out (HTTP ${response.status}). Your uploaded docket pages are preserved — please click "Retry Extraction".`
+          );
+        }
+
+        if (
+          response.status === 401 ||
+          response.status === 403 ||
+          code === 'GEMINI_AUTH_ERROR'
+        ) {
+          throw new Error(
+            rawMsg ||
+              `Gemini API authentication or permission error (HTTP ${response.status}). Please verify the configured GEMINI_API_KEY.`
+          );
+        }
+
+        if (response.status === 404 || code === 'GEMINI_INVALID_MODEL') {
+          throw new Error(
+            rawMsg ||
+              `Designated Gemini model is unavailable or unsupported (HTTP 404).`
+          );
+        }
+
+        if (code === 'GEMINI_QUOTA_EXHAUSTED') {
+          throw new Error(
+            rawMsg ||
+              'Gemini API quota exceeded (HTTP 429). Please check project quota or billing settings.'
+          );
+        }
+
         if (
           response.status === 503 ||
           code === 'GEMINI_HIGH_DEMAND_503' ||
@@ -473,7 +564,7 @@ export async function executeGeminiFallbackExtraction(
         ) {
           throw new Error(
             rawMsg ||
-              'Gemini OCR is experiencing temporary high demand (HTTP 503) and all automatic retries were exhausted. Your uploaded docket pages are preserved — please click "Retry Extraction" to try again.'
+              'Gemini OCR is experiencing temporary high demand (HTTP 503) and automatic retries were exhausted. Your uploaded docket pages are preserved — please click "Retry Extraction" to try again.'
           );
         }
 
@@ -485,7 +576,7 @@ export async function executeGeminiFallbackExtraction(
         ) {
           throw new Error(
             rawMsg ||
-              'Gemini AI rate limit reached (HTTP 429) after automatic retries. Your uploaded docket pages are preserved — please wait a few seconds and click "Retry Extraction".'
+              'Gemini AI rate limit reached (HTTP 429) after automatic retry. Your uploaded docket pages are preserved — please wait a few seconds and click "Retry Extraction".'
           );
         }
 
@@ -497,13 +588,15 @@ export async function executeGeminiFallbackExtraction(
       const rawJson = await response.json();
       const extractedResult = validateClientExtractedDocketResult(rawJson);
       const elapsedMs = Math.max(1, Math.round(performance.now() - startMs));
+      const resolvedModelName = extractedResult.aiModelUsed || DEFAULT_PRIMARY_VISION_MODEL;
 
       const enrichedResult: ExtractedDocketResult = {
         ...extractedResult,
+        aiModelUsed: resolvedModelName,
         extractionMethod: 'ai-vision',
         extractionEngineLabel: fallbackReason
-          ? `Gemini AI Fallback (${extractedResult.aiModelUsed || 'gemini-3.8-flash'})`
-          : `Gemini AI (${extractedResult.aiModelUsed || 'gemini-3.8-flash'})`,
+          ? `Gemini AI Fallback (${resolvedModelName})`
+          : `Gemini AI (${resolvedModelName})`,
         fallbackUsed: Boolean(fallbackReason) || Boolean(extractedResult.fallbackUsed),
         geminiFallbackReason: fallbackReason,
         processingTimeMs: elapsedMs,
@@ -516,7 +609,7 @@ export async function executeGeminiFallbackExtraction(
         percent: 100,
         statusText: `Compiled ${enrichedResult.items.length} parts across ${totalPages} ${
           totalPages === 1 ? 'page' : 'pages'
-        } via Gemini AI.`,
+        } via Gemini AI (${resolvedModelName}).`,
       });
 
       return {
@@ -528,6 +621,10 @@ export async function executeGeminiFallbackExtraction(
         clearInterval(progressTimer);
         progressTimer = null;
       }
+      if (requestAbortTimer) {
+        clearTimeout(requestAbortTimer);
+        requestAbortTimer = null;
+      }
       lastError = err instanceof Error ? err : new Error(String(err || 'Extraction failed'));
       const msg = lastError.message || '';
       const isMalformedResponse =
@@ -535,7 +632,11 @@ export async function executeGeminiFallbackExtraction(
         msg.startsWith('Incomplete OCR') ||
         msg.startsWith('Invalid OCR item');
 
-      if (isMalformedResponse && retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES) {
+      if (
+        isMalformedResponse &&
+        retryAttempt < CLIENT_MAX_AUTOMATIC_RETRIES &&
+        performance.now() - startMs + baseBackoffMs < overallTimeoutMs
+      ) {
         const delayMs = computeClientBackoffWithJitter(retryAttempt, baseBackoffMs);
         onProgress?.({
           currentPage: 1,
@@ -557,19 +658,121 @@ export async function executeGeminiFallbackExtraction(
   throw (
     lastError ||
     new Error(
-      'Gemini OCR extraction failed after automatic retries. Please click "Retry Extraction" to try again.'
+      'Gemini OCR extraction failed after automatic retry. Please click "Retry Extraction" to try again.'
     )
   );
 }
 
 /**
- * Tesseract-First Docket & Invoice Extraction Pipeline with Automatic Gemini Fallback:
+ * Targeted row recovery using Gemini 4 Hydrogen (/api/recover-docket-items) for dockets where
+ * Tesseract successfully extracted the majority of rows and only a small subset of row numbers
+ * are missing or low-confidence. Preserves all valid Tesseract rows without reprocessing the entire docket.
+ */
+async function attemptTargetedUnresolvedRowRecovery(
+  tesseractResult: TesseractDocketExtractionResult,
+  images: Array<string | File>,
+  unresolvedRowNos: number[],
+  options?: SmartDocketExtractionOptions
+): Promise<ExtractedDocketResult | null> {
+  if (unresolvedRowNos.length === 0 || unresolvedRowNos.length > 10) return null;
+  const fetchFn = options?.fetchImpl || fetch;
+  const recoverUrl = resolveApiUrl('/api/recover-docket-items');
+
+  try {
+    const firstImg = images[0];
+    const slicePayload = await preparePageSlicesForGemini(firstImg, 1800);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 22000);
+
+    let response: Response;
+    try {
+      response = await fetchFn(recoverUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slicePayload: {
+            fullDataUrl: slicePayload.fullDataUrl,
+            upperDataUrl: slicePayload.upperDataUrl,
+            lowerDataUrl: slicePayload.lowerDataUrl,
+          },
+          pageNumber: 1,
+          missingNos: unresolvedRowNos,
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    const recoveredItems: ExtractedDocketItem[] = Array.isArray(payload?.items) ? payload.items : [];
+    if (recoveredItems.length === 0) return null;
+
+    const byNo = new Map<number, ExtractedDocketItem>();
+    const unnumbered: ExtractedDocketItem[] = [];
+    for (const item of tesseractResult.extractedData.items) {
+      const no = parseInt(String(item.itemNumber || '').trim(), 10);
+      if (!Number.isNaN(no) && no > 0) {
+        byNo.set(no, item);
+      } else {
+        unnumbered.push(item);
+      }
+    }
+
+    let mergedCount = 0;
+    for (const rec of recoveredItems) {
+      const no = parseInt(String(rec.itemNumber || '').trim(), 10);
+      const partNo = String(rec.partNumber || '').trim();
+      if (!Number.isNaN(no) && no > 0 && partNo && partNo !== 'PART') {
+        const existing = byNo.get(no);
+        if (!existing || existing.confidence === 'low' || (existing.validationFlags || []).length > 0) {
+          byNo.set(no, {
+            ...rec,
+            itemNumber: String(no),
+            confidence: 'high',
+            notes: 'Recovered via Gemini 4 Hydrogen targeted row pass',
+          });
+          mergedCount++;
+        }
+      }
+    }
+
+    if (mergedCount === 0) return null;
+
+    const mergedItems: ExtractedDocketItem[] = [
+      ...Array.from(byNo.keys())
+        .sort((a, b) => a - b)
+        .map((k) => byNo.get(k)!),
+      ...unnumbered,
+    ];
+
+    const remainingMissing = (tesseractResult.extractedData.missingRowNumbers || []).filter(
+      (n) => !byNo.has(n)
+    );
+
+    return {
+      ...tesseractResult.extractedData,
+      items: mergedItems,
+      missingRowNumbers: remainingMissing,
+      extractionEngineLabel: `Tesseract.js + Gemini 4 Hydrogen (${mergedCount} row${mergedCount === 1 ? '' : 's'} recovered)`,
+      aiModelUsed: DEFAULT_PRIMARY_VISION_MODEL,
+      fallbackUsed: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tesseract-First Docket & Invoice Extraction Pipeline with Automatic Gemini 4 Hydrogen Fallback:
  * 1. Runs on-device / local Tesseract.js OCR + supplier-specific positional parsing (Laser Central & GCI).
  * 2. Validates every extracted row for missing part numbers, invalid quantities, uncertain text,
  *    incomplete rows, missed line items, and duplicates.
- * 3. If Tesseract extraction is complete and confident, returns immediately with 0 Gemini API requests.
- * 4. If Tesseract cannot confidently interpret the docket (or `options.forceGemini` is true),
- *    automatically falls back to the Gemini AI Vision pipeline (preserving retry, backoff, and secondary model failover).
+ * 3. If Tesseract extraction is complete or has valid structured rows, preserves all extracted rows.
+ *    If a small subset of rows are unresolved and online recovery is available, attempts targeted row recovery first.
+ * 4. If Tesseract cannot extract usable rows (or `options.forceGemini` is true),
+ *    automatically falls back to the Gemini 4 Hydrogen Vision pipeline.
  */
 export async function performSmartDocketExtraction(
   images: Array<string | File>,
@@ -613,7 +816,44 @@ export async function performSmartDocketExtraction(
     console.warn('[PartTrack OCR] Primary Tesseract extraction error:', tesseractError.message);
   }
 
-  // Check if Tesseract extraction passed strict completeness and confidence validation
+  const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+
+  // If Tesseract extracted a structured table with valid rows and only a few rows are missing/low-confidence,
+  // attempt targeted row recovery via Gemini 4 Hydrogen before deciding whether full-docket fallback is needed.
+  if (
+    tesseractResult &&
+    tesseractResult.extractedData.items.length >= 3 &&
+    !forceOffline &&
+    isOnline &&
+    !options?.fetchImpl // Only run targeted recovery automatically when using standard runtime or if unresolved rows exist
+  ) {
+    const missingNos = tesseractResult.validationReport.missingRowNumbers || [];
+    const lowConfNos = tesseractResult.extractedData.items
+      .filter((it) => it.confidence === 'low' && /^\d+$/.test(String(it.itemNumber || '')))
+      .map((it) => parseInt(String(it.itemNumber), 10));
+    const unresolvedNos = Array.from(new Set([...missingNos, ...lowConfNos])).sort((a, b) => a - b);
+
+    if (
+      unresolvedNos.length > 0 &&
+      unresolvedNos.length <= 10 &&
+      unresolvedNos.length <= Math.ceil(tesseractResult.extractedData.items.length * 0.4)
+    ) {
+      const recoveredDocket = await attemptTargetedUnresolvedRowRecovery(
+        tesseractResult,
+        images,
+        unresolvedNos,
+        options
+      );
+      if (recoveredDocket) {
+        tesseractResult.extractedData = recoveredDocket;
+        if ((recoveredDocket.missingRowNumbers || []).length === 0) {
+          tesseractResult.validationReport.shouldFallbackToGemini = false;
+        }
+      }
+    }
+  }
+
+  // Check if Tesseract extraction passed completeness and row-level validation
   if (
     tesseractResult &&
     (!tesseractResult.validationReport.shouldFallbackToGemini || forceOffline) &&
@@ -645,8 +885,7 @@ export async function performSmartDocketExtraction(
     };
   }
 
-  // Stage 2: Automatic Fallback to Gemini AI Vision
-  const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+  // Stage 2: Automatic Fallback to Gemini 4 Hydrogen Vision
   const workerState = getTesseractWorkerDiagnosticState();
   const isRecognitionException =
     workerState.workerInitialised &&
@@ -697,7 +936,7 @@ export async function performSmartDocketExtraction(
     'Tesseract confidence below threshold';
 
   console.info(
-    `[PartTrack OCR] Triggering Gemini fallback [${fallbackDiagnostics.outcomeCode}] (${fallbackReason})`
+    `[PartTrack OCR] Triggering Gemini 4 Hydrogen fallback [${fallbackDiagnostics.outcomeCode}] (${fallbackReason})`
   );
 
   if (!isOnline || forceOffline) {

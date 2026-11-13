@@ -725,7 +725,7 @@ async function runTests() {
           orderNumber: 'PO-9900',
           palletCount: 1,
           extractionMethod: 'ai-vision',
-          aiModelUsed: 'gemini-3.8-flash',
+          aiModelUsed: 'gemini-4-hydrogen',
           fallbackUsed: false,
           retryAttempts: 0,
           items: [

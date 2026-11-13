@@ -20,6 +20,9 @@ export interface ImagePreprocessingDiagnostics {
   darkPixelRatioAfter: number;
   wasInvertedFromDarkBackground: boolean;
   safeguardTriggered: boolean;
+  localIlluminationNormalized?: boolean;
+  detectedSkewDegrees?: number;
+  rotationAppliedDegrees?: number;
   durationMs: number;
 }
 
@@ -52,6 +55,256 @@ export function computeHistogramPercentile(
     }
   }
   return 255;
+}
+
+/**
+ * Normalizes local illumination gradients, camera shadows, and large background watermarks (such as
+ * the large grey "G" watermark on industrial dockets) using a 2D integral image while preserving
+ * soft anti-aliased character strokes for Tesseract LSTM recognition.
+ */
+export function applyLocalIlluminationAndWatermarkNormalization(
+  workingLum: Uint8Array,
+  width: number,
+  height: number
+): {
+  output: Uint8Array;
+  meanLuminanceAfter: number;
+  whitePixelRatioAfter: number;
+  darkPixelRatioAfter: number;
+} {
+  const numPixels = width * height;
+  const output = new Uint8Array(numPixels);
+  const w1 = width + 1;
+  const integral = new Float64Array(w1 * (height + 1));
+
+  for (let y = 0; y < height; y++) {
+    let rowSum = 0;
+    const srcOff = y * width;
+    const prevIntOff = y * w1;
+    const currIntOff = (y + 1) * w1;
+    for (let x = 0; x < width; x++) {
+      rowSum += workingLum[srcOff + x];
+      integral[currIntOff + x + 1] = integral[prevIntOff + x + 1] + rowSum;
+    }
+  }
+
+  // Radius ~1.4% of max dimension (e.g. R=25 on 1800px, R=34 on 2450px):
+  // spans across character strokes so localMean reflects local paper illumination & watermark shade.
+  const radius = Math.max(14, Math.round(Math.max(width, height) * 0.014));
+  let sumLum = 0;
+  let whiteCount = 0;
+  let darkCount = 0;
+
+  for (let y = 0; y < height; y++) {
+    const y0 = Math.max(0, y - radius);
+    const y1 = Math.min(height - 1, y + radius);
+    const rowOff = y * width;
+    const y0Off = y0 * w1;
+    const y1Off = (y1 + 1) * w1;
+    const boxH = y1 - y0 + 1;
+
+    for (let x = 0; x < width; x++) {
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      const area = (x1 - x0 + 1) * boxH;
+      const boxSum =
+        integral[y1Off + (x1 + 1)] -
+        integral[y0Off + (x1 + 1)] -
+        integral[y1Off + x0] +
+        integral[y0Off + x0];
+      const localMean = boxSum / area;
+      const lum = workingLum[rowOff + x];
+      const ratio = lum / Math.max(60, localMean);
+
+      let finalVal: number;
+      if (ratio >= 0.79) {
+        finalVal = 255;
+      } else if (ratio <= 0.46) {
+        finalVal = 0;
+      } else {
+        finalVal = Math.round(((ratio - 0.46) / 0.33) * 255);
+      }
+
+      output[rowOff + x] = finalVal;
+      sumLum += finalVal;
+      if (finalVal >= 215) whiteCount++;
+      if (finalVal <= 85) darkCount++;
+    }
+  }
+
+  return {
+    output,
+    meanLuminanceAfter: Math.round(sumLum / Math.max(1, numPixels)),
+    whitePixelRatioAfter: Number((whiteCount / Math.max(1, numPixels)).toFixed(4)),
+    darkPixelRatioAfter: Number((darkCount / Math.max(1, numPixels)).toFixed(4)),
+  };
+}
+
+/**
+ * Estimates document text baseline skew angle (in degrees, range [-7, +7]) by finding the
+ * angle that maximizes horizontal projection variance of dark text transitions in the central page region.
+ */
+export function estimateDocumentSkewDegrees(
+  luminances: Uint8Array,
+  width: number,
+  height: number
+): number {
+  if (width < 250 || height < 250) return 0;
+  const xStart = Math.floor(width * 0.12);
+  const xEnd = Math.floor(width * 0.88);
+  const yStart = Math.floor(height * 0.12);
+  const yEnd = Math.floor(height * 0.88);
+  const centerX = width * 0.5;
+
+  // Collect dark text horizontal edge points (avoids continuous vertical border lines by checking vertical discontinuity)
+  const sampleX: number[] = [];
+  const sampleY: number[] = [];
+  for (let y = yStart; y < yEnd; y += 2) {
+    const rowOff = y * width;
+    const prevOff = (y - 2) * width;
+    const nextOff = (y + 2) * width;
+    for (let x = xStart; x < xEnd; x += 3) {
+      const c = luminances[rowOff + x];
+      if (c < 95) {
+        const horizDiff = Math.abs(c - luminances[rowOff + x + 2]);
+        const vertSupport = luminances[prevOff + x] < 95 && luminances[nextOff + x] < 95;
+        if (horizDiff > 55 && !vertSupport) {
+          sampleX.push(x - centerX);
+          sampleY.push(y);
+        }
+      }
+    }
+  }
+
+  if (sampleX.length < 250) return 0;
+
+  let bestAngle = 0;
+  let bestScore = -1;
+  let scoreAtZero = 0;
+  const bins = new Int32Array(height);
+
+  for (let deg = -3.75; deg <= 3.75; deg += 0.25) {
+    const tanA = Math.tan((deg * Math.PI) / 180);
+    bins.fill(0);
+    for (let i = 0; i < sampleX.length; i++) {
+      const projY = Math.round(sampleY[i] - sampleX[i] * tanA);
+      if (projY >= yStart && projY < yEnd) {
+        bins[projY]++;
+      }
+    }
+    let score = 0;
+    for (let y = yStart + 2; y < yEnd - 2; y++) {
+      const diff = bins[y] - bins[y - 2];
+      score += diff * diff;
+    }
+    if (Math.abs(deg) < 0.01) {
+      scoreAtZero = score;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestAngle = deg;
+    }
+  }
+
+  // Reject weak/aliased off-axis peaks unless they decisively beat the unrotated horizontal projection
+  if (scoreAtZero > 0 && bestScore < scoreAtZero * 1.2) {
+    return 0;
+  }
+
+  return Number(bestAngle.toFixed(2));
+}
+
+/**
+ * Rotates a 2D grayscale luminance buffer by `angleDegrees` around its center using bilinear interpolation,
+ * filling exposed corners with pure white (255).
+ */
+export function rotateLuminanceBufferBilinear(
+  luminances: Uint8Array,
+  width: number,
+  height: number,
+  angleDegrees: number
+): Uint8Array {
+  if (Math.abs(angleDegrees) < 0.05) return luminances;
+  // Since projY = y - x * tan(deg) finds +deg when text slopes downward (+y as +x),
+  // inverse mapping at dy=0 must sample srcY = cy + dx * sin(+deg) to level the line flat.
+  const rad = (angleDegrees * Math.PI) / 180;
+  const cosA = Math.cos(rad);
+  const sinA = Math.sin(rad);
+  const cx = width * 0.5;
+  const cy = height * 0.5;
+  const out = new Uint8Array(width * height);
+  out.fill(255);
+
+  for (let y = 0; y < height; y++) {
+    const dy = y - cy;
+    const rowOff = y * width;
+    for (let x = 0; x < width; x++) {
+      const dx = x - cx;
+      const srcX = cx + dx * cosA - dy * sinA;
+      const srcY = cy + dx * sinA + dy * cosA;
+      const x0 = Math.floor(srcX);
+      const y0 = Math.floor(srcY);
+      if (x0 >= 0 && x0 < width - 1 && y0 >= 0 && y0 < height - 1) {
+        const fx = srcX - x0;
+        const fy = srcY - y0;
+        const idx00 = y0 * width + x0;
+        const v00 = luminances[idx00];
+        const v10 = luminances[idx00 + 1];
+        const v01 = luminances[idx00 + width];
+        const v11 = luminances[idx00 + width + 1];
+        const top = v00 + (v10 - v00) * fx;
+        const bot = v01 + (v11 - v01) * fx;
+        out[rowOff + x] = Math.round(top + (bot - top) * fy);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Rotates an RGBA image buffer by 90, 180, or 270 degrees clockwise.
+ */
+export function rotateRgbaBuffer90Increments(
+  rgbaData: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+  rotationDegrees: 0 | 90 | 180 | 270
+): { data: Uint8ClampedArray; width: number; height: number } {
+  if (rotationDegrees === 0) {
+    return {
+      data: rgbaData instanceof Uint8ClampedArray ? rgbaData : new Uint8ClampedArray(rgbaData),
+      width,
+      height,
+    };
+  }
+  const newWidth = rotationDegrees === 90 || rotationDegrees === 270 ? height : width;
+  const newHeight = rotationDegrees === 90 || rotationDegrees === 270 ? width : height;
+  const out = new Uint8ClampedArray(newWidth * newHeight * 4);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let dstX = x;
+      let dstY = y;
+      if (rotationDegrees === 90) {
+        dstX = height - 1 - y;
+        dstY = x;
+      } else if (rotationDegrees === 180) {
+        dstX = width - 1 - x;
+        dstY = height - 1 - y;
+      } else if (rotationDegrees === 270) {
+        dstX = y;
+        dstY = width - 1 - x;
+      }
+      const srcIdx = (y * width + x) * 4;
+      const dstIdx = (dstY * newWidth + dstX) * 4;
+      out[dstIdx] = rgbaData[srcIdx];
+      out[dstIdx + 1] = rgbaData[srcIdx + 1];
+      out[dstIdx + 2] = rgbaData[srcIdx + 2];
+      out[dstIdx + 3] = rgbaData[srcIdx + 3];
+    }
+  }
+
+  return { data: out, width: newWidth, height: newHeight };
 }
 
 /**
@@ -282,8 +535,10 @@ export function normalizeDocumentLuminances(
 }
 
 /**
- * Processes raw RGBA pixel buffer in-place using `normalizeDocumentLuminances`.
- * Used by both browser Canvas 2D context and headless/automated browser tests.
+ * Processes raw RGBA pixel buffer in-place using `normalizeDocumentLuminances` plus
+ * 2D integral-image local illumination normalization (for uneven shadows and background watermarks)
+ * and automatic skew detection/correction.
+ * Used by both browser Canvas 2D context and headless/automated browser & Node tests.
  */
 export function preprocessRgbaImageBufferInPlace(
   rgbaData: Uint8ClampedArray | Uint8Array,
@@ -292,10 +547,13 @@ export function preprocessRgbaImageBufferInPlace(
 ): ImagePreprocessingDiagnostics & { invertedDarkDocument: boolean } {
   const startMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const maxPixelsFromBuffer = Math.floor(rgbaData.length / 4);
-  const numPixels =
-    typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0
-      ? Math.min(width * height, maxPixelsFromBuffer)
-      : maxPixelsFromBuffer;
+  const hasValid2D =
+    typeof width === 'number' &&
+    typeof height === 'number' &&
+    width > 0 &&
+    height > 0 &&
+    width * height <= maxPixelsFromBuffer;
+  const numPixels = hasValid2D ? width! * height! : maxPixelsFromBuffer;
   const luminances = new Uint8Array(numPixels);
   const hist = new Uint32Array(256);
 
@@ -312,10 +570,47 @@ export function preprocessRgbaImageBufferInPlace(
   }
 
   const norm = normalizeDocumentLuminances(luminances, hist);
+  let finalOutput = norm.output;
+  let meanLuminanceAfter = norm.meanLuminanceAfter;
+  let whitePixelRatioAfter = norm.whitePixelRatioAfter;
+  let darkPixelRatioAfter = norm.darkPixelRatioAfter;
+  let localIlluminationNormalized = false;
+  let detectedSkewDegrees = 0;
+
+  if (hasValid2D && width! >= 250 && height! >= 250 && !norm.wasInvertedFromDarkBackground) {
+    const p20 = computeHistogramPercentile(hist, numPixels, 0.2);
+    const p85 = computeHistogramPercentile(hist, numPixels, 0.85);
+    const hasUnevenLightingOrWatermark =
+      norm.inputMedianLum >= 120 &&
+      (p85 - p20 >= 12 || (norm.inputMaxLum - norm.inputMinLum >= 80 && norm.whitePixelRatioAfter < 0.96));
+
+    if (hasUnevenLightingOrWatermark) {
+      const localNorm = applyLocalIlluminationAndWatermarkNormalization(luminances, width!, height!);
+      if (
+        localNorm.whitePixelRatioAfter >= 0.70 &&
+        localNorm.darkPixelRatioAfter >= 0.0003 &&
+        localNorm.darkPixelRatioAfter <= 0.35
+      ) {
+        finalOutput = localNorm.output;
+        meanLuminanceAfter = localNorm.meanLuminanceAfter;
+        whitePixelRatioAfter = localNorm.whitePixelRatioAfter;
+        darkPixelRatioAfter = localNorm.darkPixelRatioAfter;
+        localIlluminationNormalized = true;
+      }
+    }
+
+    detectedSkewDegrees = estimateDocumentSkewDegrees(finalOutput, width!, height!);
+    // Apply pixel-level bilinear deskew when tilt is significant (>= 2.2 deg).
+    // Smaller tilts (< 2.2 deg) are compensated directly in word-bounding-box line clustering
+    // so 1-2px thin laser-printed font strokes are not softened by bilinear interpolation.
+    if (Math.abs(detectedSkewDegrees) >= 2.2 && Math.abs(detectedSkewDegrees) <= 10.0) {
+      finalOutput = rotateLuminanceBufferBilinear(finalOutput, width!, height!, detectedSkewDegrees);
+    }
+  }
 
   for (let i = 0; i < numPixels; i++) {
     const idx = i * 4;
-    const finalVal = norm.output[i];
+    const finalVal = finalOutput[i];
     rgbaData[idx] = finalVal;
     rgbaData[idx + 1] = finalVal;
     rgbaData[idx + 2] = finalVal;
@@ -334,22 +629,28 @@ export function preprocessRgbaImageBufferInPlace(
     inputMinLum: norm.inputMinLum,
     inputMaxLum: norm.inputMaxLum,
     inputMedianLum: norm.inputMedianLum,
-    meanLuminanceAfter: norm.meanLuminanceAfter,
-    whitePixelRatioAfter: norm.whitePixelRatioAfter,
-    darkPixelRatioAfter: norm.darkPixelRatioAfter,
+    meanLuminanceAfter,
+    whitePixelRatioAfter,
+    darkPixelRatioAfter,
     wasInvertedFromDarkBackground: norm.wasInvertedFromDarkBackground,
     invertedDarkDocument: norm.wasInvertedFromDarkBackground,
     safeguardTriggered: norm.safeguardTriggered,
+    localIlluminationNormalized,
+    detectedSkewDegrees,
     durationMs,
   };
 }
 
 /**
  * Loads an image from a base64 DataURL or File and applies non-destructive
- * grayscale normalization that preserves fine table characters and part details.
+ * grayscale + local illumination normalization that preserves fine table characters and part details.
  */
 export async function preprocessDocketImage(
-  source: string | File
+  source: string | File,
+  options?: {
+    maxDimension?: number;
+    rotationDegrees?: 0 | 90 | 180 | 270;
+  }
 ): Promise<PreprocessedImageResult> {
   const startMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
   let displayDataUrl = '';
@@ -361,20 +662,24 @@ export async function preprocessDocketImage(
 
   const img = await loadImageElement(displayDataUrl);
 
-  // Maximum dimension for OCR (2400px ensures crisp table text)
-  const MAX_DIM = 2400;
-  let targetWidth = img.naturalWidth || img.width || 1600;
-  let targetHeight = img.naturalHeight || img.height || 2200;
+  // Maximum dimension for OCR (2600px preserves small table text on 40+ row dockets)
+  const MAX_DIM = options?.maxDimension || 2600;
+  const rotationDegrees = options?.rotationDegrees || 0;
+  let rawWidth = img.naturalWidth || img.width || 1600;
+  let rawHeight = img.naturalHeight || img.height || 2200;
 
-  if (targetWidth > MAX_DIM || targetHeight > MAX_DIM) {
-    if (targetWidth > targetHeight) {
-      targetHeight = Math.round((targetHeight * MAX_DIM) / targetWidth);
-      targetWidth = MAX_DIM;
+  if (rawWidth > MAX_DIM || rawHeight > MAX_DIM) {
+    if (rawWidth > rawHeight) {
+      rawHeight = Math.round((rawHeight * MAX_DIM) / rawWidth);
+      rawWidth = MAX_DIM;
     } else {
-      targetWidth = Math.round((targetWidth * MAX_DIM) / targetHeight);
-      targetHeight = MAX_DIM;
+      rawWidth = Math.round((rawWidth * MAX_DIM) / rawHeight);
+      rawHeight = MAX_DIM;
     }
   }
+
+  const targetWidth = rotationDegrees === 90 || rotationDegrees === 270 ? rawHeight : rawWidth;
+  const targetHeight = rotationDegrees === 90 || rotationDegrees === 270 ? rawWidth : rawHeight;
 
   const canvas = document.createElement('canvas');
   canvas.width = targetWidth;
@@ -399,6 +704,7 @@ export async function preprocessDocketImage(
         darkPixelRatioAfter: 0,
         wasInvertedFromDarkBackground: false,
         safeguardTriggered: false,
+        rotationAppliedDegrees: rotationDegrees,
         durationMs: Math.max(
           1,
           Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startMs)
@@ -409,7 +715,16 @@ export async function preprocessDocketImage(
 
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, targetWidth, targetHeight);
-  ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+  if (rotationDegrees !== 0) {
+    ctx.save();
+    ctx.translate(targetWidth / 2, targetHeight / 2);
+    ctx.rotate((rotationDegrees * Math.PI) / 180);
+    ctx.drawImage(img, -rawWidth / 2, -rawHeight / 2, rawWidth, rawHeight);
+    ctx.restore();
+  } else {
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+  }
 
   const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
   const diagnostics = preprocessRgbaImageBufferInPlace(
@@ -417,6 +732,7 @@ export async function preprocessDocketImage(
     targetWidth,
     targetHeight
   );
+  diagnostics.rotationAppliedDegrees = rotationDegrees;
 
   ctx.putImageData(imageData, 0, 0);
 

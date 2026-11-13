@@ -22,14 +22,11 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const DEFAULT_PRIMARY_MODEL = 'gemini-3.8-flash';
-const DEFAULT_FALLBACK_MODELS = [
-  'gemini-3-flash-preview',
-  'gemini-3.1-flash-lite-preview',
-  'gemini-flash-latest',
-] as const;
-const MAX_AUTOMATIC_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 2000;
+const DEFAULT_PRIMARY_MODEL = 'gemini-4-hydrogen';
+const DEFAULT_FALLBACK_MODELS = ['gemini-3.1-flash-lite'] as const;
+const GEMINI_REQUEST_TIMEOUT_MS = 22000;
+const MAX_AUTOMATIC_RETRIES = 1;
+const INITIAL_BACKOFF_MS = 1800;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -138,6 +135,14 @@ async function callGeminiRestSingleAttempt(
 ): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
+  const generationConfig: Record<string, unknown> = {
+    responseMimeType: 'application/json',
+    responseSchema,
+  };
+  if (model.includes('gemini-4-hydrogen')) {
+    generationConfig.thinkingConfig = { thinkingLevel: 'LOW' };
+  }
+
   const requestBody = {
     systemInstruction: {
       parts: [{ text: systemInstruction }],
@@ -147,17 +152,32 @@ async function callGeminiRestSingleAttempt(
         parts,
       },
     ],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema,
-    },
+    generationConfig,
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+  } catch (fetchErr: any) {
+    if (controller.signal.aborted || fetchErr?.name === 'AbortError') {
+      const timeoutErr: any = new Error(
+        `Gemini API request to ${model} timed out after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s (HTTP 504).`
+      );
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw fetchErr;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!response.ok) {
     const errText = await response.text();

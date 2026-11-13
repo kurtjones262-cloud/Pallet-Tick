@@ -14,7 +14,8 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const PRIMARY_MODEL = 'gemini-3.8-flash';
+const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const GEMINI_REQUEST_TIMEOUT_MS = 22000;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -98,17 +99,26 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
     };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${PRIMARY_MODEL}:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema,
-        },
-      }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            responseSchema,
+            thinkingConfig: { thinkingLevel: 'LOW' },
+          },
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       return new Response(JSON.stringify({ items: [] }), {

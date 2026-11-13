@@ -261,6 +261,32 @@ async function verifyTesseractAssetsReachable(): Promise<{
  * - Propagates worker initialization and language loading failures properly.
  * - Clears stale IndexedDB worker cache ONLY when recovering from an initialization failure.
  */
+const DEFAULT_DOCKET_WORKER_INIT_TIMEOUT_MS = 15000;
+let customWorkerInitTimeoutMsForTesting: number | null = null;
+
+export function setDocketWorkerInitTimeoutForTesting(timeoutMs: number | null): void {
+  customWorkerInitTimeoutMsForTesting = timeoutMs;
+}
+
+function withDocketWorkerInitTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  const timeoutMs = customWorkerInitTimeoutMsForTesting ?? DEFAULT_DOCKET_WORKER_INIT_TIMEOUT_MS;
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(
+        new Error(
+          `Tesseract worker initialization timed out after ${timeoutMs}ms (${label}).`
+        )
+      );
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  });
+}
+
 export async function getOrInitDocketTesseractWorker(
   onStageEvent?: (event: { status: string; progress: number }) => void
 ): Promise<any> {
@@ -311,17 +337,20 @@ export async function getOrInitDocketTesseractWorker(
       try {
         // IMPORTANT: Do NOT pass a non-throwing errorHandler to createWorker in tesseract.js v7,
         // because createWorker.js suppresses promise rejection on loadLanguage/initialize if errorHandler is defined.
-        const worker = await createWorkerFn('eng', OEM.LSTM_ONLY, {
-          workerPath: assetCheck.workerScriptLoaded
-            ? `${origin}/tesseract/worker.min.js`
-            : undefined,
-          workerBlobURL: false,
-          corePath: assetCheck.wasmCoreLoaded ? `${origin}/tesseract/core` : undefined,
-          langPath: assetCheck.trainedDataLoaded ? `${origin}/tesseract/lang-data` : undefined,
-          gzip: true,
-          cacheMethod: 'none',
-          logger: loggerFn,
-        });
+        const worker = await withDocketWorkerInitTimeout(
+          createWorkerFn('eng', OEM.LSTM_ONLY, {
+            workerPath: assetCheck.workerScriptLoaded
+              ? `${origin}/tesseract/worker.min.js`
+              : undefined,
+            workerBlobURL: false,
+            corePath: assetCheck.wasmCoreLoaded ? `${origin}/tesseract/core` : undefined,
+            langPath: assetCheck.trainedDataLoaded ? `${origin}/tesseract/lang-data` : undefined,
+            gzip: true,
+            cacheMethod: 'none',
+            logger: loggerFn,
+          }),
+          'browser-primary'
+        );
         await worker.setParameters({
           tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
           preserve_interword_spaces: '1',
@@ -346,15 +375,18 @@ export async function getOrInitDocketTesseractWorker(
           }
         }
 
-        const fallbackWorker = await createWorkerFn('eng', OEM.LSTM_ONLY, {
-          workerPath: `${origin}/tesseract/worker.min.js`,
-          workerBlobURL: true,
-          corePath: `${origin}/tesseract/core`,
-          langPath: `${origin}/tesseract/lang-data`,
-          gzip: true,
-          cacheMethod: 'none',
-          logger: loggerFn,
-        });
+        const fallbackWorker = await withDocketWorkerInitTimeout(
+          createWorkerFn('eng', OEM.LSTM_ONLY, {
+            workerPath: `${origin}/tesseract/worker.min.js`,
+            workerBlobURL: true,
+            corePath: `${origin}/tesseract/core`,
+            langPath: `${origin}/tesseract/lang-data`,
+            gzip: true,
+            cacheMethod: 'none',
+            logger: loggerFn,
+          }),
+          'browser-blob-fallback'
+        );
         await fallbackWorker.setParameters({
           tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
           preserve_interword_spaces: '1',
@@ -370,12 +402,15 @@ export async function getOrInitDocketTesseractWorker(
       // Node.js runtime or injected test factory
       const pathMod = await import('path');
       const localLangPath = pathMod.resolve(process.cwd(), 'public/tesseract/lang-data');
-      const nodeWorker = await createWorkerFn('eng', OEM.LSTM_ONLY, {
-        langPath: localLangPath,
-        gzip: true,
-        cacheMethod: 'none',
-        logger: loggerFn,
-      });
+      const nodeWorker = await withDocketWorkerInitTimeout(
+        createWorkerFn('eng', OEM.LSTM_ONLY, {
+          langPath: localLangPath,
+          gzip: true,
+          cacheMethod: 'none',
+          logger: loggerFn,
+        }),
+        'node-worker'
+      );
       if (typeof nodeWorker?.setParameters === 'function') {
         await nodeWorker.setParameters({
           tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
@@ -586,6 +621,8 @@ export async function recognizeDocketPageWithTesseract(
 
   const isRealImage = hasRealImagePayload(imageSource);
 
+  let nodeRawBufferForRotation: Buffer | null = null;
+
   if (isBrowser && isRealImage && (typeof imageSource === 'string' || imageSource instanceof File)) {
     const prep = await preprocessDocketImage(imageSource);
     originalDataUrl = prep.displayDataUrl;
@@ -596,7 +633,7 @@ export async function recognizeDocketPageWithTesseract(
     recordStage?.(
       `page_${pageNumber}_image_preprocess`,
       'ok',
-      `Page ${pageNumber} preprocessed (${width}x${height}, pLow=${prep.diagnostics?.pLow ?? 0}, pHigh=${prep.diagnostics?.pHigh ?? 255}, whiteRatio=${prep.diagnostics?.whitePixelRatioAfter ?? 1})`,
+      `Page ${pageNumber} preprocessed (${width}x${height}, pLow=${prep.diagnostics?.pLow ?? 0}, pHigh=${prep.diagnostics?.pHigh ?? 255}, whiteRatio=${prep.diagnostics?.whitePixelRatioAfter ?? 1}, localNorm=${Boolean(prep.diagnostics?.localIlluminationNormalized)})`,
       Math.round(performance.now() - prepStartMs)
     );
   } else if (typeof imageSource === 'string') {
@@ -610,6 +647,47 @@ export async function recognizeDocketPageWithTesseract(
         `Page ${pageNumber} BMP normalized (pLow=${bmpNorm.pLow}, pHigh=${bmpNorm.pHigh}, whiteRatio=${bmpNorm.whiteRatio})`,
         Math.round(performance.now() - prepStartMs)
       );
+    } else if (!isBrowser && isRealImage && !customWorkerFactoryForTesting && imageSource.startsWith('data:image/')) {
+      try {
+        const commaIdx = imageSource.indexOf(',');
+        const b64 = commaIdx >= 0 ? imageSource.slice(commaIdx + 1) : '';
+        const buf = Buffer.from(b64, 'base64');
+        nodeRawBufferForRotation = buf;
+        const sharpMod = await import('sharp');
+        const sharp = (sharpMod.default || sharpMod) as any;
+        const { data, info } = await sharp(buf)
+          .rotate()
+          .resize(2600, 2600, { fit: 'inside', withoutEnlargement: true })
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
+        const { preprocessRgbaImageBufferInPlace } = await import('./imagePreprocessing');
+        const diag = preprocessRgbaImageBufferInPlace(clamped, info.width, info.height);
+        const preprocessedBuf = await sharp(Buffer.from(clamped), {
+          raw: { width: info.width, height: info.height, channels: 4 },
+        })
+          .jpeg({ quality: 92 })
+          .toBuffer();
+        preprocessedDataUrl = `data:image/jpeg;base64,${preprocessedBuf.toString('base64')}`;
+        width = info.width;
+        height = info.height;
+        hashInput = preprocessedDataUrl;
+        recordStage?.(
+          `page_${pageNumber}_image_preprocess`,
+          'ok',
+          `Page ${pageNumber} dataUrl preprocessed via sharp (${width}x${height}, pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter}, localNorm=${Boolean(diag.localIlluminationNormalized)})`,
+          Math.round(performance.now() - prepStartMs)
+        );
+      } catch {
+        preprocessedDataUrl = imageSource;
+        recordStage?.(
+          `page_${pageNumber}_image_preprocess`,
+          'ok',
+          `Page ${pageNumber} image staged (${imageSource.length} chars)`,
+          Math.round(performance.now() - prepStartMs)
+        );
+      }
     } else {
       preprocessedDataUrl = imageSource;
       recordStage?.(
@@ -633,7 +711,13 @@ export async function recognizeDocketPageWithTesseract(
         const sharpMod = await import('sharp');
         const sharp = (sharpMod.default || sharpMod) as any;
         const buf = Buffer.isBuffer(imageSource) ? imageSource : Buffer.from(imageSource);
-        const { data, info } = await sharp(buf).rotate().ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        nodeRawBufferForRotation = buf;
+        const { data, info } = await sharp(buf)
+          .rotate()
+          .resize(2600, 2600, { fit: 'inside', withoutEnlargement: true })
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
         const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
         const { preprocessRgbaImageBufferInPlace } = await import('./imagePreprocessing');
         const diag = preprocessRgbaImageBufferInPlace(clamped, info.width, info.height);
@@ -649,7 +733,7 @@ export async function recognizeDocketPageWithTesseract(
         recordStage?.(
           `page_${pageNumber}_image_preprocess`,
           'ok',
-          `Page ${pageNumber} buffer preprocessed via sharp (${width}x${height}, pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter})`,
+          `Page ${pageNumber} buffer preprocessed via sharp (${width}x${height}, pLow=${diag.pLow}, pHigh=${diag.pHigh}, whiteRatio=${diag.whitePixelRatioAfter}, localNorm=${Boolean(diag.localIlluminationNormalized)})`,
           Math.round(performance.now() - prepStartMs)
         );
       } catch {
@@ -712,76 +796,8 @@ export async function recognizeDocketPageWithTesseract(
   let workerInitDurationMs = 0;
   let ocrDurationMs = 0;
 
-  // 1. ALWAYS run Tesseract.js LSTM OCR when a real decodable image or rendered PDF page image is present
-  // (or when a test worker factory is injected)
-  if (isRealImage || customWorkerFactoryForTesting) {
-    const workerInitStartMs = performance.now();
-    const worker = await getOrInitDocketTesseractWorker();
-    workerInitDurationMs = Math.max(0, Math.round(performance.now() - workerInitStartMs));
-    recordStage?.(
-      `page_${pageNumber}_worker_ready`,
-      'ok',
-      `Tesseract LSTM worker ready (worker.min.js=${workerAssetState.workerScriptLoaded}, wasm=${workerAssetState.wasmCoreLoaded}, eng.traineddata.gz=${workerAssetState.trainedDataLoaded})`,
-      workerInitDurationMs
-    );
-
-    activeDocketProgressHook = onRecognizeProgress || null;
-    let recognitionOutput: any = null;
-    const recStartMs = performance.now();
-
-    try {
-      const targetForTesseract = preprocessedDataUrl || imageSource;
-      recognizeCalled = true;
-      try {
-        recognitionOutput = await worker.recognize(
-          targetForTesseract,
-          {},
-          { text: true, tsv: true, blocks: true }
-        );
-      } catch (blocksErr: any) {
-        // In tesseract.js v7, `blocks: true` runs `JSON.parse(api.GetJSONText())` inside the worker,
-        // which can throw a SyntaxError if OCR text contains unescaped quotes or backslashes.
-        // Report the actual error in diagnostics and retry with `{ text: true, tsv: true }`.
-        recordStage?.(
-          `page_${pageNumber}_recognize_blocks_retry`,
-          'warn',
-          `Retrying worker.recognize with TSV+UTF8 output after GetJSONText error: ${blocksErr?.message || String(blocksErr)}`
-        );
-        recognitionOutput = await worker.recognize(
-          targetForTesseract,
-          {},
-          { text: true, tsv: true }
-        );
-      }
-      ocrDurationMs = Math.max(1, Math.round(performance.now() - recStartMs));
-    } catch (ocrErr: any) {
-      ocrDurationMs = Math.max(1, Math.round(performance.now() - recStartMs));
-      recognizeError = ocrErr?.message || String(ocrErr || 'Unknown Tesseract recognize error');
-      recordStage?.(
-        `page_${pageNumber}_recognize_error`,
-        'error',
-        `worker.recognize failed on page ${pageNumber}: ${recognizeError}`,
-        ocrDurationMs
-      );
-      // If no fallback selectable PDF text exists on this page, propagate the recognition failure
-      // rather than silently converting it into an empty result without error context.
-      const hasFallbackPdfLines =
-        textHint?.hasSelectableText &&
-        Array.isArray(textHint.selectableLines) &&
-        textHint.selectableLines.length > 0;
-      if (!hasFallbackPdfLines) {
-        throw new Error(`Tesseract recognition failed on page ${pageNumber}: ${recognizeError}`);
-      }
-    } finally {
-      activeDocketProgressHook = null;
-    }
-
-    const data = recognitionOutput?.data || {};
-    if (typeof data.confidence === 'number') {
-      defaultDataConfidence = data.confidence;
-    }
-
-    // Extract positioned words from data.blocks, data.tsv, or data.words
+  // Helper to extract RawOcrWords from Tesseract recognitionOutput
+  const extractRawWordsFromOutput = (data: any): RawOcrWord[] => {
     let rawWords: RawOcrWord[] = [];
     if (Array.isArray(data.blocks) && data.blocks.length > 0) {
       for (const block of data.blocks) {
@@ -806,11 +822,9 @@ export async function recognizeDocketPageWithTesseract(
         }
       }
     }
-
     if (rawWords.length === 0 && typeof data.tsv === 'string' && data.tsv.trim()) {
       rawWords = parseTsvToPositionedWords(data.tsv);
     }
-
     if (rawWords.length === 0 && Array.isArray(data.words)) {
       for (const w of data.words) {
         const txt = String(w?.text || '').trim();
@@ -826,6 +840,196 @@ export async function recognizeDocketPageWithTesseract(
             y1: Number(b.y1) || 0,
           },
         });
+      }
+    }
+    return rawWords;
+  };
+
+  // 1. ALWAYS run Tesseract.js LSTM OCR when a real decodable image or rendered PDF page image is present
+  // (or when a test worker factory is injected)
+  if (isRealImage || customWorkerFactoryForTesting) {
+    const workerInitStartMs = performance.now();
+    const worker = await getOrInitDocketTesseractWorker();
+    workerInitDurationMs = Math.max(0, Math.round(performance.now() - workerInitStartMs));
+    recordStage?.(
+      `page_${pageNumber}_worker_ready`,
+      'ok',
+      `Tesseract LSTM worker ready (worker.min.js=${workerAssetState.workerScriptLoaded}, wasm=${workerAssetState.wasmCoreLoaded}, eng.traineddata.gz=${workerAssetState.trainedDataLoaded})`,
+      workerInitDurationMs
+    );
+
+    activeDocketProgressHook = onRecognizeProgress || null;
+    let recognitionOutput: any = null;
+    const recStartMs = performance.now();
+
+    try {
+      const targetForTesseract = preprocessedDataUrl || imageSource;
+      recognizeCalled = true;
+      if (customWorkerFactoryForTesting) {
+        try {
+          recognitionOutput = await worker.recognize(
+            targetForTesseract,
+            {},
+            { text: true, tsv: true, blocks: true }
+          );
+        } catch (blocksErr: any) {
+          recordStage?.(
+            `page_${pageNumber}_recognize_blocks_retry`,
+            'warn',
+            `Retrying worker.recognize with TSV+UTF8 output after GetJSONText error: ${blocksErr?.message || String(blocksErr)}`
+          );
+          recognitionOutput = await worker.recognize(
+            targetForTesseract,
+            {},
+            { text: true, tsv: true }
+          );
+        }
+      } else {
+        // Use TSV + UTF-8 text output directly so unescaped quotes ("") in part descriptions
+        // never trigger Tesseract v7's GetJSONText JSON.parse SyntaxError or require a double OCR pass.
+        recognitionOutput = await worker.recognize(
+          targetForTesseract,
+          {},
+          { text: true, tsv: true }
+        );
+      }
+      ocrDurationMs = Math.max(1, Math.round(performance.now() - recStartMs));
+    } catch (ocrErr: any) {
+      ocrDurationMs = Math.max(1, Math.round(performance.now() - recStartMs));
+      recognizeError = ocrErr?.message || String(ocrErr || 'Unknown Tesseract recognize error');
+      recordStage?.(
+        `page_${pageNumber}_recognize_error`,
+        'error',
+        `worker.recognize failed on page ${pageNumber}: ${recognizeError}`,
+        ocrDurationMs
+      );
+      const hasFallbackPdfLines =
+        textHint?.hasSelectableText &&
+        Array.isArray(textHint.selectableLines) &&
+        textHint.selectableLines.length > 0;
+      if (!hasFallbackPdfLines) {
+        throw new Error(`Tesseract recognition failed on page ${pageNumber}: ${recognizeError}`);
+      }
+    } finally {
+      activeDocketProgressHook = null;
+    }
+
+    let data = recognitionOutput?.data || {};
+    if (typeof data.confidence === 'number') {
+      defaultDataConfidence = data.confidence;
+    }
+
+    let rawWords = extractRawWordsFromOutput(data);
+    const alphaNumWordsCount = (words: RawOcrWord[]) =>
+      words.filter((w) => /[A-Z0-9]{2,}/i.test(w.text) && w.confidence >= 45).length;
+
+    const scoreOrientationCandidate = (
+      words: RawOcrWord[],
+      pageMeanConf: number
+    ): { score: number; keywordHits: number; goodCount: number } => {
+      const goodCount = alphaNumWordsCount(words);
+      const highConfCount = words.filter(
+        (w) => /^[A-Z0-9\-/]{2,}$/i.test(w.text.trim()) && w.confidence >= 62
+      ).length;
+      const keywordHits = words.filter((w) =>
+        /^(?:docket|order|job|client|despatch|part|description|line|ord\/?q|back|qty|ea|laser|central|gci|plate|tapped|countersink|delivery|invoice)$/i.test(
+          w.text.replace(/[^A-Za-z0-9/]/g, '')
+        ) || /^(?:J1[2-6]\d{7}|1[LY]Y\d{4}|DKW\d{6})$/i.test(w.text.trim())
+      ).length;
+      const score = goodCount * 2 + highConfCount * 3 + keywordHits * 35 + Math.round(pageMeanConf * 2);
+      return { score, keywordHits, goodCount };
+    };
+
+    const initialEval = scoreOrientationCandidate(rawWords, defaultDataConfidence);
+    const isLikelyRotatedPage =
+      isRealImage &&
+      !customWorkerFactoryForTesting &&
+      ((width > height * 1.08 && initialEval.keywordHits < 2) ||
+        initialEval.goodCount < 10 ||
+        (defaultDataConfidence < 52 && initialEval.keywordHits < 2));
+
+    if (isLikelyRotatedPage) {
+      const candidateAngles: Array<90 | 270 | 180> =
+        width > height ? [90, 270, 180] : [180, 90, 270];
+      let bestWords = rawWords;
+      let bestScore = initialEval.score;
+      let bestGoodCount = initialEval.goodCount;
+      let bestData = data;
+      let bestPreprocessedUrl = preprocessedDataUrl;
+      let bestW = width;
+      let bestH = height;
+      let chosenAngle = 0;
+
+      for (const angle of candidateAngles) {
+        try {
+          let rotDataUrl = '';
+          let rotW = width;
+          let rotH = height;
+          if (isBrowser && (typeof imageSource === 'string' || imageSource instanceof File)) {
+            const rotPrep = await preprocessDocketImage(imageSource, { rotationDegrees: angle });
+            rotDataUrl = rotPrep.ocrDataUrl;
+            rotW = rotPrep.width;
+            rotH = rotPrep.height;
+          } else if (!isBrowser && nodeRawBufferForRotation) {
+            const sharpMod = await import('sharp');
+            const sharp = (sharpMod.default || sharpMod) as any;
+            const { data: rData, info: rInfo } = await sharp(nodeRawBufferForRotation)
+              .rotate()
+              .rotate(angle)
+              .resize(2600, 2600, { fit: 'inside', withoutEnlargement: true })
+              .ensureAlpha()
+              .raw()
+              .toBuffer({ resolveWithObject: true });
+            const rClamped = new Uint8ClampedArray(rData.buffer, rData.byteOffset, rData.byteLength);
+            const { preprocessRgbaImageBufferInPlace } = await import('./imagePreprocessing');
+            preprocessRgbaImageBufferInPlace(rClamped, rInfo.width, rInfo.height);
+            const rBuf = await sharp(Buffer.from(rClamped), {
+              raw: { width: rInfo.width, height: rInfo.height, channels: 4 },
+            })
+              .jpeg({ quality: 92 })
+              .toBuffer();
+            rotDataUrl = `data:image/jpeg;base64,${rBuf.toString('base64')}`;
+            rotW = rInfo.width;
+            rotH = rInfo.height;
+          }
+          if (!rotDataUrl) continue;
+
+          const rotRec = await worker.recognize(rotDataUrl, {}, { text: true, tsv: true });
+          const rotData = rotRec?.data || {};
+          const rotWords = extractRawWordsFromOutput(rotData);
+          const rotConf = typeof rotData.confidence === 'number' ? rotData.confidence : 0;
+          const rotEval = scoreOrientationCandidate(rotWords, rotConf);
+
+          if (rotEval.score > bestScore * 1.2 && rotEval.goodCount >= 8) {
+            bestScore = rotEval.score;
+            bestGoodCount = rotEval.goodCount;
+            bestWords = rotWords;
+            bestData = rotData;
+            bestPreprocessedUrl = rotDataUrl;
+            bestW = rotW;
+            bestH = rotH;
+            chosenAngle = angle;
+            if (rotEval.keywordHits >= 4 && rotConf >= 58) break;
+          }
+        } catch {
+          // Ignore rotation candidate error
+        }
+      }
+
+      if (chosenAngle !== 0) {
+        rawWords = bestWords;
+        data = bestData;
+        preprocessedDataUrl = bestPreprocessedUrl;
+        width = bestW;
+        height = bestH;
+        if (typeof data.confidence === 'number') {
+          defaultDataConfidence = data.confidence;
+        }
+        recordStage?.(
+          `page_${pageNumber}_orientation_recovery`,
+          'ok',
+          `Recovered rotated page orientation (${chosenAngle}° clockwise, goodWords=${bestGoodCount}, conf=${defaultDataConfidence}%)`
+        );
       }
     }
 

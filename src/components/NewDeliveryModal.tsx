@@ -178,7 +178,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
             `${filePrefix}Staging image "${file.name || `Photo ${i + 1}`}"...`
           );
           try {
-            const prepared = await prepareColorImageForGemini(file, 1800);
+            const prepared = await prepareColorImageForGemini(file, 2600, 0.92);
             newPages.push({
               id: `page_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
               sourceFileId,
@@ -252,7 +252,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
 
         // 4. Generic fallback: attempt image/dataUrl load
         try {
-          const prepared = await prepareColorImageForGemini(file, 1800);
+          const prepared = await prepareColorImageForGemini(file, 2600, 0.92);
           newPages.push({
             id: `file_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
             sourceFileId,

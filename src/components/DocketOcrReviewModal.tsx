@@ -624,7 +624,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   <Sparkles className="w-2.5 h-2.5 text-amber-600" />
                   <span>
                     {activeExtractionMeta.extractionEngineLabel ||
-                      `Gemini AI (${activeExtractionMeta.aiModelUsed || 'gemini-3.8-flash'})`}
+                      `Gemini AI (${activeExtractionMeta.aiModelUsed || 'gemini-4-hydrogen'})`}
                   </span>
                 </span>
               ) : (

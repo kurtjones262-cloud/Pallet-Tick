@@ -68,24 +68,22 @@ async function runTests() {
 
   // Model configuration resolution
   const defaultModels = resolveConfiguredVisionModels();
-  assert.equal(defaultModels.primaryModel, 'gemini-3.8-flash');
+  assert.equal(defaultModels.primaryModel, 'gemini-4-hydrogen');
   assert.deepEqual(defaultModels.fallbackModels, [
-    'gemini-3-flash-preview',
-    'gemini-3.1-flash-lite-preview',
-    'gemini-flash-latest',
+    'gemini-3.1-flash-lite',
   ]);
   const customModels = resolveConfiguredVisionModels({
     GEMINI_PRIMARY_MODEL: 'gemini-3.8-flash',
-    GEMINI_FALLBACK_MODEL: 'gemini-3-flash-preview,gemini-2.5-flash',
+    GEMINI_FALLBACK_MODEL: 'gemini-3-flash-preview,gemini-3.1-flash-lite',
   });
-  assert.equal(customModels.primaryModel, 'gemini-3.8-flash');
-  assert.deepEqual(customModels.fallbackModels, ['gemini-3-flash-preview', 'gemini-2.5-flash']);
+  assert.equal(customModels.primaryModel, 'gemini-4-hydrogen');
+  assert.deepEqual(customModels.fallbackModels, ['gemini-3.1-flash-lite']);
   console.log(
-    `  ✅ PASS: Configurable primary & fallback models resolved (${defaultModels.primaryModel} -> ${defaultModels.fallbackModels.join(' -> ')})`
+    `  ✅ PASS: Configurable primary & fallback models resolved & legacy names normalized (${defaultModels.primaryModel} -> ${defaultModels.fallbackModels.join(' -> ')})`
   );
   passed += 2;
 
-  // Test generateWithRetryAndFallback: Primary model fails 4 times (initial + 3 retries) with 503,
+  // Test generateWithRetryAndFallback: Primary model fails 2 times (initial + 1 retry) with 503,
   // then falls back to secondary model with identical systemInstruction and responseSchema
   const callLog: Array<{ model: string; systemInstruction: string; responseSchema: any }> = [];
   const mockAiFallbackSuccess = {
@@ -96,7 +94,7 @@ async function runTests() {
           systemInstruction: req.config.systemInstruction,
           responseSchema: req.config.responseSchema,
         });
-        if (req.model === 'gemini-3.8-flash') {
+        if (req.model === 'gemini-4-hydrogen') {
           const e: any = new Error('503 UNAVAILABLE: Model is experiencing high demand');
           e.status = 503;
           throw e;
@@ -122,24 +120,24 @@ async function runTests() {
     testSchema,
     'batch',
     {
-      GEMINI_PRIMARY_MODEL: 'gemini-3.8-flash',
-      GEMINI_FALLBACK_MODEL: 'gemini-3-flash-preview',
+      GEMINI_PRIMARY_MODEL: 'gemini-4-hydrogen',
+      GEMINI_FALLBACK_MODEL: 'gemini-3.1-flash-lite',
     },
     1 // 1ms base delay for fast test execution
   );
 
-  // Primary model must be called 4 times (1 initial + 3 retries), then fallback model called once = 5 total calls
-  const primaryCalls = callLog.filter((c) => c.model === 'gemini-3.8-flash');
-  const fallbackCalls = callLog.filter((c) => c.model === 'gemini-3-flash-preview');
-  assert.equal(primaryCalls.length, 4, 'Primary model must execute initial attempt + max 3 automatic retries');
-  assert.equal(fallbackCalls.length, 1, 'Secondary fallback model must be invoked after primary retries exhaust');
+  // Primary model must be called 2 times (1 initial + 1 retry), then fallback model called once = 3 total calls
+  const primaryCalls = callLog.filter((c) => c.model === 'gemini-4-hydrogen');
+  const fallbackCalls = callLog.filter((c) => c.model === 'gemini-3.1-flash-lite');
+  assert.equal(primaryCalls.length, 2, 'Primary model must execute initial attempt + max 1 automatic retry');
+  assert.equal(fallbackCalls.length, 1, 'Secondary fallback model must be invoked after primary retry exhausts');
   assert.equal(fallbackCalls[0].systemInstruction, testSysInstruction, 'Fallback model must use identical systemInstruction');
   assert.deepEqual(fallbackCalls[0].responseSchema, testSchema, 'Fallback model must use identical responseSchema');
-  assert.equal(fallbackResult.modelUsed, 'gemini-3-flash-preview');
+  assert.equal(fallbackResult.modelUsed, 'gemini-3.1-flash-lite');
   assert.equal(fallbackResult.fallbackUsed, true);
-  assert.equal(fallbackResult.retryAttempts, 3);
+  assert.equal(fallbackResult.retryAttempts, 1);
   assert.equal(fallbackResult.parsed.items[0].part, 'FB-100');
-  console.log('  ✅ PASS: Primary model retried exactly 3 times on 503, then succeeded on fallback model with identical schema & instructions');
+  console.log('  ✅ PASS: Primary model retried at most 1 time on 503, then succeeded on fallback model with identical schema & instructions');
   passed += 6;
 
   // Test non-retryable 400 Invalid API Key / Malformed Request: must abort immediately with 0 retries and 0 fallback calls
@@ -163,7 +161,7 @@ async function runTests() {
         testSysInstruction,
         testSchema,
         'batch',
-        { GEMINI_PRIMARY_MODEL: 'gemini-3.8-flash', GEMINI_FALLBACK_MODEL: 'gemini-3-flash-preview' },
+        { GEMINI_PRIMARY_MODEL: 'gemini-4-hydrogen', GEMINI_FALLBACK_MODEL: 'gemini-3.1-flash-lite' },
         1
       ),
     /API key not valid/

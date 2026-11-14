@@ -35,6 +35,7 @@ import {
   buildRestDocketResponseSchema,
   normalizeRawBatchItem,
   isGciSupplierHint,
+  isGciExcludedNonPartItem,
   normalizeGciDispatchDate,
   resolveGciPageHeaderFields,
 } from './src/server/docketOcr.ts';
@@ -731,10 +732,25 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
 
   const builtDockets = segments.map((seg) => {
     const items: any[] = [];
+    const excludedRowNos = new Set<number>();
     let autoSeq = 1;
     for (const rawIt of seg.rawItems) {
+      if (isGci && isGciExcludedNonPartItem(rawIt?.part, rawIt?.desc)) {
+        const exNo = parseInt(parseCleanRowNo(rawIt?.no), 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          excludedRowNos.add(exNo);
+        }
+        continue;
+      }
       const normalized = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
       if (!normalized) continue;
+      if (isGci && isGciExcludedNonPartItem(normalized.item.partNumber, normalized.item.description)) {
+        const exNo = parseInt(normalized.cleanNo, 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          excludedRowNos.add(exNo);
+        }
+        continue;
+      }
       items.push({
         ...normalized.item,
         itemNumber: normalized.cleanNo || String(autoSeq++),
@@ -753,6 +769,7 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
       jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items,
+      excludedRowNumbers: excludedRowNos.size > 0 ? Array.from(excludedRowNos).sort((a, b) => a - b) : undefined,
       confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
       needsManualReview: items.length === 0 || seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber),
       separationUncertain: seg.separationUncertain,

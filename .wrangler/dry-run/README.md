@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "pallet-tick" generated at 2026-11-14T04:06:31.887Z.

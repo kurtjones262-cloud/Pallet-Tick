@@ -77,6 +77,7 @@ export interface ExtractedDocketResult {
   validationFlags?: string[];
   validationWarnings?: string[];
   missingRowNumbers?: number[];
+  excludedRowNumbers?: number[];
   flaggedRowCount?: number;
   hasPrintedNoColumn?: boolean;
   firstVisibleRowNo?: number;
@@ -717,6 +718,105 @@ export function resolveGciPageHeaderFields(
   };
 }
 
+/**
+ * Deterministic GCI-only filter for administrative/service table entries that are not physical manufactured parts:
+ * 1. Customer Labels:
+ *    - Client Part Code: CUSTOMER-LABELS (tolerating CUSTOMER LABELS, CUSTOMER_LABELS, CUSTOMERLABELS, etc.)
+ *    - Part Description: CUSTOMER LABELS
+ * 2. Delivery / Transport:
+ *    - Client Part Code: DELIVERY_EXCL (tolerating DELIVERY EXCL, DELIVERY-EXCL, DELIVERYEXCL, etc.)
+ *    - Part Description: CUSTOMERS TRANSPORT
+ *
+ * Uses Client Part Code as the primary exclusion identifier, and uses the clearly matching
+ * administrative description as a secondary check when the part code is missing, unreadable, or a placeholder.
+ * Never excludes genuine manufactured parts (including those with TAPPED, NO CSK, COUNTERSINK, or words like "delivery" or "labels" in longer part descriptions).
+ */
+export function isGciExcludedNonPartItem(
+  rawPart?: string | null,
+  rawDesc?: string | null
+): boolean {
+  const cleanPart = String(rawPart || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
+    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const cleanDesc = String(rawDesc || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
+    .replace(/\b\d+\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const partCanonical = cleanPart
+    .toUpperCase()
+    .replace(/['’`]/g, '')
+    .replace(/[\s\-_./]+/g, '_');
+  const partCompact = partCanonical.replace(/_/g, '');
+
+  // Primary check: Client Part Code matches CUSTOMER-LABELS or DELIVERY_EXCL variations
+  if (
+    partCanonical === 'CUSTOMER_LABELS' ||
+    partCanonical === 'CUSTOMER_LABEL' ||
+    partCanonical === 'CUSTOMERS_LABELS' ||
+    partCanonical === 'CUSTOMERS_LABEL' ||
+    partCompact === 'CUSTOMERLABELS' ||
+    partCompact === 'CUSTOMERLABEL' ||
+    partCompact === 'CUSTOMERSLABELS' ||
+    partCanonical === 'DELIVERY_EXCL' ||
+    partCanonical === 'DELIVERY_EXCI' ||
+    partCanonical === 'DELIVERY_EXL' ||
+    partCompact === 'DELIVERYEXCL' ||
+    partCompact === 'DELIVERYEXCI' ||
+    partCompact === 'DELIVERYEXL'
+  ) {
+    return true;
+  }
+
+  // Secondary check: When Client Part Code is missing, unreadable, a placeholder, or copied from the description,
+  // check whether the Part Description clearly matches CUSTOMER LABELS or CUSTOMERS TRANSPORT.
+  const descCanonical = cleanDesc
+    .toUpperCase()
+    .replace(/['’`]/g, '')
+    .replace(/[\s\-_./]+/g, '_');
+  const descCompact = descCanonical.replace(/_/g, '');
+
+  const isCustomerLabelsDesc =
+    descCanonical === 'CUSTOMER_LABELS' ||
+    descCanonical === 'CUSTOMER_LABEL' ||
+    descCanonical === 'CUSTOMERS_LABELS' ||
+    descCanonical === 'CUSTOMERS_LABEL' ||
+    descCompact === 'CUSTOMERLABELS' ||
+    descCompact === 'CUSTOMERLABEL';
+
+  const isCustomersTransportDesc =
+    descCanonical === 'CUSTOMERS_TRANSPORT' ||
+    descCanonical === 'CUSTOMER_TRANSPORT' ||
+    descCanonical === 'DELIVERY_EXCL' ||
+    descCanonical === 'DELIVERY_EXCI' ||
+    descCompact === 'CUSTOMERSTRANSPORT' ||
+    descCompact === 'CUSTOMERTRANSPORT' ||
+    descCompact === 'DELIVERYEXCL';
+
+  if (isCustomerLabelsDesc || isCustomersTransportDesc) {
+    const isCodeMissingOrUnreadable =
+      !cleanPart ||
+      /^(?:PART|UNKNOWN|N\/?A|NONE|NULL|UNREADABLE|ILLEGIBLE|MISSING|\?+|\-+|\d{1,4})$/i.test(cleanPart) ||
+      partCanonical === descCanonical ||
+      partCompact === descCompact ||
+      (isCustomerLabelsDesc && /^(?:CUSTOMERS?|LABELS?)$/i.test(cleanPart)) ||
+      (isCustomersTransportDesc && /^(?:DELIVERY|EXCL|CUSTOMERS?|TRANSPORT)$/i.test(cleanPart));
+
+    if (isCodeMissingOrUnreadable) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export function buildDocketExtractionPrompt(
   pageDescriptions: string[],
   pageNumbers: number[],
@@ -765,7 +865,8 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - "Despatch Date" / "Dispatch Date" (Australian DD/MM/YYYY format, e.g. 12/11/2026 -> 2026-11-12) -> populate 'deliveryDate' formatted as YYYY-MM-DD.
    - Set 'supplier' to "GCI".
    - Multi-page & multi-docket GCI grouping: Use "Job No" as the primary identifier for independent GCI dockets. Group continuation pages sharing the same "Job No" together; if a page has a different "Job No", set startsNewDocket=true and keep its corresponding "Client Order No" in 'orderNumber'.
-   - Missing or unreadable Job No: If "Job No" is missing or unreadable on a page, leave 'docketNumber' and 'jobNumber' empty "" and note it in 'validationWarnings'. NEVER substitute "Client Order No" into 'docketNumber'.`;
+   - Missing or unreadable Job No: If "Job No" is missing or unreadable on a page, leave 'docketNumber' and 'jobNumber' empty "" and note it in 'validationWarnings'. NEVER substitute "Client Order No" into 'docketNumber'.
+   - Exclude GCI non-part administrative entries: Do NOT include rows with Client Part Code "CUSTOMER-LABELS" (Part Description "CUSTOMER LABELS") or "DELIVERY_EXCL" (Part Description "CUSTOMERS TRANSPORT"). Preserve all genuine manufactured parts (including rows with "TAPPED", "NO CSK", "COUNTERSINK", etc.).`;
 }
 
 export function buildRestDocketResponseSchema(): Record<string, unknown> {
@@ -1838,14 +1939,29 @@ export async function extractDocketWithGeminiVision(
 
   for (const seg of segments) {
     const segByNo = new Map<number, ExtractedDocketItem>();
+    const segExcludedNos = new Set<number>();
     const segUnnumbered: ExtractedDocketItem[] = [];
     const segPageMin = new Map<number, number>();
     const segPageMax = new Map<number, number>();
     let segMaxCandidate = 0;
 
     for (const rawIt of seg.rawItems) {
+      if (isGci && isGciExcludedNonPartItem(rawIt.part, rawIt.desc)) {
+        const exNo = parseInt(parseCleanRowNo(rawIt.no), 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          segExcludedNos.add(exNo);
+        }
+        continue;
+      }
       const norm = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
       if (!norm) continue;
+      if (isGci && isGciExcludedNonPartItem(norm.item.partNumber, norm.item.description)) {
+        const exNo = parseInt(norm.cleanNo, 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          segExcludedNos.add(exNo);
+        }
+        continue;
+      }
       const numNo = parseInt(norm.cleanNo, 10);
       const itemPage = norm.item.pageNumber || seg.pageNumbers[0];
 
@@ -1892,7 +2008,7 @@ export async function extractDocketWithGeminiVision(
     ) {
       const missingNos: number[] = [];
       for (let n = 1; n <= segMaxCandidate; n++) {
-        if (!segByNo.has(n)) missingNos.push(n);
+        if (!segByNo.has(n) && !segExcludedNos.has(n)) missingNos.push(n);
       }
       if (missingNos.length > 0 && missingNos.length <= 60) {
         const missingPerPage = new Map<number, Set<number>>();
@@ -1918,8 +2034,18 @@ export async function extractDocketWithGeminiVision(
           const chunk = recoveryPayloads.slice(i, i + 3);
           const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
           for (const r of recoveredRaw) {
+            if (isGci && isGciExcludedNonPartItem(r.part, r.desc)) {
+              const exNo = parseInt(parseCleanRowNo(r.no), 10);
+              if (!Number.isNaN(exNo) && exNo > 0) segExcludedNos.add(exNo);
+              continue;
+            }
             const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
             if (!norm) continue;
+            if (isGci && isGciExcludedNonPartItem(norm.item.partNumber, norm.item.description)) {
+              const exNo = parseInt(norm.cleanNo, 10);
+              if (!Number.isNaN(exNo) && exNo > 0) segExcludedNos.add(exNo);
+              continue;
+            }
             const numNo = parseInt(norm.cleanNo, 10);
             if (!Number.isNaN(numNo) && numNo > 0 && !segByNo.has(numNo)) {
               segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
@@ -1966,6 +2092,7 @@ export async function extractDocketWithGeminiVision(
       hasPrintedNoColumn: anyPrintedNoColumn,
       firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : undefined,
       lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : undefined,
+      excludedRowNumbers: segExcludedNos.size > 0 ? Array.from(segExcludedNos).sort((a, b) => a - b) : undefined,
       flaggedRowCount: flaggedCount,
       validationFlags: dedupWarnings.length > 0 ? dedupWarnings : undefined,
       validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : undefined,

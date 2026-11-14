@@ -3,6 +3,7 @@ import {
   ExtractedDocketResult,
   GCI_MISSING_JOB_NO_WARNING,
   isGciSupplierHint,
+  isGciExcludedNonPartItem,
   resolveGciPageHeaderFields,
 } from '../server/docketOcr';
 import { SupplierRuleId } from '../types/delivery';
@@ -1801,6 +1802,21 @@ function extractTableItemsWithLayout(
     );
 
     if (item) {
+      if (
+        supplierProfile === 'gci' &&
+        isGciExcludedNonPartItem(item.partNumber, item.description)
+      ) {
+        while (i + 1 < candidateLines.length) {
+          const nextLine = candidateLines[i + 1];
+          if (isDetailContinuationLine(nextLine, docketNumber, orderNumber, columnLayout)) {
+            i++;
+          } else {
+            break;
+          }
+        }
+        continue;
+      }
+
       // Check if this line is actually a wrapped right-hand description fragment of the immediately preceding row
       // (e.g. "**J160798107 - COUNTERSINK" or "**J160798109" split onto the next line without a leading row index)
       const prevItem = items.length > 0 ? items[items.length - 1] : null;
@@ -1839,7 +1855,13 @@ function extractTableItemsWithLayout(
         }
       }
       items.push(item);
-    } else if (looksLikeUnparsedTableCandidateLine(text)) {
+    } else if (
+      looksLikeUnparsedTableCandidateLine(text) &&
+      !(
+        supplierProfile === 'gci' &&
+        /\b(?:CUSTOMERS?[\s\-_./]*LABELS?|DELIVERY[\s\-_./]*EXCL?\.?|CUSTOMERS?\s+TRANSPORT)\b/i.test(text)
+      )
+    ) {
       unparsedCandidateCount++;
     }
   }
@@ -1859,7 +1881,10 @@ function extractTableItemsWithLayout(
           supplierProfile,
           undefined
         );
-        if (item) {
+        if (
+          item &&
+          !(supplierProfile === 'gci' && isGciExcludedNonPartItem(item.partNumber, item.description))
+        ) {
           item.pageNumber = line.pageNumber ?? pageNumber;
           item.bbox = line.bbox;
           items.push(item);
@@ -1995,8 +2020,8 @@ function isDetailContinuationLine(
     return false;
   }
 
-  // Reject if it contains a new structured part code (e.g. DKW2654723, LC-1001, J160799102)
-  const hasNewPartCode = /\b(?:DKW\d{6,8}|[A-Z]{2,6}-[A-Z0-9\-_]{2,14}|[A-Z]\d{8,10})\b/i.test(text);
+  // Reject if it contains a new structured part code (e.g. DKW2654723, LC-1001, J160799102) or GCI administrative row token
+  const hasNewPartCode = /\b(?:DKW\d{6,8}|[A-Z]{2,6}-[A-Z0-9\-_]{2,14}|[A-Z]\d{8,10}|CUSTOMERS?[\s\-_]*LABELS?|DELIVERY[\s\-_]*EXCL|CUSTOMERS?\s+TRANSPORT)\b/i.test(text);
   if (hasNewPartCode) {
     return false;
   }
@@ -2513,12 +2538,25 @@ function parsePositionalAndSupplierLineItem(
         partNumber = bestCode;
       }
 
-      const tappedOrCountersink = afterCode1.match(/\b(TAPPED|COUNTERSIN[K]?)\b/i);
-      if (tappedOrCountersink && partNumber) {
+      const hasNoCsk = /\bNO\s*CSK\b/i.test(afterCode1);
+      const hasOffcut = /\bOFFCUT\b/i.test(afterCode1);
+      const tappedOrCountersink = !hasOffcut
+        ? afterCode1.match(/\b(TAPPED|COUNTERSIN[K]?)\b/i)
+        : null;
+      if (tappedOrCountersink && partNumber && !hasNoCsk) {
         const suffix = tappedOrCountersink[1].toUpperCase().startsWith('COUNTERSIN')
           ? 'COUNTERSINK'
           : 'TAPPED';
         description = `${partNumber} - ${suffix}`;
+      } else if (hasNoCsk && partNumber && (!description || !/\bNO\s*CSK\b/i.test(description))) {
+        const prefix = tappedOrCountersink
+          ? `${partNumber} - ${
+              tappedOrCountersink[1].toUpperCase().startsWith('COUNTERSIN')
+                ? 'COUNTERSINK'
+                : 'TAPPED'
+            }`
+          : partNumber;
+        description = `${prefix} - NO CSK`;
       } else if (partNumber && (!description || description.length < 4)) {
         description = partNumber;
       }
@@ -2649,7 +2687,7 @@ function parsePositionalAndSupplierLineItem(
 
   if (!partNumber) {
     const alphaNumMatches = workingLine.match(
-      /\b([A-Z]{1,6}\d{1,6}[A-Z0-9]{0,4}|\d{2,6}[A-Z]{1,4})\b/gi
+      /\b([A-Z]{1,6}\d{1,6}[A-Z0-9]{0,4}|\d{1,3}[A-Z]{1,4}\d{2,6}[A-Z0-9]{0,4}|\d{2,6}[A-Z]{1,4})\b/gi
     );
     if (alphaNumMatches) {
       for (const candidate of alphaNumMatches) {
@@ -3168,17 +3206,43 @@ export function normalizeExtractedDocketSingle(
 
   const supplier = isGci ? 'GCI' : normalizeIndustrialSupplierLabel(docket.supplier);
   const normalizedItems: ExtractedDocketItem[] = [];
+  const excludedRowNos = new Set<number>(
+    Array.isArray(docket.excludedRowNumbers)
+      ? docket.excludedRowNumbers.filter((n) => typeof n === 'number' && n > 0)
+      : []
+  );
 
   for (let i = 0; i < (docket.items || []).length; i++) {
     const rawItem = docket.items[i];
     if (!rawItem) continue;
     if (isNonPartChargeOrFooterRow(rawItem)) continue;
 
+    if (
+      isGci &&
+      (isGciExcludedNonPartItem(rawItem.partNumber, rawItem.description) ||
+        isGciExcludedNonPartItem((rawItem as any).part, (rawItem as any).desc))
+    ) {
+      const exNo = parseInt(String(rawItem.itemNumber || (rawItem as any).no || '').trim(), 10);
+      if (!Number.isNaN(exNo) && exNo > 0) {
+        excludedRowNos.add(exNo);
+      }
+      continue;
+    }
+
     const cleanPart = normalizeGeminiPartCode(rawItem.partNumber || '');
     const { description, unit } = extractUnitAndCleanDescription(
       rawItem.description || '',
       rawItem.unit
     );
+
+    if (isGci && isGciExcludedNonPartItem(cleanPart, description)) {
+      const exNo = parseInt(String(rawItem.itemNumber || (rawItem as any).no || '').trim(), 10);
+      if (!Number.isNaN(exNo) && exNo > 0) {
+        excludedRowNos.add(exNo);
+      }
+      continue;
+    }
+
     const revVal = (rawItem.revision || rawItem.rev || '').trim() || undefined;
     const rawQty = Number(rawItem.quantity);
     const validQty = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 0;
@@ -3276,11 +3340,14 @@ export function normalizeExtractedDocketSingle(
     const minNo = uniqueSorted[0];
     const maxNo = uniqueSorted[uniqueSorted.length - 1];
     const span = maxNo - minNo + 1;
-    if (span <= uniqueSorted.length + 15 && maxNo <= 2000) {
+    if (span <= uniqueSorted.length + excludedRowNos.size + 15 && maxNo <= 2000) {
       const present = new Set(uniqueSorted);
-      const startNo = minNo <= 3 ? 1 : minNo;
+      let startNo = minNo <= 3 ? 1 : minNo;
+      while (startNo < minNo && excludedRowNos.has(startNo)) {
+        startNo++;
+      }
       for (let expectedNo = startNo; expectedNo <= maxNo; expectedNo++) {
-        if (!present.has(expectedNo)) {
+        if (!present.has(expectedNo) && !excludedRowNos.has(expectedNo)) {
           missingRowNumbers.push(expectedNo);
         }
       }
@@ -3347,6 +3414,7 @@ export function normalizeExtractedDocketSingle(
     orderNumber: gciResolved ? gciResolved.orderNumber : docket.orderNumber?.trim() || undefined,
     jobNumber: gciResolved ? gciResolved.jobNumber : docket.jobNumber?.trim() || undefined,
     items: normalizedItems,
+    excludedRowNumbers: excludedRowNos.size > 0 ? Array.from(excludedRowNos).sort((a, b) => a - b) : undefined,
     confidenceScore:
       typeof docket.confidenceScore === 'number' && docket.confidenceScore > 0
         ? Math.min(docket.confidenceScore, computedConfidence || docket.confidenceScore)

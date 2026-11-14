@@ -148,6 +148,89 @@ function resolveGciPageHeaderFields(
   };
 }
 
+function isGciExcludedNonPartItem(
+  rawPart?: string | null,
+  rawDesc?: string | null
+): boolean {
+  const cleanPart = String(rawPart || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
+    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const cleanDesc = String(rawDesc || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
+    .replace(/\b\d+\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const partCanonical = cleanPart
+    .toUpperCase()
+    .replace(/['’`]/g, '')
+    .replace(/[\s\-_./]+/g, '_');
+  const partCompact = partCanonical.replace(/_/g, '');
+
+  if (
+    partCanonical === 'CUSTOMER_LABELS' ||
+    partCanonical === 'CUSTOMER_LABEL' ||
+    partCanonical === 'CUSTOMERS_LABELS' ||
+    partCanonical === 'CUSTOMERS_LABEL' ||
+    partCompact === 'CUSTOMERLABELS' ||
+    partCompact === 'CUSTOMERLABEL' ||
+    partCompact === 'CUSTOMERSLABELS' ||
+    partCanonical === 'DELIVERY_EXCL' ||
+    partCanonical === 'DELIVERY_EXCI' ||
+    partCanonical === 'DELIVERY_EXL' ||
+    partCompact === 'DELIVERYEXCL' ||
+    partCompact === 'DELIVERYEXCI' ||
+    partCompact === 'DELIVERYEXL'
+  ) {
+    return true;
+  }
+
+  const descCanonical = cleanDesc
+    .toUpperCase()
+    .replace(/['’`]/g, '')
+    .replace(/[\s\-_./]+/g, '_');
+  const descCompact = descCanonical.replace(/_/g, '');
+
+  const isCustomerLabelsDesc =
+    descCanonical === 'CUSTOMER_LABELS' ||
+    descCanonical === 'CUSTOMER_LABEL' ||
+    descCanonical === 'CUSTOMERS_LABELS' ||
+    descCanonical === 'CUSTOMERS_LABEL' ||
+    descCompact === 'CUSTOMERLABELS' ||
+    descCompact === 'CUSTOMERLABEL';
+
+  const isCustomersTransportDesc =
+    descCanonical === 'CUSTOMERS_TRANSPORT' ||
+    descCanonical === 'CUSTOMER_TRANSPORT' ||
+    descCanonical === 'DELIVERY_EXCL' ||
+    descCanonical === 'DELIVERY_EXCI' ||
+    descCompact === 'CUSTOMERSTRANSPORT' ||
+    descCompact === 'CUSTOMERTRANSPORT' ||
+    descCompact === 'DELIVERYEXCL';
+
+  if (isCustomerLabelsDesc || isCustomersTransportDesc) {
+    const isCodeMissingOrUnreadable =
+      !cleanPart ||
+      /^(?:PART|UNKNOWN|N\/?A|NONE|NULL|UNREADABLE|ILLEGIBLE|MISSING|\?+|\-+|\d{1,4})$/i.test(cleanPart) ||
+      partCanonical === descCanonical ||
+      partCompact === descCompact ||
+      (isCustomerLabelsDesc && /^(?:CUSTOMERS?|LABELS?)$/i.test(cleanPart)) ||
+      (isCustomersTransportDesc && /^(?:DELIVERY|EXCL|CUSTOMERS?|TRANSPORT)$/i.test(cleanPart));
+
+    if (isCodeMissingOrUnreadable) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const pagesModelCooldownUntil = new Map<string, number>();
 const MODEL_COOLDOWN_MS = 5 * 60 * 1000;
 const TRANSIENT_COOLDOWN_MS = 60 * 1000;
@@ -921,16 +1004,27 @@ Rules:
     const combinedWarnings = Array.from(new Set([...topWarnings, ...gciWarningsExtra]));
     const builtDockets = segmentOrder.map((segKey) => {
       const seg = segmentMap.get(segKey)!;
-      const items = seg.rawRows
-        .map((r, idx) => {
-          const norm = normalizePageItem(r, seg.pageNumbers[0] || 1);
-          if (!norm) return null;
-          return {
-            ...norm.item,
-            itemNumber: norm.cleanNo || String(idx + 1),
-          };
-        })
-        .filter((it): it is NonNullable<typeof it> => it !== null);
+      const excludedRowNos = new Set<number>();
+      let autoSeq = 1;
+      const items: Array<NonNullable<ReturnType<typeof normalizePageItem>>['item']> = [];
+      for (const r of seg.rawRows) {
+        if (isGci && isGciExcludedNonPartItem(r?.part, r?.desc)) {
+          const exNo = parseInt(parseCleanRowNo(r?.no), 10);
+          if (!Number.isNaN(exNo) && exNo > 0) excludedRowNos.add(exNo);
+          continue;
+        }
+        const norm = normalizePageItem(r, seg.pageNumbers[0] || 1);
+        if (!norm) continue;
+        if (isGci && isGciExcludedNonPartItem(norm.item.partNumber, norm.item.description)) {
+          const exNo = parseInt(norm.cleanNo, 10);
+          if (!Number.isNaN(exNo) && exNo > 0) excludedRowNos.add(exNo);
+          continue;
+        }
+        items.push({
+          ...norm.item,
+          itemNumber: norm.cleanNo || String(autoSeq++),
+        });
+      }
       const flaggedRowCount = items.filter((it) => it.confidence === 'low').length;
 
       return {
@@ -943,6 +1037,7 @@ Rules:
         jobNumber: seg.jobNumber,
         palletCount: seg.palletCount,
         items,
+        excludedRowNumbers: excludedRowNos.size > 0 ? Array.from(excludedRowNos).sort((a, b) => a - b) : undefined,
         confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedRowCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
         needsManualReview: items.length === 0 || seg.separationUncertain || flaggedRowCount > 0 || (isGci && !seg.hasExplicitDocketNumber),
         separationUncertain: seg.separationUncertain,

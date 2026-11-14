@@ -16,7 +16,11 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import { Delivery, DeliveryPart, DocketAttachment, SupplierRuleId } from '../types/delivery';
-import { ExtractedDocketResult, ExtractedDocketItem } from '../server/docketOcr';
+import {
+  ExtractedDocketResult,
+  ExtractedDocketItem,
+  isGciExcludedNonPartItem,
+} from '../server/docketOcr';
 import {
   addDeliveryAuthoritative,
   getStoredDeliveries,
@@ -111,16 +115,18 @@ function buildInitialDrafts(
           ? 'GCI Job No is missing or unreadable — enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).'
           : undefined),
       sourcePageNumbers: defaultPages,
-      items: (src.items || []).map((it) => ({
-        ...it,
-        originalOcrValues: it.originalOcrValues || {
-          partNumber: it.partNumber,
-          itemNumber: it.itemNumber,
-          description: it.description,
-          revision: it.rev || it.revision,
-          quantity: Math.max(1, it.quantity || 1),
-        },
-      })),
+      items: (src.items || [])
+        .filter((it) => !(rule === 'gci' && isGciExcludedNonPartItem(it.partNumber, it.description)))
+        .map((it) => ({
+          ...it,
+          originalOcrValues: it.originalOcrValues || {
+            partNumber: it.partNumber,
+            itemNumber: it.itemNumber,
+            description: it.description,
+            revision: it.rev || it.revision,
+            quantity: Math.max(1, it.quantity || 1),
+          },
+        })),
     };
   });
 }
@@ -202,6 +208,10 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       ...d,
       supplierRule: ruleId,
       supplier: SUPPLIER_RULES[ruleId].name,
+      items:
+        ruleId === 'gci'
+          ? d.items.filter((it) => !isGciExcludedNonPartItem(it.partNumber, it.description))
+          : d.items,
     }));
   };
 
@@ -516,6 +526,9 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         let lineIdx = 1;
 
         draft.items.forEach((it, rowIdx) => {
+          if (draft.supplierRule === 'gci' && isGciExcludedNonPartItem(it.partNumber, it.description)) {
+            return;
+          }
           const qty = expandQuantities ? Math.max(1, it.quantity || 1) : 1;
           const isMultiple = qty > 1;
           const cleanDocketNo =

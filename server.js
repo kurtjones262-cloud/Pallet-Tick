@@ -28,6 +28,7 @@ __export(docketOcr_exports, {
   extractGciFieldsFromSelectableText: () => extractGciFieldsFromSelectableText,
   extractPartCodeWithGeminiVision: () => extractPartCodeWithGeminiVision,
   generateWithRetryAndFallback: () => generateWithRetryAndFallback,
+  isGciExcludedNonPartItem: () => isGciExcludedNonPartItem,
   isGciSupplierHint: () => isGciSupplierHint,
   isSyntheticDocketPlaceholder: () => isSyntheticDocketPlaceholder,
   logOcrEvent: () => logOcrEvent,
@@ -377,6 +378,26 @@ function resolveGciPageHeaderFields(input, options) {
     validationWarnings: warnings
   };
 }
+function isGciExcludedNonPartItem(rawPart, rawDesc) {
+  const cleanPart = String(rawPart || "").replace(/[\r\n]+/g, " ").replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, "").replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, "").replace(/\s+/g, " ").trim();
+  const cleanDesc = String(rawDesc || "").replace(/[\r\n]+/g, " ").replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, "").replace(/\b\d+\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, "").replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, "").replace(/\s+/g, " ").trim();
+  const partCanonical = cleanPart.toUpperCase().replace(/['’`]/g, "").replace(/[\s\-_./]+/g, "_");
+  const partCompact = partCanonical.replace(/_/g, "");
+  if (partCanonical === "CUSTOMER_LABELS" || partCanonical === "CUSTOMER_LABEL" || partCanonical === "CUSTOMERS_LABELS" || partCanonical === "CUSTOMERS_LABEL" || partCompact === "CUSTOMERLABELS" || partCompact === "CUSTOMERLABEL" || partCompact === "CUSTOMERSLABELS" || partCanonical === "DELIVERY_EXCL" || partCanonical === "DELIVERY_EXCI" || partCanonical === "DELIVERY_EXL" || partCompact === "DELIVERYEXCL" || partCompact === "DELIVERYEXCI" || partCompact === "DELIVERYEXL") {
+    return true;
+  }
+  const descCanonical = cleanDesc.toUpperCase().replace(/['’`]/g, "").replace(/[\s\-_./]+/g, "_");
+  const descCompact = descCanonical.replace(/_/g, "");
+  const isCustomerLabelsDesc = descCanonical === "CUSTOMER_LABELS" || descCanonical === "CUSTOMER_LABEL" || descCanonical === "CUSTOMERS_LABELS" || descCanonical === "CUSTOMERS_LABEL" || descCompact === "CUSTOMERLABELS" || descCompact === "CUSTOMERLABEL";
+  const isCustomersTransportDesc = descCanonical === "CUSTOMERS_TRANSPORT" || descCanonical === "CUSTOMER_TRANSPORT" || descCanonical === "DELIVERY_EXCL" || descCanonical === "DELIVERY_EXCI" || descCompact === "CUSTOMERSTRANSPORT" || descCompact === "CUSTOMERTRANSPORT" || descCompact === "DELIVERYEXCL";
+  if (isCustomerLabelsDesc || isCustomersTransportDesc) {
+    const isCodeMissingOrUnreadable = !cleanPart || /^(?:PART|UNKNOWN|N\/?A|NONE|NULL|UNREADABLE|ILLEGIBLE|MISSING|\?+|\-+|\d{1,4})$/i.test(cleanPart) || partCanonical === descCanonical || partCompact === descCompact || isCustomerLabelsDesc && /^(?:CUSTOMERS?|LABELS?)$/i.test(cleanPart) || isCustomersTransportDesc && /^(?:DELIVERY|EXCL|CUSTOMERS?|TRANSPORT)$/i.test(cleanPart);
+    if (isCodeMissingOrUnreadable) {
+      return true;
+    }
+  }
+  return false;
+}
 function buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages, supplierHint) {
   const basePrompt = `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order. If the document is blank or has no part rows, return items: [].
 
@@ -418,7 +439,8 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - "Despatch Date" / "Dispatch Date" (Australian DD/MM/YYYY format, e.g. 12/11/2026 -> 2026-11-12) -> populate 'deliveryDate' formatted as YYYY-MM-DD.
    - Set 'supplier' to "GCI".
    - Multi-page & multi-docket GCI grouping: Use "Job No" as the primary identifier for independent GCI dockets. Group continuation pages sharing the same "Job No" together; if a page has a different "Job No", set startsNewDocket=true and keep its corresponding "Client Order No" in 'orderNumber'.
-   - Missing or unreadable Job No: If "Job No" is missing or unreadable on a page, leave 'docketNumber' and 'jobNumber' empty "" and note it in 'validationWarnings'. NEVER substitute "Client Order No" into 'docketNumber'.`;
+   - Missing or unreadable Job No: If "Job No" is missing or unreadable on a page, leave 'docketNumber' and 'jobNumber' empty "" and note it in 'validationWarnings'. NEVER substitute "Client Order No" into 'docketNumber'.
+   - Exclude GCI non-part administrative entries: Do NOT include rows with Client Part Code "CUSTOMER-LABELS" (Part Description "CUSTOMER LABELS") or "DELIVERY_EXCL" (Part Description "CUSTOMERS TRANSPORT"). Preserve all genuine manufactured parts (including rows with "TAPPED", "NO CSK", "COUNTERSINK", etc.).`;
 }
 function buildRestDocketResponseSchema() {
   return {
@@ -1261,13 +1283,28 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   const builtDockets = [];
   for (const seg of segments) {
     const segByNo = /* @__PURE__ */ new Map();
+    const segExcludedNos = /* @__PURE__ */ new Set();
     const segUnnumbered = [];
     const segPageMin = /* @__PURE__ */ new Map();
     const segPageMax = /* @__PURE__ */ new Map();
     let segMaxCandidate = 0;
     for (const rawIt of seg.rawItems) {
+      if (isGci && isGciExcludedNonPartItem(rawIt.part, rawIt.desc)) {
+        const exNo = parseInt(parseCleanRowNo(rawIt.no), 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          segExcludedNos.add(exNo);
+        }
+        continue;
+      }
       const norm = normalizeRawBatchItem(rawIt, seg.pageNumbers[0]);
       if (!norm) continue;
+      if (isGci && isGciExcludedNonPartItem(norm.item.partNumber, norm.item.description)) {
+        const exNo = parseInt(norm.cleanNo, 10);
+        if (!Number.isNaN(exNo) && exNo > 0) {
+          segExcludedNos.add(exNo);
+        }
+        continue;
+      }
       const numNo = parseInt(norm.cleanNo, 10);
       const itemPage = norm.item.pageNumber || seg.pageNumbers[0];
       if (!Number.isNaN(numNo) && numNo > 0 && numNo <= 1500) {
@@ -1299,7 +1336,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     if (anyPrintedNoColumn && segMaxCandidate > 1 && segMaxCandidate <= 600 && segUnnumbered.length === 0) {
       const missingNos = [];
       for (let n = 1; n <= segMaxCandidate; n++) {
-        if (!segByNo.has(n)) missingNos.push(n);
+        if (!segByNo.has(n) && !segExcludedNos.has(n)) missingNos.push(n);
       }
       if (missingNos.length > 0 && missingNos.length <= 60) {
         const missingPerPage = /* @__PURE__ */ new Map();
@@ -1325,8 +1362,18 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
           const chunk = recoveryPayloads.slice(i, i + 3);
           const recoveredRaw = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, chunk);
           for (const r of recoveredRaw) {
+            if (isGci && isGciExcludedNonPartItem(r.part, r.desc)) {
+              const exNo = parseInt(parseCleanRowNo(r.no), 10);
+              if (!Number.isNaN(exNo) && exNo > 0) segExcludedNos.add(exNo);
+              continue;
+            }
             const norm = normalizeRawBatchItem(r, chunk[0].pageNumber);
             if (!norm) continue;
+            if (isGci && isGciExcludedNonPartItem(norm.item.partNumber, norm.item.description)) {
+              const exNo = parseInt(norm.cleanNo, 10);
+              if (!Number.isNaN(exNo) && exNo > 0) segExcludedNos.add(exNo);
+              continue;
+            }
             const numNo = parseInt(norm.cleanNo, 10);
             if (!Number.isNaN(numNo) && numNo > 0 && !segByNo.has(numNo)) {
               segByNo.set(numNo, { ...norm.item, itemNumber: String(numNo) });
@@ -1370,6 +1417,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       hasPrintedNoColumn: anyPrintedNoColumn,
       firstVisibleRowNo: sortedNos.length > 0 ? sortedNos[0] : void 0,
       lastVisibleRowNo: sortedNos.length > 0 ? sortedNos[sortedNos.length - 1] : void 0,
+      excludedRowNumbers: segExcludedNos.size > 0 ? Array.from(segExcludedNos).sort((a, b) => a - b) : void 0,
       flaggedRowCount: flaggedCount,
       validationFlags: dedupWarnings.length > 0 ? dedupWarnings : void 0,
       validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : void 0

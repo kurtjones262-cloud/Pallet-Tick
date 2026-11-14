@@ -87,9 +87,11 @@ function buildInitialDrafts(
         ? Array.from({ length: attachedPagesCount }, (_, i) => i + 1)
         : [1];
 
+    const isGciMissingJobNo = rule === 'gci' && !String(src.docketNumber || '').trim();
+
     return {
       draftId: `draft_${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-      docketNumber: src.docketNumber || `DK-${1001 + idx}`,
+      docketNumber: rule === 'gci' ? (src.docketNumber || '') : (src.docketNumber || `DK-${1001 + idx}`),
       supplierRule: rule,
       supplier:
         src.supplier &&
@@ -102,8 +104,12 @@ function buildInitialDrafts(
       palletCount: src.palletCount || 1,
       orderNumber: src.orderNumber || '',
       notes: src.notes || '',
-      separationUncertain: Boolean(src.separationUncertain),
-      separationReason: src.separationReason,
+      separationUncertain: Boolean(src.separationUncertain) || isGciMissingJobNo,
+      separationReason:
+        src.separationReason ||
+        (isGciMissingJobNo
+          ? 'GCI Job No is missing or unreadable — enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).'
+          : undefined),
       sourcePageNumbers: defaultPages,
       items: (src.items || []).map((it) => ({
         ...it,
@@ -850,12 +856,15 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
                   <input
                     type="text"
                     value={activeDraft.docketNumber}
+                    placeholder={activeDraft.supplierRule === 'gci' ? 'Enter GCI Job No' : undefined}
                     onChange={(e) =>
                       updateActiveDraft((d) => ({ ...d, docketNumber: e.target.value }))
                     }
                     className={`w-full h-8 px-2.5 font-mono text-xs font-bold bg-white border rounded-[3px] text-[#18181B] uppercase outline-none ${
                       isDuplicateExisting || isDuplicateInBatch
                         ? 'border-red-500 focus:border-red-600'
+                        : !activeDraft.docketNumber.trim()
+                        ? 'border-amber-500 focus:border-amber-600'
                         : 'border-[#E4E3DE] focus:border-zinc-500'
                     }`}
                   />

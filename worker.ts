@@ -27,12 +27,16 @@ import {
   MAX_AUTOMATIC_RETRIES,
   INITIAL_BACKOFF_MS,
   DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
+  GCI_MISSING_JOB_NO_WARNING,
   resolveConfiguredVisionModels,
   classifyGeminiError,
   validateAndParseOcrJsonResponse,
   buildDocketExtractionPrompt,
   buildRestDocketResponseSchema,
   normalizeRawBatchItem,
+  isGciSupplierHint,
+  normalizeGciDispatchDate,
+  resolveGciPageHeaderFields,
 } from './src/server/docketOcr.ts';
 
 export interface Env {
@@ -347,7 +351,8 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   }
 
   const body: any = await request.json().catch(() => ({}));
-  const { images, pageSlices } = body || {};
+  const { images, pageSlices, supplierHint } = body || {};
+  const isGci = isGciSupplierHint(typeof supplierHint === 'string' ? supplierHint : undefined);
 
   if (
     (!Array.isArray(images) || images.length === 0) &&
@@ -396,7 +401,12 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
 
   const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
   const pageNumbers = Array.from({ length: totalPages }, (_, idx) => idx + 1);
-  const promptText = buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages);
+  const promptText = buildDocketExtractionPrompt(
+    pageDescriptions,
+    pageNumbers,
+    totalPages,
+    typeof supplierHint === 'string' ? supplierHint : undefined
+  );
 
   parts.push({ text: promptText });
 
@@ -454,8 +464,14 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     if (ph?.customerName && String(ph.customerName).trim() && !meta.customerName) {
       meta.customerName = String(ph.customerName).trim();
     }
-    if (ph?.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(ph.deliveryDate).trim()) && !meta.deliveryDate) {
-      meta.deliveryDate = String(ph.deliveryDate).trim();
+    if (ph?.deliveryDate && !meta.deliveryDate) {
+      const trimmedDate = String(ph.deliveryDate).trim();
+      if (isGci) {
+        const normDate = normalizeGciDispatchDate(trimmedDate);
+        if (normDate) meta.deliveryDate = normDate;
+      } else if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedDate)) {
+        meta.deliveryDate = trimmedDate;
+      }
     }
     if (ph?.orderNumber && String(ph.orderNumber).trim() && !meta.orderNumber) {
       meta.orderNumber = String(ph.orderNumber).trim();
@@ -482,8 +498,14 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   if (!firstMeta.customerName && parsed.customerName?.trim()) {
     firstMeta.customerName = String(parsed.customerName).trim();
   }
-  if (!firstMeta.deliveryDate && parsed.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(String(parsed.deliveryDate).trim())) {
-    firstMeta.deliveryDate = String(parsed.deliveryDate).trim();
+  if (!firstMeta.deliveryDate && parsed.deliveryDate) {
+    const trimmedDate = String(parsed.deliveryDate).trim();
+    if (isGci) {
+      const normDate = normalizeGciDispatchDate(trimmedDate);
+      if (normDate) firstMeta.deliveryDate = normDate;
+    } else if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedDate)) {
+      firstMeta.deliveryDate = trimmedDate;
+    }
   }
   if (!firstMeta.orderNumber && parsed.orderNumber?.trim()) firstMeta.orderNumber = String(parsed.orderNumber).trim();
   if (!firstMeta.jobNumber && parsed.jobNumber?.trim()) firstMeta.jobNumber = String(parsed.jobNumber).trim();
@@ -498,6 +520,33 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     if (!Number.isNaN(nVal) && nVal > 0 && nVal <= 1500) {
       meta.minRowNo = meta.minRowNo === undefined ? nVal : Math.min(meta.minRowNo, nVal);
       meta.maxRowNo = meta.maxRowNo === undefined ? nVal : Math.max(meta.maxRowNo, nVal);
+    }
+  }
+
+  // Apply GCI-specific header field resolution per page BEFORE docket segmentation
+  if (isGci) {
+    for (let p = 1; p <= totalPages; p++) {
+      const meta = pageMetaMap.get(p)!;
+      const resolved = resolveGciPageHeaderFields(
+        {
+          docketNumber: meta.explicitDocketNumber,
+          jobNumber: meta.jobNumber,
+          orderNumber: meta.orderNumber,
+          deliveryDate: meta.deliveryDate,
+          supplier: meta.supplier,
+          validationWarnings: meta.validationWarnings,
+        },
+        {
+          selectableText: resolvedPayloads[p - 1]?.pdfSelectableText,
+          isContinuationWithoutHeader: p > 1,
+        }
+      );
+      meta.explicitDocketNumber = resolved.docketNumber;
+      meta.jobNumber = resolved.jobNumber;
+      meta.orderNumber = resolved.orderNumber;
+      if (resolved.deliveryDate) meta.deliveryDate = resolved.deliveryDate;
+      meta.supplier = 'GCI';
+      meta.validationWarnings = resolved.validationWarnings;
     }
   }
 
@@ -529,28 +578,50 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     const hasExplicit = explicitKey.length > 0;
 
     if (segments.length === 0) {
-      const fallbackDk = `DK-${Math.floor(10000 + Math.random() * 90000)}`;
-      segments.push({
-        docketKey: hasExplicit ? explicitKey : fallbackDk,
-        explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
-        hasExplicitDocketNumber: hasExplicit,
-        supplier: meta.supplier || 'Steel Fabrication Supplier',
-        customerName: meta.customerName,
-        deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
-        carrier: meta.carrier,
-        orderNumber: meta.orderNumber,
-        jobNumber: meta.jobNumber,
-        palletCount: Math.max(1, meta.palletCount || 1),
-        pageNumbers: [p],
-        maxRowSeen: meta.maxRowNo || 0,
-        rawItems: [...meta.rawItems],
-        validationWarnings: [...meta.validationWarnings],
-        separationUncertain: !hasExplicit && totalPages > 1,
-        separationReason:
-          !hasExplicit && totalPages > 1
-            ? 'Docket number not detected on page 1 — verify page boundaries.'
-            : undefined,
-      });
+      if (isGci && !hasExplicit) {
+        const missingKey = `GCI-MISSING-JOB-P${p}-${Math.floor(100 + Math.random() * 900)}`;
+        segments.push({
+          docketKey: missingKey,
+          explicitDocketNumber: '',
+          hasExplicitDocketNumber: false,
+          supplier: 'GCI',
+          customerName: meta.customerName,
+          deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: undefined,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: Array.from(new Set([...meta.validationWarnings, GCI_MISSING_JOB_NO_WARNING])),
+          separationUncertain: true,
+          separationReason: GCI_MISSING_JOB_NO_WARNING,
+        });
+      } else {
+        const fallbackDk = `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+        segments.push({
+          docketKey: hasExplicit ? explicitKey : fallbackDk,
+          explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
+          hasExplicitDocketNumber: hasExplicit,
+          supplier: meta.supplier || 'Steel Fabrication Supplier',
+          customerName: meta.customerName,
+          deliveryDate: meta.deliveryDate || new Date().toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
+          separationUncertain: !hasExplicit && totalPages > 1,
+          separationReason:
+            !hasExplicit && totalPages > 1
+              ? 'Docket number not detected on page 1 — verify page boundaries.'
+              : undefined,
+        });
+      }
       continue;
     }
 
@@ -598,30 +669,57 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     const shouldSplitUncertain = Boolean(meta.startsNewDocket || rowResetDetected || orderChanged);
 
     if (shouldSplitUncertain) {
-      const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
-      const reason = `Page ${p} appears to start a new docket (${
-        rowResetDetected ? 'row numbering restarted at 1' : orderChanged ? 'order number changed' : 'new header detected'
-      }), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
-      prevSeg.separationUncertain = true;
-      prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
-      segments.push({
-        docketKey: fallbackDk,
-        explicitDocketNumber: fallbackDk,
-        hasExplicitDocketNumber: false,
-        supplier: meta.supplier || prevSeg.supplier,
-        customerName: meta.customerName || prevSeg.customerName,
-        deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
-        carrier: meta.carrier,
-        orderNumber: meta.orderNumber,
-        jobNumber: meta.jobNumber,
-        palletCount: Math.max(1, meta.palletCount || 1),
-        pageNumbers: [p],
-        maxRowSeen: meta.maxRowNo || 0,
-        rawItems: [...meta.rawItems],
-        validationWarnings: [...meta.validationWarnings],
-        separationUncertain: true,
-        separationReason: reason,
-      });
+      if (isGci) {
+        const missingKey = `GCI-MISSING-JOB-P${p}-${Math.floor(100 + Math.random() * 900)}`;
+        const reason = `Page ${p} appears to start a new GCI docket (${
+          orderChanged ? 'Client Order No changed' : rowResetDetected ? 'row numbering restarted at 1' : 'new header detected'
+        }), but Job No is missing or unreadable. Enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).`;
+        prevSeg.separationUncertain = true;
+        prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        segments.push({
+          docketKey: missingKey,
+          explicitDocketNumber: '',
+          hasExplicitDocketNumber: false,
+          supplier: 'GCI',
+          customerName: meta.customerName || prevSeg.customerName,
+          deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: undefined,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: Array.from(new Set([...meta.validationWarnings, GCI_MISSING_JOB_NO_WARNING])),
+          separationUncertain: true,
+          separationReason: reason,
+        });
+      } else {
+        const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
+        const reason = `Page ${p} appears to start a new docket (${
+          rowResetDetected ? 'row numbering restarted at 1' : orderChanged ? 'order number changed' : 'new header detected'
+        }), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
+        prevSeg.separationUncertain = true;
+        prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        segments.push({
+          docketKey: fallbackDk,
+          explicitDocketNumber: fallbackDk,
+          hasExplicitDocketNumber: false,
+          supplier: meta.supplier || prevSeg.supplier,
+          customerName: meta.customerName || prevSeg.customerName,
+          deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
+          separationUncertain: true,
+          separationReason: reason,
+        });
+      }
     } else {
       prevSeg.pageNumbers.push(p);
       prevSeg.rawItems.push(...meta.rawItems);
@@ -647,7 +745,7 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
 
     return {
       docketNumber: seg.explicitDocketNumber,
-      supplier: seg.supplier,
+      supplier: isGci ? 'GCI' : seg.supplier,
       customerName: seg.customerName,
       deliveryDate: seg.deliveryDate,
       carrier: seg.carrier,
@@ -655,8 +753,8 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
       jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items,
-      confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedCount > 0 ? 80 : 100) : 0,
-      needsManualReview: items.length === 0 || seg.separationUncertain || flaggedCount > 0,
+      confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
+      needsManualReview: items.length === 0 || seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber),
       separationUncertain: seg.separationUncertain,
       separationReason: seg.separationReason,
       sourcePageNumbers: [...seg.pageNumbers],
@@ -674,8 +772,8 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   });
 
   const primary = builtDockets[0] || {
-    docketNumber: String(parsed.docketNumber || `DK-${Math.floor(10000 + Math.random() * 90000)}`).trim(),
-    supplier: String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
+    docketNumber: isGci ? '' : String(parsed.docketNumber || `DK-${Math.floor(10000 + Math.random() * 90000)}`).trim(),
+    supplier: isGci ? 'GCI' : String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
     customerName: parsed.customerName ? String(parsed.customerName).trim() : undefined,
     deliveryDate: String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
     carrier: parsed.carrier ? String(parsed.carrier).trim() : undefined,

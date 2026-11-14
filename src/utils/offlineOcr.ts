@@ -405,7 +405,7 @@ async function attemptTargetedUnresolvedRowRecovery(
       extractionEngineLabel: `${docket.extractionEngineLabel || `Gemini Vision (${docket.aiModelUsed || DEFAULT_PRIMARY_VISION_MODEL})`} + ${mergedCount} row${
         mergedCount === 1 ? '' : 's'
       } recovered`,
-    });
+    }, options?.supplierHint);
 
     return normalized;
   } catch {
@@ -714,7 +714,7 @@ export async function executeGeminiDocketExtraction(
 
       const rawJson = await response.json();
       const validatedRaw = validateClientExtractedDocketResult(rawJson);
-      let normalizedResult = validateAndNormalizeGeminiDocket(validatedRaw);
+      let normalizedResult = validateAndNormalizeGeminiDocket(validatedRaw, options?.supplierHint);
 
       // Run targeted row recovery if small number of missing or low-confidence numbered rows remain
       const shouldAttemptRecovery =

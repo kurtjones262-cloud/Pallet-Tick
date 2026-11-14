@@ -168,7 +168,7 @@ app.get('/api/export-project-zip', async (_req: ExpressRequest, res: ExpressResp
  */
 app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse) => {
   try {
-    const { images, startItemIndex, pageSlices } = req.body || {};
+    const { images, startItemIndex, pageSlices, supplierHint } = req.body || {};
     if (
       (!Array.isArray(images) || images.length === 0) &&
       (!Array.isArray(pageSlices) || pageSlices.length === 0)
@@ -190,7 +190,9 @@ app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse
     const result = await extractDocketWithGeminiVision(
       Array.isArray(images) ? images : [],
       startIdx,
-      Array.isArray(pageSlices) ? pageSlices : undefined
+      Array.isArray(pageSlices) ? pageSlices : undefined,
+      undefined,
+      typeof supplierHint === 'string' ? supplierHint : undefined
     );
     return res.status(200).json(result);
   } catch (err: any) {

@@ -1,4 +1,10 @@
-import { ExtractedDocketItem, ExtractedDocketResult } from '../server/docketOcr';
+import {
+  ExtractedDocketItem,
+  ExtractedDocketResult,
+  GCI_MISSING_JOB_NO_WARNING,
+  isGciSupplierHint,
+  resolveGciPageHeaderFields,
+} from '../server/docketOcr';
 import { SupplierRuleId } from '../types/delivery';
 
 export interface RawOcrWord {
@@ -373,11 +379,24 @@ export function parseIndustrialDocketText(
   // 6. PO / Order Number
   const orderNumber = extractOrderNumber(normalizedLines);
 
+  // Guard for GCI text parsing: never allow Client Order No to populate docketNumber
+  let finalDocketNumber = docketNumber;
+  let finalHasExplicitDocket = hasExplicitDocketNumber;
+  if (
+    supplierProfile === 'gci' &&
+    finalDocketNumber &&
+    orderNumber &&
+    finalDocketNumber.trim().toUpperCase() === orderNumber.trim().toUpperCase()
+  ) {
+    finalDocketNumber = '';
+    finalHasExplicitDocket = false;
+  }
+
   // 7. Table Line Items Extraction using positional column layout + supplier-specific rules
   const { items, unparsedCandidateCount, columnLayout } = extractTableItemsWithLayout(
     normalizedLines,
     pageNumber,
-    docketNumber,
+    finalDocketNumber,
     supplierProfile,
     orderNumber
   );
@@ -386,8 +405,8 @@ export function parseIndustrialDocketText(
     header: {
       supplier: detectedSupplier,
       supplierProfile,
-      docketNumber,
-      hasExplicitDocketNumber,
+      docketNumber: finalDocketNumber,
+      hasExplicitDocketNumber: finalHasExplicitDocket,
       deliveryDate,
       carrier,
       palletCount,
@@ -3126,9 +3145,28 @@ function isNonPartChargeOrFooterRow(item: ExtractedDocketItem): boolean {
  * detects sequence gaps (`missingRowNumbers`), and flags questionable rows without fabricating data.
  */
 export function normalizeExtractedDocketSingle(
-  docket: ExtractedDocketResult
+  docket: ExtractedDocketResult,
+  supplierHint?: SupplierRuleId
 ): ExtractedDocketResult {
-  const supplier = normalizeIndustrialSupplierLabel(docket.supplier);
+  const isGci = isGciSupplierHint(supplierHint);
+  const gciResolved = isGci
+    ? resolveGciPageHeaderFields(
+        {
+          docketNumber: docket.docketNumber,
+          jobNumber: docket.jobNumber,
+          orderNumber: docket.orderNumber,
+          deliveryDate: docket.deliveryDate,
+          supplier: docket.supplier,
+          validationWarnings: docket.validationWarnings,
+        },
+        {
+          selectableText: docket.rawTextSummary,
+          isContinuationWithoutHeader: false,
+        }
+      )
+    : null;
+
+  const supplier = isGci ? 'GCI' : normalizeIndustrialSupplierLabel(docket.supplier);
   const normalizedItems: ExtractedDocketItem[] = [];
 
   for (let i = 0; i < (docket.items || []).length; i++) {
@@ -3270,12 +3308,20 @@ export function normalizeExtractedDocketSingle(
         );
 
   const docketWarnings = new Set<string>(
-    Array.isArray(docket.validationWarnings) ? docket.validationWarnings : []
+    Array.isArray(gciResolved?.validationWarnings)
+      ? gciResolved.validationWarnings
+      : Array.isArray(docket.validationWarnings)
+      ? docket.validationWarnings
+      : []
   );
   const docketFlags = new Set<string>(
     Array.isArray(docket.validationFlags) ? docket.validationFlags : []
   );
 
+  if (gciResolved?.missingJobNo) {
+    docketFlags.add(GCI_MISSING_JOB_NO_WARNING);
+    docketWarnings.add(GCI_MISSING_JOB_NO_WARNING);
+  }
   if (normalizedItems.length === 0) {
     docketFlags.add('No part rows detected');
   }
@@ -3294,10 +3340,12 @@ export function normalizeExtractedDocketSingle(
 
   return {
     ...docket,
+    docketNumber: gciResolved ? gciResolved.docketNumber : docket.docketNumber,
     supplier,
     customerName: docket.customerName?.trim() || undefined,
-    orderNumber: docket.orderNumber?.trim() || undefined,
-    jobNumber: docket.jobNumber?.trim() || undefined,
+    deliveryDate: gciResolved?.deliveryDate || docket.deliveryDate,
+    orderNumber: gciResolved ? gciResolved.orderNumber : docket.orderNumber?.trim() || undefined,
+    jobNumber: gciResolved ? gciResolved.jobNumber : docket.jobNumber?.trim() || undefined,
     items: normalizedItems,
     confidenceScore:
       typeof docket.confidenceScore === 'number' && docket.confidenceScore > 0
@@ -3309,9 +3357,14 @@ export function normalizeExtractedDocketSingle(
     firstVisibleRowNo: numericNosSorted.length > 0 ? numericNosSorted[0] : undefined,
     lastVisibleRowNo:
       numericNosSorted.length > 0 ? numericNosSorted[numericNosSorted.length - 1] : undefined,
+    separationUncertain: Boolean(docket.separationUncertain) || Boolean(gciResolved?.missingJobNo),
+    separationReason:
+      docket.separationReason ||
+      (gciResolved?.missingJobNo ? GCI_MISSING_JOB_NO_WARNING : undefined),
     needsManualReview:
       Boolean(docket.needsManualReview) ||
       Boolean(docket.separationUncertain) ||
+      Boolean(gciResolved?.missingJobNo) ||
       normalizedItems.length === 0 ||
       flaggedRowCount > 0 ||
       missingRowNumbers.length > 0,
@@ -3324,10 +3377,11 @@ export function normalizeExtractedDocketSingle(
  * Post-Gemini normalization & validation wrapper across both primary docket and any `separatedDockets`.
  */
 export function validateAndNormalizeGeminiDocket(
-  extracted: ExtractedDocketResult
+  extracted: ExtractedDocketResult,
+  supplierHint?: SupplierRuleId
 ): ExtractedDocketResult {
   const separated = Array.isArray(extracted.separatedDockets) && extracted.separatedDockets.length > 0
-    ? extracted.separatedDockets.map((d) => normalizeExtractedDocketSingle(d))
+    ? extracted.separatedDockets.map((d) => normalizeExtractedDocketSingle(d, supplierHint))
     : undefined;
 
   if (separated && separated.length > 0) {
@@ -3350,5 +3404,5 @@ export function validateAndNormalizeGeminiDocket(
     };
   }
 
-  return normalizeExtractedDocketSingle(extracted);
+  return normalizeExtractedDocketSingle(extracted, supplierHint);
 }

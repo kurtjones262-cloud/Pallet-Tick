@@ -14,21 +14,28 @@ __export(docketOcr_exports, {
   DEFAULT_FALLBACK_VISION_MODELS: () => DEFAULT_FALLBACK_VISION_MODELS,
   DEFAULT_PRIMARY_VISION_MODEL: () => DEFAULT_PRIMARY_VISION_MODEL,
   DOCKET_EXTRACTION_SYSTEM_INSTRUCTION: () => DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
+  GCI_MISSING_JOB_NO_WARNING: () => GCI_MISSING_JOB_NO_WARNING,
   GEMINI_REQUEST_TIMEOUT_MS: () => GEMINI_REQUEST_TIMEOUT_MS,
   INITIAL_BACKOFF_MS: () => INITIAL_BACKOFF_MS,
   MAX_AUTOMATIC_RETRIES: () => MAX_AUTOMATIC_RETRIES,
   buildDocketExtractionPrompt: () => buildDocketExtractionPrompt,
   buildRestDocketResponseSchema: () => buildRestDocketResponseSchema,
   classifyGeminiError: () => classifyGeminiError,
+  cleanGciRefToken: () => cleanGciRefToken,
   clearGeminiModelCooldownsForTesting: () => clearGeminiModelCooldownsForTesting,
   computeExponentialBackoffWithJitter: () => computeExponentialBackoffWithJitter,
   extractDocketWithGeminiVision: () => extractDocketWithGeminiVision,
+  extractGciFieldsFromSelectableText: () => extractGciFieldsFromSelectableText,
   extractPartCodeWithGeminiVision: () => extractPartCodeWithGeminiVision,
   generateWithRetryAndFallback: () => generateWithRetryAndFallback,
+  isGciSupplierHint: () => isGciSupplierHint,
+  isSyntheticDocketPlaceholder: () => isSyntheticDocketPlaceholder,
   logOcrEvent: () => logOcrEvent,
+  normalizeGciDispatchDate: () => normalizeGciDispatchDate,
   normalizeRawBatchItem: () => normalizeRawBatchItem,
   recoverMissingDocketItems: () => recoverMissingDocketItems,
   resolveConfiguredVisionModels: () => resolveConfiguredVisionModels,
+  resolveGciPageHeaderFields: () => resolveGciPageHeaderFields,
   sanitizeVisionModelIdentifier: () => sanitizeVisionModelIdentifier,
   validateAndParseOcrJsonResponse: () => validateAndParseOcrJsonResponse
 });
@@ -237,8 +244,141 @@ function parseCleanRowNo(raw) {
   }
   return "";
 }
-function buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages) {
-  return `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order. If the document is blank or has no part rows, return items: [].
+function isGciSupplierHint(supplierHint) {
+  return typeof supplierHint === "string" && supplierHint.trim().toLowerCase() === "gci";
+}
+function cleanGciRefToken(raw) {
+  const s = String(raw || "").replace(/^(?:client\s*order\s*(?:no|num|number|#)|job\s*(?:no|num|number|#)|docket\s*(?:no|num|number|#)|order\s*(?:no|num|number|#)|po\s*(?:no|num|number|#)?)\s*[:#.\-]?\s*/i, "").trim();
+  return s;
+}
+function isSyntheticDocketPlaceholder(raw) {
+  return /^DK-(?:REVIEW-)?(?:P?\d+-)?\d+$/i.test(String(raw || "").trim());
+}
+function normalizeGciDispatchDate(rawDate) {
+  const s = String(rawDate || "").trim();
+  if (!s) return void 0;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (dmy) {
+    let day = parseInt(dmy[1], 10);
+    let month = parseInt(dmy[2], 10);
+    const year = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    if (month > 12 && day >= 1 && day <= 12) {
+      const swap = day;
+      day = month;
+      month = swap;
+    }
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+  const named = s.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
+  if (named) {
+    const months = {
+      jan: "01",
+      january: "01",
+      feb: "02",
+      february: "02",
+      mar: "03",
+      march: "03",
+      apr: "04",
+      april: "04",
+      may: "05",
+      jun: "06",
+      june: "06",
+      jul: "07",
+      july: "07",
+      aug: "08",
+      august: "08",
+      sep: "09",
+      sept: "09",
+      september: "09",
+      oct: "10",
+      october: "10",
+      nov: "11",
+      november: "11",
+      dec: "12",
+      december: "12"
+    };
+    const mCode = months[named[2].toLowerCase()];
+    const day = parseInt(named[1], 10);
+    if (mCode && day >= 1 && day <= 31) {
+      return `${named[3]}-${mCode}-${String(day).padStart(2, "0")}`;
+    }
+  }
+  return void 0;
+}
+function extractGciFieldsFromSelectableText(selectableText) {
+  const text = String(selectableText || "").trim();
+  if (!text) return {};
+  let jobNo;
+  let clientOrderNo;
+  let dispatchDate;
+  const clientOrderMatch = text.match(/Client\s*Order\s*(?:No|Num|Number|#)?\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
+  if (clientOrderMatch?.[1] && !/^(?:JOB|NO|DATE|DESPATCH|DISPATCH)$/i.test(clientOrderMatch[1])) {
+    clientOrderNo = clientOrderMatch[1].trim();
+  }
+  const jobMatch = text.match(/Job\s*(?:No|Num|Number|#)\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
+  if (jobMatch?.[1] && !/^(?:NO|DATE|DESPATCH|DISPATCH|BY)$/i.test(jobMatch[1])) {
+    jobNo = jobMatch[1].trim();
+  }
+  const dateMatch = text.match(/(?:Despatch|Dispatch)\s*Date\s*[:#.\-|\s]+\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2})/i);
+  if (dateMatch?.[1]) {
+    dispatchDate = normalizeGciDispatchDate(dateMatch[1].trim());
+  }
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (/\bclient\s*order\b/i.test(lines[i]) && /\bjob\s*no\b/i.test(lines[i])) {
+      const valLine = lines[i + 1];
+      const tabular = valLine.match(/([A-Z0-9\-]{3,16})\s*(?:\||\s{2,}|\s)\s*([A-Z0-9\-]{4,16})(?:\s*(?:\||\s)\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}))?/i);
+      if (tabular) {
+        if (!clientOrderNo && tabular[1]) clientOrderNo = tabular[1].trim();
+        if (!jobNo && tabular[2]) jobNo = tabular[2].trim();
+        if (!dispatchDate && tabular[3]) dispatchDate = normalizeGciDispatchDate(tabular[3].trim());
+      }
+      break;
+    }
+  }
+  return { jobNo, clientOrderNo, dispatchDate };
+}
+function resolveGciPageHeaderFields(input, options) {
+  const normId = (s) => s.trim().toUpperCase().replace(/\s+/g, "");
+  const rawDocketClean = cleanGciRefToken(input.docketNumber);
+  const rawDocket = isSyntheticDocketPlaceholder(rawDocketClean) ? "" : rawDocketClean;
+  const rawJob = cleanGciRefToken(input.jobNumber);
+  const rawOrder = cleanGciRefToken(input.orderNumber);
+  const textHints = extractGciFieldsFromSelectableText(options?.selectableText);
+  const resolvedOrder = rawOrder || textHints.clientOrderNo || "";
+  const orderNorm = normId(resolvedOrder);
+  const textOrderNorm = normId(textHints.clientOrderNo || "");
+  let resolvedJob = "";
+  if (rawJob && (!orderNorm || normId(rawJob) !== orderNorm) && (!textOrderNorm || normId(rawJob) !== textOrderNorm)) {
+    resolvedJob = rawJob;
+  } else if (textHints.jobNo && (!orderNorm || normId(textHints.jobNo) !== orderNorm)) {
+    resolvedJob = textHints.jobNo;
+  } else if (rawDocket && (!orderNorm || normId(rawDocket) !== orderNorm) && (!textOrderNorm || normId(rawDocket) !== textOrderNorm)) {
+    resolvedJob = rawDocket;
+  }
+  const resolvedDate = normalizeGciDispatchDate(input.deliveryDate) || textHints.dispatchDate;
+  const missingJobNo = !resolvedJob && !options?.isContinuationWithoutHeader;
+  const warnings = Array.from(
+    new Set((input.validationWarnings || []).map((w) => String(w || "").trim()).filter(Boolean))
+  );
+  if (missingJobNo && !warnings.some((w) => /GCI Job No/i.test(w))) {
+    warnings.push(GCI_MISSING_JOB_NO_WARNING);
+  }
+  return {
+    docketNumber: resolvedJob,
+    jobNumber: resolvedJob || void 0,
+    orderNumber: resolvedOrder || void 0,
+    deliveryDate: resolvedDate,
+    supplier: "GCI",
+    missingJobNo,
+    validationWarnings: warnings
+  };
+}
+function buildDocketExtractionPrompt(pageDescriptions, pageNumbers, totalPages, supplierHint) {
+  const basePrompt = `Examine ${pageDescriptions.join(" and ")} (out of ${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order. If the document is blank or has no part rows, return items: [].
 
 MANDATORY 100%-RECALL EXTRACTION RULES:
 1. RECORD FIRST & LAST VISIBLE ROW NUMBERS:
@@ -266,6 +406,19 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - originalText: Exact raw text string read from this row when helpful for review/verification.
    - confidence: "high", "medium", or "low" (use "low" if smudged, faded, ambiguous, or split awkwardly).
    - validationWarnings: Array of short warnings for this row if uncertain (else []).`;
+  if (!isGciSupplierHint(supplierHint)) {
+    return basePrompt;
+  }
+  return `${basePrompt}
+
+6. GCI SUPPLIER-SPECIFIC HEADER MAPPING (CRITICAL \u2014 DO NOT SWAP):
+   - The user selected supplier = GCI. GCI dockets use header labels: "Client Order No", "Job No", "Despatch Date" / "Dispatch Date", and "Despatched By".
+   - "Job No" (e.g. 194322) IS the primary Docket / Ref # -> populate BOTH 'docketNumber' and 'jobNumber' with the exact Job No value in 'pageHeaders' and top-level fields.
+   - "Client Order No" (e.g. 72018) IS the customer PO / Order # -> populate 'orderNumber' ONLY. NEVER place "Client Order No" into 'docketNumber' or 'jobNumber'.
+   - "Despatch Date" / "Dispatch Date" (Australian DD/MM/YYYY format, e.g. 12/11/2026 -> 2026-11-12) -> populate 'deliveryDate' formatted as YYYY-MM-DD.
+   - Set 'supplier' to "GCI".
+   - Multi-page & multi-docket GCI grouping: Use "Job No" as the primary identifier for independent GCI dockets. Group continuation pages sharing the same "Job No" together; if a page has a different "Job No", set startsNewDocket=true and keep its corresponding "Client Order No" in 'orderNumber'.
+   - Missing or unreadable Job No: If "Job No" is missing or unreadable on a page, leave 'docketNumber' and 'jobNumber' empty "" and note it in 'validationWarnings'. NEVER substitute "Client Order No" into 'docketNumber'.`;
 }
 function buildRestDocketResponseSchema() {
   return {
@@ -512,7 +665,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
   genericErr.code = finalClassification.errorCode || "AI_EXTRACTION_FAILED";
   throw genericErr;
 }
-async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages) {
+async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages, supplierHint) {
   const parts = [];
   const pageDescriptions = [];
   for (const bp of batchPages) {
@@ -542,7 +695,8 @@ ${payload.pdfSelectableText.slice(0, 18e3)}`
   const promptText = buildDocketExtractionPrompt(
     pageDescriptions,
     batchPages.map((b) => b.pageNumber),
-    totalPages
+    totalPages,
+    supplierHint
   );
   const responseSchema = {
     type: Type.OBJECT,
@@ -812,7 +966,7 @@ function normalizeRawBatchItem(it, defaultPageNumber) {
     }
   };
 }
-async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, pageSlices, overrideApiKey) {
+async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, pageSlices, overrideApiKey, supplierHint) {
   const apiKey = overrideApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error(
@@ -831,6 +985,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   });
   const resolvedPayloads = Array.isArray(pageSlices) && pageSlices.length > 0 ? pageSlices : base64Images.map((img) => ({ fullDataUrl: img }));
   const totalPages = resolvedPayloads.length;
+  const isGci = isGciSupplierHint(supplierHint);
   const pagesPerBatch = totalPages >= 5 ? 2 : 1;
   const batches = [];
   for (let i = 0; i < totalPages; i += pagesPerBatch) {
@@ -844,7 +999,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   for (let i = 0; i < batches.length; i += 2) {
     const pair = batches.slice(i, i + 2);
     const pairRes = await Promise.all(
-      pair.map((b) => extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages))
+      pair.map((b) => extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages, supplierHint))
     );
     batchResponses.push(...pairRes);
   }
@@ -880,8 +1035,14 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       if (ph.customerName && ph.customerName.trim() && !meta.customerName) {
         meta.customerName = ph.customerName.trim();
       }
-      if (ph.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(ph.deliveryDate.trim()) && !meta.deliveryDate) {
-        meta.deliveryDate = ph.deliveryDate.trim();
+      if (ph.deliveryDate && !meta.deliveryDate) {
+        const trimmedDate = ph.deliveryDate.trim();
+        if (isGci) {
+          const normDate = normalizeGciDispatchDate(trimmedDate);
+          if (normDate) meta.deliveryDate = normDate;
+        } else if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedDate)) {
+          meta.deliveryDate = trimmedDate;
+        }
       }
       if (ph.orderNumber && ph.orderNumber.trim() && !meta.orderNumber) meta.orderNumber = ph.orderNumber.trim();
       if (ph.jobNumber && ph.jobNumber.trim() && !meta.jobNumber) meta.jobNumber = ph.jobNumber.trim();
@@ -890,15 +1051,21 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       if (ph.startsNewDocket) meta.startsNewDocket = true;
     }
     const firstMeta = pageMetaMap.get(defaultPage);
-    if (!firstMeta.explicitDocketNumber && bRes.docketNumber?.trim() && batchPageNums.length === 1) {
+    if (!firstMeta.explicitDocketNumber && bRes.docketNumber?.trim() && (batchPageNums.length === 1 || (bRes.pageHeaders || []).length === 0)) {
       firstMeta.explicitDocketNumber = bRes.docketNumber.trim();
     }
     if (!firstMeta.supplier && bRes.supplier?.trim()) firstMeta.supplier = bRes.supplier.trim();
     if (!firstMeta.customerName && bRes.customerName?.trim()) {
       firstMeta.customerName = bRes.customerName.trim();
     }
-    if (!firstMeta.deliveryDate && bRes.deliveryDate && /^\d{4}-\d{2}-\d{2}$/.test(bRes.deliveryDate.trim())) {
-      firstMeta.deliveryDate = bRes.deliveryDate.trim();
+    if (!firstMeta.deliveryDate && bRes.deliveryDate) {
+      const trimmedDate = bRes.deliveryDate.trim();
+      if (isGci) {
+        const normDate = normalizeGciDispatchDate(trimmedDate);
+        if (normDate) firstMeta.deliveryDate = normDate;
+      } else if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedDate)) {
+        firstMeta.deliveryDate = trimmedDate;
+      }
     }
     if (!firstMeta.orderNumber && bRes.orderNumber?.trim()) firstMeta.orderNumber = bRes.orderNumber.trim();
     if (!firstMeta.jobNumber && bRes.jobNumber?.trim()) firstMeta.jobNumber = bRes.jobNumber.trim();
@@ -917,6 +1084,32 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       }
     }
   }
+  if (isGci) {
+    for (let p = 1; p <= totalPages; p++) {
+      const meta = pageMetaMap.get(p);
+      const resolved = resolveGciPageHeaderFields(
+        {
+          docketNumber: meta.explicitDocketNumber,
+          jobNumber: meta.jobNumber,
+          orderNumber: meta.orderNumber,
+          deliveryDate: meta.deliveryDate,
+          supplier: meta.supplier,
+          validationWarnings: meta.validationWarnings
+        },
+        {
+          selectableText: resolvedPayloads[p - 1]?.pdfSelectableText,
+          // Evaluate missingJobNo accurately later if this page turns out to be a continuation page
+          isContinuationWithoutHeader: p > 1
+        }
+      );
+      meta.explicitDocketNumber = resolved.docketNumber;
+      meta.jobNumber = resolved.jobNumber;
+      meta.orderNumber = resolved.orderNumber;
+      if (resolved.deliveryDate) meta.deliveryDate = resolved.deliveryDate;
+      meta.supplier = "GCI";
+      meta.validationWarnings = resolved.validationWarnings;
+    }
+  }
   const segments = [];
   const normDocketKey = (s) => s.trim().toUpperCase().replace(/\s+/g, "");
   for (let p = 1; p <= totalPages; p++) {
@@ -924,25 +1117,50 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     const explicitKey = normDocketKey(meta.explicitDocketNumber);
     const hasExplicit = explicitKey.length > 0;
     if (segments.length === 0) {
-      const fallbackDk = `DK-${Math.floor(1e4 + Math.random() * 9e4)}`;
-      segments.push({
-        docketKey: hasExplicit ? explicitKey : fallbackDk,
-        explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
-        hasExplicitDocketNumber: hasExplicit,
-        supplier: meta.supplier || "Steel Fabrication Supplier",
-        customerName: meta.customerName,
-        deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
-        carrier: meta.carrier,
-        orderNumber: meta.orderNumber,
-        jobNumber: meta.jobNumber,
-        palletCount: Math.max(1, meta.palletCount || 1),
-        pageNumbers: [p],
-        maxRowSeen: meta.maxRowNo || 0,
-        rawItems: [...meta.rawItems],
-        validationWarnings: [...meta.validationWarnings],
-        separationUncertain: !hasExplicit && totalPages > 1,
-        separationReason: !hasExplicit && totalPages > 1 ? "Docket number not detected on page 1 \u2014 verify page boundaries." : void 0
-      });
+      if (isGci && !hasExplicit) {
+        const missingKey = `GCI-MISSING-JOB-P${p}-${Math.floor(100 + Math.random() * 900)}`;
+        const missingWarnings = Array.from(
+          /* @__PURE__ */ new Set([...meta.validationWarnings, GCI_MISSING_JOB_NO_WARNING])
+        );
+        segments.push({
+          docketKey: missingKey,
+          explicitDocketNumber: "",
+          hasExplicitDocketNumber: false,
+          supplier: "GCI",
+          customerName: meta.customerName,
+          deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: void 0,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: missingWarnings,
+          separationUncertain: true,
+          separationReason: GCI_MISSING_JOB_NO_WARNING
+        });
+      } else {
+        const fallbackDk = `DK-${Math.floor(1e4 + Math.random() * 9e4)}`;
+        segments.push({
+          docketKey: hasExplicit ? explicitKey : fallbackDk,
+          explicitDocketNumber: meta.explicitDocketNumber || fallbackDk,
+          hasExplicitDocketNumber: hasExplicit,
+          supplier: meta.supplier || "Steel Fabrication Supplier",
+          customerName: meta.customerName,
+          deliveryDate: meta.deliveryDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
+          separationUncertain: !hasExplicit && totalPages > 1,
+          separationReason: !hasExplicit && totalPages > 1 ? "Docket number not detected on page 1 \u2014 verify page boundaries." : void 0
+        });
+      }
       continue;
     }
     if (hasExplicit) {
@@ -985,28 +1203,53 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     const orderChanged = Boolean(meta.orderNumber && prevSeg.orderNumber && meta.orderNumber !== prevSeg.orderNumber);
     const shouldSplitUncertain = Boolean(meta.startsNewDocket || rowResetDetected || orderChanged);
     if (shouldSplitUncertain) {
-      const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
-      const reason = `Page ${p} appears to start a new docket (${rowResetDetected ? "row numbering restarted at 1" : orderChanged ? "order number changed" : "new header detected"}), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
-      prevSeg.separationUncertain = true;
-      prevSeg.separationReason = prevSeg.separationReason || "Verify multi-page boundary against adjoining pages.";
-      segments.push({
-        docketKey: fallbackDk,
-        explicitDocketNumber: fallbackDk,
-        hasExplicitDocketNumber: false,
-        supplier: meta.supplier || prevSeg.supplier,
-        customerName: meta.customerName || prevSeg.customerName,
-        deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
-        carrier: meta.carrier,
-        orderNumber: meta.orderNumber,
-        jobNumber: meta.jobNumber,
-        palletCount: Math.max(1, meta.palletCount || 1),
-        pageNumbers: [p],
-        maxRowSeen: meta.maxRowNo || 0,
-        rawItems: [...meta.rawItems],
-        validationWarnings: [...meta.validationWarnings],
-        separationUncertain: true,
-        separationReason: reason
-      });
+      if (isGci) {
+        const missingKey = `GCI-MISSING-JOB-P${p}-${Math.floor(100 + Math.random() * 900)}`;
+        const reason = `Page ${p} appears to start a new GCI docket (${orderChanged ? "Client Order No changed" : rowResetDetected ? "row numbering restarted at 1" : "new header detected"}), but Job No is missing or unreadable. Enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).`;
+        prevSeg.separationUncertain = true;
+        prevSeg.separationReason = prevSeg.separationReason || "Verify multi-page boundary against adjoining pages.";
+        segments.push({
+          docketKey: missingKey,
+          explicitDocketNumber: "",
+          hasExplicitDocketNumber: false,
+          supplier: "GCI",
+          customerName: meta.customerName || prevSeg.customerName,
+          deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: void 0,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: Array.from(/* @__PURE__ */ new Set([...meta.validationWarnings, GCI_MISSING_JOB_NO_WARNING])),
+          separationUncertain: true,
+          separationReason: reason
+        });
+      } else {
+        const fallbackDk = `DK-REVIEW-${p}-${Math.floor(100 + Math.random() * 900)}`;
+        const reason = `Page ${p} appears to start a new docket (${rowResetDetected ? "row numbering restarted at 1" : orderChanged ? "order number changed" : "new header detected"}), but no distinct docket number could be read. Please verify and assign the correct docket number.`;
+        prevSeg.separationUncertain = true;
+        prevSeg.separationReason = prevSeg.separationReason || "Verify multi-page boundary against adjoining pages.";
+        segments.push({
+          docketKey: fallbackDk,
+          explicitDocketNumber: fallbackDk,
+          hasExplicitDocketNumber: false,
+          supplier: meta.supplier || prevSeg.supplier,
+          customerName: meta.customerName || prevSeg.customerName,
+          deliveryDate: meta.deliveryDate || prevSeg.deliveryDate,
+          carrier: meta.carrier,
+          orderNumber: meta.orderNumber,
+          jobNumber: meta.jobNumber,
+          palletCount: Math.max(1, meta.palletCount || 1),
+          pageNumbers: [p],
+          maxRowSeen: meta.maxRowNo || 0,
+          rawItems: [...meta.rawItems],
+          validationWarnings: [...meta.validationWarnings],
+          separationUncertain: true,
+          separationReason: reason
+        });
+      }
     } else {
       prevSeg.pageNumbers.push(p);
       prevSeg.rawItems.push(...meta.rawItems);
@@ -1105,7 +1348,7 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     const flaggedCount = validItems.filter((it) => it.confidence === "low").length;
     builtDockets.push({
       docketNumber: seg.explicitDocketNumber,
-      supplier: seg.supplier,
+      supplier: isGci ? "GCI" : seg.supplier,
       customerName: seg.customerName,
       deliveryDate: seg.deliveryDate,
       carrier: seg.carrier,
@@ -1113,8 +1356,8 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items: validItems,
-      confidenceScore: validItems.length > 0 ? seg.separationUncertain || flaggedCount > 0 ? 80 : 100 : 0,
-      needsManualReview: validItems.length === 0 || seg.separationUncertain || flaggedCount > 0,
+      confidenceScore: validItems.length > 0 ? seg.separationUncertain || flaggedCount > 0 || isGci && !seg.hasExplicitDocketNumber ? 80 : 100 : 0,
+      needsManualReview: validItems.length === 0 || seg.separationUncertain || flaggedCount > 0 || isGci && !seg.hasExplicitDocketNumber,
       separationUncertain: seg.separationUncertain,
       separationReason: seg.separationReason,
       sourcePageNumbers: [...seg.pageNumbers],
@@ -1253,7 +1496,7 @@ Rules:
     confidence: String(parsed.confidence || "high").toLowerCase()
   };
 }
-var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS, DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
+var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS, DOCKET_EXTRACTION_SYSTEM_INSTRUCTION, GCI_MISSING_JOB_NO_WARNING;
 var init_docketOcr = __esm({
   "src/server/docketOcr.ts"() {
     DEFAULT_PRIMARY_VISION_MODEL = "gemini-4-hydrogen";
@@ -1287,6 +1530,7 @@ INDUSTRIAL DOCKET & ANTI-HALLUCINATION RULES:
 - Never confuse contact phone/fax numbers, ABN numbers, postcodes, dates, bank details, weights (kg), dimensions (mm), or unit prices ($) with part numbers or quantities.
 - If a character or digit in a smudged/skewed area is uncertain, record your best literal reading, include the exact raw row snippet in 'originalText', set confidence='low', and explain the uncertainty in 'validationWarnings'. NEVER invent missing rows or guess fabricated codes.
 - Only extract physical part rows literally present in the document. If a document is blank or contains no physical part rows, return items: [].`;
+    GCI_MISSING_JOB_NO_WARNING = "GCI Job No is missing or unreadable \u2014 verify and enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).";
   }
 });
 
@@ -6017,7 +6261,7 @@ app.get("/api/export-project-zip", async (_req, res) => {
 });
 app.post("/api/extract-docket", async (req, res) => {
   try {
-    const { images, startItemIndex, pageSlices } = req.body || {};
+    const { images, startItemIndex, pageSlices, supplierHint } = req.body || {};
     if ((!Array.isArray(images) || images.length === 0) && (!Array.isArray(pageSlices) || pageSlices.length === 0)) {
       return res.status(400).json({ error: "No docket images provided." });
     }
@@ -6032,7 +6276,9 @@ app.post("/api/extract-docket", async (req, res) => {
     const result = await extractDocketWithGeminiVision(
       Array.isArray(images) ? images : [],
       startIdx,
-      Array.isArray(pageSlices) ? pageSlices : void 0
+      Array.isArray(pageSlices) ? pageSlices : void 0,
+      void 0,
+      typeof supplierHint === "string" ? supplierHint : void 0
     );
     return res.status(200).json(result);
   } catch (err) {

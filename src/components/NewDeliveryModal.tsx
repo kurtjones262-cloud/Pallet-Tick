@@ -113,6 +113,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   const [offlineQueueNotice, setOfflineQueueNotice] = useState<string | null>(null);
   const [reviewData, setReviewData] = useState<ExtractedDocketResult | null>(null);
   const [reviewQueueId, setReviewQueueId] = useState<string | undefined>(undefined);
+  const [reviewSupplierRule, setReviewSupplierRule] = useState<SupplierRuleId | undefined>(undefined);
   const [reviewAttachedPages, setReviewAttachedPages] = useState<
     Array<{
       pageNumber: number;
@@ -411,6 +412,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           : SUPPLIER_RULES[selectedSupplierRule].name;
 
       setReviewQueueId(undefined);
+      setReviewSupplierRule(undefined);
       setReviewAttachedPages(null);
       setReviewData({
         ...output.extractedData,
@@ -436,6 +438,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   const handleOpenQueuedForReview = (item: PendingDocketUpload) => {
     if (!item.extractedData) return;
     setReviewQueueId(item.id);
+    setReviewSupplierRule(item.supplierHint);
     setReviewAttachedPages(
       item.pages.map((p, idx) => ({
         pageNumber: idx + 1,
@@ -453,7 +456,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
       {reviewData ? (
         <DocketOcrReviewModal
           extractedData={reviewData}
-          initialSupplierRule={selectedSupplierRule}
+          initialSupplierRule={reviewSupplierRule || selectedSupplierRule}
           pendingQueueId={reviewQueueId}
           attachedPages={
             reviewAttachedPages ||
@@ -468,6 +471,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
           onClose={() => {
             setReviewData(null);
             setReviewQueueId(undefined);
+            setReviewSupplierRule(undefined);
             setReviewAttachedPages(null);
           }}
           onDeliveryCreated={(newDels) => {

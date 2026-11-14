@@ -468,11 +468,18 @@ export async function executeGeminiDocketExtraction(
 
   const wireSlices: PageSlicePayload[] = processedPages.map((p) => {
     const sp = p.slicePayload!;
-    const hasBothHalves = Boolean(sp.upperDataUrl && sp.lowerDataUrl);
+    const distinctUpper =
+      sp.upperDataUrl && sp.upperDataUrl !== sp.fullDataUrl ? sp.upperDataUrl : undefined;
+    const distinctLower =
+      sp.lowerDataUrl &&
+      sp.lowerDataUrl !== sp.fullDataUrl &&
+      sp.lowerDataUrl !== sp.upperDataUrl
+        ? sp.lowerDataUrl
+        : undefined;
     return {
-      fullDataUrl: hasBothHalves ? '' : sp.fullDataUrl,
-      upperDataUrl: sp.upperDataUrl,
-      lowerDataUrl: sp.lowerDataUrl,
+      fullDataUrl: sp.fullDataUrl,
+      upperDataUrl: distinctUpper,
+      lowerDataUrl: distinctLower,
       pdfSelectableText: sp.pdfSelectableText,
     };
   });

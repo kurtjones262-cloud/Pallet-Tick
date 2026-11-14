@@ -65,6 +65,8 @@ interface DocketReviewDraft {
   separationUncertain: boolean;
   separationReason?: string;
   sourcePageNumbers: number[];
+  missingRowNumbers: number[];
+  validationFlags: string[];
   items: ExtractedDocketItem[];
 }
 
@@ -115,6 +117,14 @@ function buildInitialDrafts(
           ? 'GCI Job No is missing or unreadable — enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).'
           : undefined),
       sourcePageNumbers: defaultPages,
+      missingRowNumbers: Array.isArray(src.missingRowNumbers) ? src.missingRowNumbers : [],
+      validationFlags: Array.from(
+        new Set(
+          [...(src.validationFlags || []), ...(src.validationWarnings || [])]
+            .map((w) => String(w || '').trim())
+            .filter(Boolean)
+        )
+      ),
       items: (src.items || [])
         .filter((it) => !(rule === 'gci' && isGciExcludedNonPartItem(it.partNumber, it.description)))
         .map((it) => ({
@@ -341,6 +351,12 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       const merged: DocketReviewDraft = {
         ...previous,
         sourcePageNumbers: mergedPages,
+        missingRowNumbers: Array.from(
+          new Set([...previous.missingRowNumbers, ...current.missingRowNumbers])
+        ).sort((a, b) => a - b),
+        validationFlags: Array.from(
+          new Set([...previous.validationFlags, ...current.validationFlags])
+        ),
         items: [...previous.items, ...current.items],
         palletCount: Math.max(previous.palletCount, current.palletCount),
         separationUncertain: false,
@@ -791,18 +807,32 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
           </div>
         )}
 
-        {(activeExtractionMeta.missingRowNumbers.length > 0 ||
-          activeExtractionMeta.validationFlags.length > 0) && (
-          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center gap-2 shrink-0">
-            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-            <span>
-              <strong>Validation Notice:</strong>{' '}
-              {activeExtractionMeta.validationFlags.length > 0
-                ? activeExtractionMeta.validationFlags.join(' · ')
-                : `Check row numbers ${activeExtractionMeta.missingRowNumbers.join(', ')}`}
-            </span>
-          </div>
-        )}
+        {(() => {
+          const draftMissing =
+            activeDraft.missingRowNumbers.length > 0
+              ? activeDraft.missingRowNumbers
+              : drafts.length === 1
+              ? activeExtractionMeta.missingRowNumbers
+              : [];
+          const draftFlags =
+            activeDraft.validationFlags.length > 0
+              ? activeDraft.validationFlags
+              : drafts.length === 1
+              ? activeExtractionMeta.validationFlags
+              : [];
+          if (draftMissing.length === 0 && draftFlags.length === 0) return null;
+          return (
+            <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center gap-2 shrink-0">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                <strong>Validation Notice:</strong>{' '}
+                {draftFlags.length > 0
+                  ? draftFlags.join(' · ')
+                  : `Check row numbers ${draftMissing.join(', ')}`}
+              </span>
+            </div>
+          );
+        })()}
 
         {/* Status / Error Banners */}
         {retryOcrStatus && (

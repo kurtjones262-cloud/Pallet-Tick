@@ -38,6 +38,7 @@ import {
   isGciExcludedNonPartItem,
   normalizeGciDispatchDate,
   resolveGciPageHeaderFields,
+  appendPagePayloadParts,
 } from './src/server/docketOcr.ts';
 
 export interface Env {
@@ -381,23 +382,8 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
 
   for (let i = 0; i < totalPages; i++) {
     const pNum = i + 1;
-    const payload = resolvedPayloads[i];
-    if (payload.upperDataUrl && payload.lowerDataUrl) {
-      const up = parseDataUrl(payload.upperDataUrl);
-      const low = parseDataUrl(payload.lowerDataUrl);
-      parts.push({ inlineData: { mimeType: up.mimeType, data: up.base64Data } });
-      parts.push({ inlineData: { mimeType: low.mimeType, data: low.base64Data } });
-      pageDescriptions.push(`Page ${pNum} (Upper & Lower zoomed slices)`);
-    } else {
-      const full = parseDataUrl(payload.fullDataUrl);
-      parts.push({ inlineData: { mimeType: full.mimeType, data: full.base64Data } });
-      pageDescriptions.push(`Page ${pNum}`);
-    }
-    if (payload.pdfSelectableText && payload.pdfSelectableText.trim()) {
-      parts.push({
-        text: `[SELECTABLE TEXT FROM PDF PAGE ${pNum}]:\n${payload.pdfSelectableText.slice(0, 18000)}`,
-      });
-    }
+    const desc = appendPagePayloadParts(parts, pNum, resolvedPayloads[i]);
+    pageDescriptions.push(desc);
   }
 
   const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
@@ -457,7 +443,9 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   for (const ph of rawPageHeaders) {
     const pNum = Math.min(totalPages, Math.max(1, Number(ph?.page ?? ph?.pageNumber) || 1));
     const meta = pageMetaMap.get(pNum)!;
-    const dn = String(ph?.docketNumber || '').trim();
+    const dn = String(ph?.docketNumber ?? ph?.referenceNumber ?? '').trim();
+    const jn = String(ph?.jobNumber ?? ph?.jobNo ?? ph?.job_no ?? '').trim();
+    const on = String(ph?.orderNumber ?? ph?.clientOrderNo ?? ph?.client_order_no ?? '').trim();
     if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
     if (ph?.supplier && String(ph.supplier).trim() && !meta.supplier) {
       meta.supplier = String(ph.supplier).trim();
@@ -474,11 +462,11 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
         meta.deliveryDate = trimmedDate;
       }
     }
-    if (ph?.orderNumber && String(ph.orderNumber).trim() && !meta.orderNumber) {
-      meta.orderNumber = String(ph.orderNumber).trim();
+    if (on && !meta.orderNumber) {
+      meta.orderNumber = on;
     }
-    if (ph?.jobNumber && String(ph.jobNumber).trim() && !meta.jobNumber) {
-      meta.jobNumber = String(ph.jobNumber).trim();
+    if (jn && !meta.jobNumber) {
+      meta.jobNumber = jn;
     }
     if (ph?.carrier && String(ph.carrier).trim() && !meta.carrier) {
       meta.carrier = String(ph.carrier).trim();
@@ -490,10 +478,20 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   }
 
   const firstMeta = pageMetaMap.get(1)!;
-  if (!firstMeta.explicitDocketNumber && totalPages === 1 && parsed.docketNumber?.trim()) {
-    firstMeta.explicitDocketNumber = String(parsed.docketNumber).trim();
-  } else if (!firstMeta.explicitDocketNumber && rawPageHeaders.length === 0 && parsed.docketNumber?.trim()) {
-    firstMeta.explicitDocketNumber = String(parsed.docketNumber).trim();
+  const otherPageIds = new Set<string>();
+  for (let p = 2; p <= totalPages; p++) {
+    const m = pageMetaMap.get(p);
+    if (m?.explicitDocketNumber) otherPageIds.add(m.explicitDocketNumber);
+    if (m?.jobNumber) otherPageIds.add(m.jobNumber);
+    if (m?.orderNumber) otherPageIds.add(m.orderNumber);
+  }
+  const canBackfillFromTop = totalPages === 1 || rawPageHeaders.length === 0;
+  const topDocket = String(parsed.docketNumber ?? parsed.referenceNumber ?? '').trim();
+  const topOrder = String(parsed.orderNumber ?? parsed.clientOrderNo ?? parsed.client_order_no ?? '').trim();
+  const topJob = String(parsed.jobNumber ?? parsed.jobNo ?? parsed.job_no ?? '').trim();
+
+  if (!firstMeta.explicitDocketNumber && topDocket && (canBackfillFromTop || !otherPageIds.has(topDocket))) {
+    firstMeta.explicitDocketNumber = topDocket;
   }
   if (!firstMeta.supplier && parsed.supplier?.trim()) firstMeta.supplier = String(parsed.supplier).trim();
   if (!firstMeta.customerName && parsed.customerName?.trim()) {
@@ -508,10 +506,14 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
       firstMeta.deliveryDate = trimmedDate;
     }
   }
-  if (!firstMeta.orderNumber && parsed.orderNumber?.trim()) firstMeta.orderNumber = String(parsed.orderNumber).trim();
-  if (!firstMeta.jobNumber && parsed.jobNumber?.trim()) firstMeta.jobNumber = String(parsed.jobNumber).trim();
+  if (!firstMeta.orderNumber && topOrder && (canBackfillFromTop || !otherPageIds.has(topOrder))) {
+    firstMeta.orderNumber = topOrder;
+  }
+  if (!firstMeta.jobNumber && topJob && (canBackfillFromTop || !otherPageIds.has(topJob))) {
+    firstMeta.jobNumber = topJob;
+  }
   if (!firstMeta.carrier && parsed.carrier?.trim()) firstMeta.carrier = String(parsed.carrier).trim();
-  if (topLevelWarnings.length > 0) firstMeta.validationWarnings.push(...topLevelWarnings);
+  if (topLevelWarnings.length > 0 && totalPages === 1) firstMeta.validationWarnings.push(...topLevelWarnings);
 
   for (const rawIt of rawItems) {
     const pNum = Math.min(totalPages, Math.max(1, Number(rawIt?.page ?? rawIt?.pageNumber) || 1));
@@ -675,8 +677,10 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
         const reason = `Page ${p} appears to start a new GCI docket (${
           orderChanged ? 'Client Order No changed' : rowResetDetected ? 'row numbering restarted at 1' : 'new header detected'
         }), but Job No is missing or unreadable. Enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).`;
-        prevSeg.separationUncertain = true;
-        prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        if (!prevSeg.hasExplicitDocketNumber || (!orderChanged && !meta.startsNewDocket)) {
+          prevSeg.separationUncertain = true;
+          prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        }
         segments.push({
           docketKey: missingKey,
           explicitDocketNumber: '',
@@ -758,6 +762,11 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
     }
     const flaggedCount = items.filter((it) => it.confidence === 'low').length;
     const dedupWarnings = Array.from(new Set(seg.validationWarnings.filter(Boolean)));
+    const segRawText = seg.pageNumbers
+      .map((pNum) => resolvedPayloads[pNum - 1]?.pdfSelectableText?.trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
 
     return {
       docketNumber: seg.explicitDocketNumber,
@@ -769,6 +778,7 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
       jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items,
+      rawTextSummary: segRawText || undefined,
       excludedRowNumbers: excludedRowNos.size > 0 ? Array.from(excludedRowNos).sort((a, b) => a - b) : undefined,
       confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
       needsManualReview: items.length === 0 || seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber),

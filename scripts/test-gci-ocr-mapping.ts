@@ -9,6 +9,9 @@ import {
   normalizeGciDispatchDate,
   extractGciFieldsFromSelectableText,
   isGciExcludedNonPartItem,
+  mapBatchPageNumber,
+  appendPagePayloadParts,
+  extractDocketWithGeminiVision,
   GCI_MISSING_JOB_NO_WARNING,
 } from '../src/server/docketOcr.ts';
 import {
@@ -745,7 +748,443 @@ async function runTests() {
   console.log('  ✅ PASS: GCI save & reload round-trip verified in D1 SQLite');
   passed += 11;
 
-  console.log(`\n🎉 ALL ${passed} GCI OCR MAPPING, EXCLUSION & REGRESSION ASSERTIONS PASSED!`);
+  // ---------------------------------------------------------------------------
+  // 8. Critical Three-Docket GCI Metadata Regression Suite (Priorities 1-6)
+  // ---------------------------------------------------------------------------
+  console.log('\n--- 8. Critical Three-Docket GCI Metadata Regression Suite ---');
+
+  // 8a. Priority 1: mapBatchPageNumber single-page & multi-page batch mapping
+  assert.equal(mapBatchPageNumber(1, [1]), 1);
+  assert.equal(mapBatchPageNumber(1, [2]), 2, 'Single-page batch [2] returning page:1 MUST map to page 2, never overwrite Page 1');
+  assert.equal(mapBatchPageNumber(1, [3]), 3, 'Single-page batch [3] returning page:1 MUST map to page 3, never overwrite Page 1');
+  assert.equal(mapBatchPageNumber(undefined, [3]), 3);
+  assert.equal(mapBatchPageNumber(2, [3, 4]), 4, 'Multi-page batch [3,4] returning relative page:2 must map to page 4');
+  assert.equal(mapBatchPageNumber(4, [3, 4]), 4);
+  passed += 6;
+
+  // 8b. Priority 2: Image transmission preserves Full Page + explicit labels + deduplicates identical slices
+  const fakeFull = `data:image/jpeg;base64,${Buffer.from('FULL-PAGE-BYTES-1').toString('base64')}`;
+  const fakeUpper = `data:image/jpeg;base64,${Buffer.from('UPPER-SLICE-BYTES-1').toString('base64')}`;
+  const fakeLower = `data:image/jpeg;base64,${Buffer.from('LOWER-SLICE-BYTES-1').toString('base64')}`;
+
+  const labeledParts: Array<Record<string, unknown>> = [];
+  const labeledDesc = appendPagePayloadParts(labeledParts, 2, {
+    fullDataUrl: fakeFull,
+    upperDataUrl: fakeUpper,
+    lowerDataUrl: fakeLower,
+    pdfSelectableText: 'Client Order No\t72046\tJob No\t194434',
+  });
+  const imageParts = labeledParts.filter((p) => Boolean(p.inlineData));
+  const textLabels = labeledParts.filter((p) => typeof p.text === 'string').map((p) => String(p.text));
+  assert.equal(imageParts.length, 3, 'Full + distinct Upper + distinct Lower images must all be sent');
+  assert(textLabels.some((t) => t.includes('[PAGE 2 - FULL PAGE VIEW')), 'Must emit explicit PAGE 2 FULL PAGE VIEW label');
+  assert(textLabels.some((t) => t.includes('[PAGE 2 - UPPER ZOOMED SLICE')), 'Must emit explicit PAGE 2 UPPER ZOOMED SLICE label');
+  assert(textLabels.some((t) => t.includes('[PAGE 2 - LOWER ZOOMED SLICE')), 'Must emit explicit PAGE 2 LOWER ZOOMED SLICE label');
+  assert(textLabels.some((t) => t.includes('[SELECTABLE TEXT FROM PDF PAGE 2]')), 'Must attach selectable PDF text');
+  assert(labeledDesc.includes('all belonging strictly to Page 2'));
+
+  // Deduplication check when upper === full === lower
+  const dedupParts: Array<Record<string, unknown>> = [];
+  appendPagePayloadParts(dedupParts, 1, {
+    fullDataUrl: fakeFull,
+    upperDataUrl: fakeFull,
+    lowerDataUrl: fakeFull,
+  });
+  assert.equal(
+    dedupParts.filter((p) => Boolean(p.inlineData)).length,
+    1,
+    'Identical full/upper/lower images must be deduplicated into 1 inlineData part'
+  );
+
+  // Client offlineOcr wireSlices check: fullDataUrl is ALWAYS preserved (never dropped for upper/lower fallback)
+  let capturedClientBody: any = null;
+  await performSmartDocketExtraction([fakeFull], undefined, false, [{ rawText: 'Client Order No: 72018 Job No: 194322' }], {
+    supplierHint: 'gci',
+    enableTargetedRecovery: false,
+    fetchImpl: async (_url, init) => {
+      capturedClientBody = init?.body ? JSON.parse(String(init.body)) : null;
+      return new Response(
+        JSON.stringify({
+          docketNumber: '194322',
+          jobNumber: '194322',
+          orderNumber: '72018',
+          deliveryDate: '2026-11-12',
+          supplier: 'GCI',
+          confidenceScore: 100,
+          needsManualReview: false,
+          items: [{ itemNumber: '1', partNumber: 'P1', description: 'Bracket', quantity: 2, confidence: 'high' }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    },
+  });
+  assert(capturedClientBody?.pageSlices?.[0]?.fullDataUrl === fakeFull, 'Client wireSlices must preserve fullDataUrl');
+  passed += 8;
+
+  // 8c. Priority 3: Selectable text extraction across GCI layouts + QLD 4555 address immunity
+  const addrNoisyTwoRow = extractGciFieldsFromSelectableText(
+    [
+      'GOLDEN COAST INDUSTRIAL PTY LTD',
+      'DELIVER TO: WORKSHOP CO',
+      '158 OLD BOWLING GREEN ROAD PALMWOODS QLD 4555',
+      'Client Order No   Job No   Despatch Date   Despatched By',
+      'PALMWOODS QLD 4555',
+      '72018   194322   12/11/2026   Layla MacDonald',
+    ].join('\n')
+  );
+  assert.equal(addrNoisyTwoRow.clientOrderNo, '72018');
+  assert.equal(addrNoisyTwoRow.jobNo, '194322');
+  assert.equal(addrNoisyTwoRow.dispatchDate, '2026-11-12');
+
+  const verticalAlternating = extractGciFieldsFromSelectableText(
+    [
+      'PALMWOODS QLD 4555',
+      'ABN 12 345 678 901',
+      'Client Order No',
+      '72046',
+      'Job No',
+      '194434',
+      'Despatch Date',
+      '13/11/2026',
+      'Despatched By',
+      'Layla MacDonald',
+    ].join('\n')
+  );
+  assert.equal(verticalAlternating.clientOrderNo, '72046');
+  assert.equal(verticalAlternating.jobNo, '194434');
+  assert.equal(verticalAlternating.dispatchDate, '2026-11-13');
+
+  const stackedColumnBlock = extractGciFieldsFromSelectableText(
+    [
+      'Client Order No',
+      'Job No',
+      'Despatch Date',
+      'Despatched By',
+      'PALMWOODS QLD 4555',
+      '72047',
+      '194459',
+      '14/11/2026',
+    ].join('\n')
+  );
+  assert.equal(stackedColumnBlock.clientOrderNo, '72047');
+  assert.equal(stackedColumnBlock.jobNo, '194459');
+  assert.equal(stackedColumnBlock.dispatchDate, '2026-11-14');
+
+  const undatedWithPostcodeNoise = extractGciFieldsFromSelectableText(
+    [
+      'Client Order No   Job No',
+      '158 Old Bowling Green Road PALMWOODS QLD 4555',
+      'Ph: 07 5445 1234',
+      '72018   194322',
+    ].join('\n')
+  );
+  assert.equal(undatedWithPostcodeNoise.clientOrderNo, '72018');
+  assert.equal(undatedWithPostcodeNoise.jobNo, '194322');
+  passed += 11;
+
+  // 8d & 8e. Exact 3-Docket GCI PDF Scenario:
+  // Docket 1: Client Order No 72018 | Job No 194322
+  // Docket 2: Client Order No 72046 | Job No 194434
+  // Docket 3: Client Order No 72047 | Job No 194459
+  // Test 1: Multi-batch extractDocketWithGeminiVision where each single-page batch returns page: 1 + aliases!
+  const prevFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+      const bodyStr = init?.body ? String(init.body) : '';
+      if (bodyStr.includes('[PAGE 1 -')) {
+        return geminiJsonResponse({
+          pageHeaders: [
+            { page: 1, docketNumber: '', jobNo: '194322', clientOrderNo: '72018', deliveryDate: '12/11/2026', startsNewDocket: true },
+          ],
+          items: [
+            { page: 1, no: '1', part: '1YY8231', desc: '1YY8231 - TAPPED', rev: 'A', qty: 4 },
+            { page: 1, no: '2', part: 'CUSTOMER-LABELS', desc: 'CUSTOMER LABELS', rev: 'A', qty: 1 },
+          ],
+        });
+      }
+      if (bodyStr.includes('[PAGE 2 -')) {
+        return geminiJsonResponse({
+          pageHeaders: [
+            // Deliberately returns page: 1 inside Batch 2 (single-page batch for Page 2) + missing docketNumber!
+            { page: 1, docketNumber: '', job_no: '194434', client_order_no: '72046', deliveryDate: '13/11/2026', startsNewDocket: true },
+          ],
+          items: [
+            { page: 1, no: '1', part: 'J160798105', desc: 'J160798105 - NO CSK', rev: '0', qty: 6 },
+            { page: 1, no: '2', part: 'DELIVERY_EXCL', desc: 'CUSTOMERS TRANSPORT', rev: '0', qty: 1 },
+          ],
+        });
+      }
+      return geminiJsonResponse({
+        pageHeaders: [
+          // Deliberately returns page: 1 inside Batch 3 (single-page batch for Page 3)!
+          { page: 1, docketNumber: '', jobNumber: '194459', orderNumber: '72047', deliveryDate: '14/11/2026', startsNewDocket: true },
+        ],
+        items: [
+          { page: 1, no: '1', part: 'J160799102', desc: 'J160799102', rev: '0', qty: 2 },
+        ],
+      });
+    }) as typeof fetch;
+
+    const threeDocketVision = await extractDocketWithGeminiVision(
+      [fakeFull, fakeFull, fakeFull],
+      1,
+      [
+        { fullDataUrl: fakeFull, upperDataUrl: fakeUpper, lowerDataUrl: fakeLower, pdfSelectableText: 'Client Order No\n72018\nJob No\n194322\nDespatch Date\n12/11/2026' },
+        { fullDataUrl: fakeFull, upperDataUrl: fakeUpper, lowerDataUrl: fakeLower, pdfSelectableText: 'Client Order No\n72046\nJob No\n194434\nDespatch Date\n13/11/2026' },
+        { fullDataUrl: fakeFull, upperDataUrl: fakeUpper, lowerDataUrl: fakeLower, pdfSelectableText: 'Client Order No\n72047\nJob No\n194459\nDespatch Date\n14/11/2026' },
+      ],
+      'test-key-never-logged',
+      'gci'
+    );
+
+    assert.equal(threeDocketVision.separatedDockets?.length, 3, 'extractDocketWithGeminiVision must detect all 3 independent GCI dockets');
+    assert.deepEqual(
+      threeDocketVision.separatedDockets?.map((d) => [d.docketNumber, d.orderNumber, d.deliveryDate]),
+      [
+        ['194322', '72018', '2026-11-12'],
+        ['194434', '72046', '2026-11-13'],
+        ['194459', '72047', '2026-11-14'],
+      ],
+      'All 3 GCI dockets must retain their exact Job No, Client Order No, and Despatch Date'
+    );
+    assert.deepEqual(threeDocketVision.separatedDockets?.map((d) => d.sourcePageNumbers), [[1], [2], [3]]);
+    assert.equal(threeDocketVision.separatedDockets?.[0].items.length, 1);
+    assert.equal(threeDocketVision.separatedDockets?.[0].items[0].description, '1YY8231 - TAPPED');
+    assert.equal(threeDocketVision.separatedDockets?.[1].items.length, 1);
+    assert.equal(threeDocketVision.separatedDockets?.[1].items[0].description, 'J160798105 - NO CSK');
+    assert.equal(threeDocketVision.separatedDockets?.[2].items.length, 1);
+    assert.equal(threeDocketVision.separatedDockets?.every((d) => !d.needsManualReview && !d.separationUncertain), true);
+    passed += 7;
+
+    // Test 2: Worker AND Pages Function when Gemini omits Job No from pageHeaders on Pages 2 & 3,
+    // relying on selectable text rescue with PALMWOODS QLD 4555 address noise
+    const threeDocketPayloads = [
+      {
+        fullDataUrl: fakeFull,
+        upperDataUrl: fakeUpper,
+        lowerDataUrl: fakeLower,
+        pdfSelectableText: 'DELIVER TO PALMWOODS QLD 4555\nClient Order No\tJob No\tDespatch Date\n72018\t194322\t12/11/2026',
+      },
+      {
+        fullDataUrl: fakeFull,
+        upperDataUrl: fakeUpper,
+        lowerDataUrl: fakeLower,
+        pdfSelectableText: 'DELIVER TO PALMWOODS QLD 4555\nClient Order No\tJob No\tDespatch Date\n72046\t194434\t13/11/2026',
+      },
+      {
+        fullDataUrl: fakeFull,
+        upperDataUrl: fakeUpper,
+        lowerDataUrl: fakeLower,
+        pdfSelectableText: 'DELIVER TO PALMWOODS QLD 4555\nClient Order No\tJob No\tDespatch Date\n72047\t194459\t14/11/2026',
+      },
+    ];
+
+    globalThis.fetch = (async () =>
+      geminiJsonResponse({
+        // Worst case: Gemini puts 72018 top-level and omits pageHeaders on P2 & P3!
+        docketNumber: '72018',
+        orderNumber: '72018',
+        deliveryDate: '12/11/2026',
+        pageHeaders: [
+          { page: 1, docketNumber: '72018', jobNumber: '', orderNumber: '72018', deliveryDate: '12/11/2026' },
+        ],
+        items: [
+          { page: 1, no: '1', part: 'PART-D1', desc: 'Part 1', qty: 2 },
+          { page: 2, no: '1', part: 'PART-D2', desc: 'Part 2', qty: 3 },
+          { page: 3, no: '1', part: 'PART-D3', desc: 'Part 3', qty: 5 },
+        ],
+      })) as typeof fetch;
+
+    const workerThreeRes = await workerEntry.fetch(
+      new Request('http://localhost:3000/api/extract-docket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ supplierHint: 'gci', pageSlices: threeDocketPayloads }),
+      }),
+      env
+    );
+    assert.equal(workerThreeRes.status, 200);
+    const workerThreeJson: any = await workerThreeRes.json();
+
+    const pagesThreeRes = await pagesExtractDocketPost({
+      request: new Request('https://parttrack.pages.dev/api/extract-docket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ supplierHint: 'gci', pageSlices: threeDocketPayloads }),
+      }),
+      env: { GEMINI_API_KEY: 'test-key-never-logged' },
+    } as any);
+    assert.equal(pagesThreeRes.status, 200);
+    const pagesThreeJson: any = await pagesThreeRes.json();
+
+    for (const [label, resJson] of [
+      ['Worker', workerThreeJson],
+      ['Pages Function', pagesThreeJson],
+    ] as const) {
+      assert.equal(resJson.separatedDockets?.length, 3, `${label}: must separate 3 GCI dockets`);
+      assert.deepEqual(
+        resJson.separatedDockets.map((d: any) => [d.docketNumber, d.orderNumber, d.deliveryDate]),
+        [
+          ['194322', '72018', '2026-11-12'],
+          ['194434', '72046', '2026-11-13'],
+          ['194459', '72047', '2026-11-14'],
+        ],
+        `${label}: all 3 GCI dockets must extract 194322/194434/194459 and Client Order Nos cleanly`
+      );
+      assert.equal(
+        resJson.separatedDockets.every((d: any) => !d.needsManualReview && !(d.validationWarnings || []).some((w: string) => /GCI Job No/i.test(w))),
+        true,
+        `${label}: valid 3-docket extraction must NOT emit GCI missing Job No warning`
+      );
+      const clientValidated = validateAndNormalizeGeminiDocket(resJson, 'gci');
+      assert.equal(clientValidated.separatedDockets?.length, 3, `${label} -> Client validator: must preserve 3 dockets`);
+      assert.deepEqual(
+        clientValidated.separatedDockets?.map((d) => [d.docketNumber, d.orderNumber, d.deliveryDate]),
+        [
+          ['194322', '72018', '2026-11-12'],
+          ['194434', '72046', '2026-11-13'],
+          ['194459', '72047', '2026-11-14'],
+        ]
+      );
+    }
+    passed += 8;
+
+    // 8f. Per-docket warning isolation + genuine continuation page check
+    // Scenario A: Docket 1 (194322) valid, Docket 2 (order 72046) genuinely missing Job No, Docket 3 (194459) valid
+    globalThis.fetch = (async () =>
+      geminiJsonResponse({
+        pageHeaders: [
+          { page: 1, docketNumber: '194322', jobNumber: '194322', orderNumber: '72018', deliveryDate: '12/11/2026', startsNewDocket: true },
+          { page: 2, docketNumber: '72046', jobNumber: '', orderNumber: '72046', deliveryDate: '13/11/2026', startsNewDocket: true },
+          { page: 3, docketNumber: '194459', jobNumber: '194459', orderNumber: '72047', deliveryDate: '14/11/2026', startsNewDocket: true },
+        ],
+        items: [
+          { page: 1, no: '1', part: 'PART-A', desc: 'Part A', qty: 1 },
+          { page: 2, no: '1', part: 'PART-B', desc: 'Part B', qty: 1 },
+          { page: 3, no: '1', part: 'PART-C', desc: 'Part C', qty: 1 },
+        ],
+      })) as typeof fetch;
+
+    const isolatedWorkerRes = await workerEntry.fetch(
+      new Request('http://localhost:3000/api/extract-docket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          supplierHint: 'gci',
+          pageSlices: [{ fullDataUrl: fakeFull }, { fullDataUrl: fakeFull }, { fullDataUrl: fakeFull }],
+        }),
+      }),
+      env
+    );
+    const isolatedWorkerJson: any = await isolatedWorkerRes.json();
+
+    const isolatedPagesRes = await pagesExtractDocketPost({
+      request: new Request('https://parttrack.pages.dev/api/extract-docket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          supplierHint: 'gci',
+          pageSlices: [{ fullDataUrl: fakeFull }, { fullDataUrl: fakeFull }, { fullDataUrl: fakeFull }],
+        }),
+      }),
+      env: { GEMINI_API_KEY: 'test-key-never-logged' },
+    } as any);
+    const isolatedPagesJson: any = await isolatedPagesRes.json();
+
+    for (const [label, j] of [
+      ['Worker warning isolation', isolatedWorkerJson],
+      ['Pages warning isolation', isolatedPagesJson],
+    ] as const) {
+      assert.equal(j.separatedDockets.length, 3, `${label}: 3 segments`);
+      assert.equal(j.separatedDockets[0].docketNumber, '194322', `${label}: D1 Job No`);
+      assert.equal(j.separatedDockets[0].separationUncertain, false, `${label}: D1 must remain certain`);
+      assert(
+        !(j.separatedDockets[0].validationWarnings || []).some((w: string) => /GCI Job No/i.test(w)),
+        `${label}: D1 must NOT receive D2 missing Job No warning`
+      );
+      assert.equal(j.separatedDockets[1].docketNumber, '', `${label}: D2 Job No must stay blank, never 72046`);
+      assert.equal(j.separatedDockets[1].orderNumber, '72046', `${label}: D2 Client Order No`);
+      assert.equal(j.separatedDockets[1].separationUncertain, true, `${label}: D2 must be flagged uncertain`);
+      assert(
+        (j.separatedDockets[1].validationWarnings || []).some((w: string) => /GCI Job No/i.test(w)),
+        `${label}: D2 must carry missing Job No warning`
+      );
+      assert.equal(j.separatedDockets[2].docketNumber, '194459', `${label}: D3 Job No`);
+      assert.equal(j.separatedDockets[2].separationUncertain, false, `${label}: D3 must remain certain`);
+      assert(
+        !(j.separatedDockets[2].validationWarnings || []).some((w: string) => /GCI Job No/i.test(w)),
+        `${label}: D3 must NOT receive D2 missing Job No warning`
+      );
+    }
+    passed += 20;
+
+    // Scenario B: Genuine 2-page GCI continuation docket (Page 2 has no header, rows 4-5 continue Page 1 rows 1-3)
+    globalThis.fetch = (async () =>
+      geminiJsonResponse({
+        pageHeaders: [
+          { page: 1, docketNumber: '194322', jobNumber: '194322', orderNumber: '72018', deliveryDate: '12/11/2026', startsNewDocket: false },
+          { page: 2, docketNumber: '', jobNumber: '', orderNumber: '', deliveryDate: '', startsNewDocket: false },
+        ],
+        items: [
+          { page: 1, no: '1', part: 'P-1', desc: 'Part 1', qty: 1 },
+          { page: 1, no: '2', part: 'P-2', desc: 'Part 2', qty: 1 },
+          { page: 1, no: '3', part: 'P-3', desc: 'Part 3', qty: 1 },
+          { page: 2, no: '4', part: 'P-4', desc: 'Part 4', qty: 2 },
+          { page: 2, no: '5', part: 'P-5', desc: 'Part 5', qty: 3 },
+        ],
+      })) as typeof fetch;
+
+    const contRes = await pagesExtractDocketPost({
+      request: new Request('https://parttrack.pages.dev/api/extract-docket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          supplierHint: 'gci',
+          pageSlices: [{ fullDataUrl: fakeFull }, { fullDataUrl: fakeFull }],
+        }),
+      }),
+      env: { GEMINI_API_KEY: 'test-key-never-logged' },
+    } as any);
+    const contJson: any = await contRes.json();
+    assert.equal(contJson.separatedDockets.length, 1, 'Genuine GCI continuation page must stay merged into 1 docket');
+    assert.equal(contJson.separatedDockets[0].docketNumber, '194322');
+    assert.equal(contJson.separatedDockets[0].items.length, 5);
+    assert.deepEqual(contJson.separatedDockets[0].sourcePageNumbers, [1, 2]);
+    assert.equal(
+      (contJson.separatedDockets[0].validationWarnings || []).some((w: string) => /GCI Job No/i.test(w)),
+      false,
+      'Genuine continuation page must NOT trigger false GCI missing Job No warning'
+    );
+    passed += 5;
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+
+  console.log('  ✅ PASS: All Three-Docket GCI metadata, batch mapping, slice transmission, continuation & warning-isolation tests passed');
+
+  // 8g. Opt-in Live Gemini API Integration Test (runs ONLY when GEMINI_API_KEY is configured)
+  const liveApiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (liveApiKey) {
+    console.log('\n--- 9. Live Gemini API GCI Integration Test (GEMINI_API_KEY present) ---');
+    const liveDataUrl = `data:image/jpeg;base64,${realGciImg.toString('base64')}`;
+    const liveResult = await extractDocketWithGeminiVision(
+      [liveDataUrl],
+      1,
+      [{ fullDataUrl: liveDataUrl }],
+      liveApiKey,
+      'gci'
+    );
+    assert.equal(liveResult.supplier, 'GCI');
+    assert(Array.isArray(liveResult.items), 'Live Gemini result must return items array');
+    console.log(
+      `  ✅ LIVE GEMINI PASS: model=${liveResult.aiModelUsed}, docket=${liveResult.docketNumber || '(blank)'}, order=${liveResult.orderNumber || '(blank)'}, items=${liveResult.items.length}`
+    );
+    passed += 2;
+  } else {
+    console.log('\n--- 9. Live Gemini API GCI Integration Test: [SKIPPED — GEMINI_API_KEY is not configured in environment] ---');
+  }
+
+  console.log(`\n🎉 ALL ${passed} GCI OCR MAPPING, EXCLUSION & REGRESSION ASSERTIONS PASSED (mocked offline suite)!`);
 }
 
 runTests().catch((err) => {

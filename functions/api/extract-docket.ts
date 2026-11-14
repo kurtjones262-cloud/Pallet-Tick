@@ -9,6 +9,23 @@
  * - Rich structured item fields (rev, unit, originalText, confidence, validationWarnings)
  */
 
+import {
+  DEFAULT_PRIMARY_VISION_MODEL,
+  DEFAULT_FALLBACK_VISION_MODELS,
+  GEMINI_REQUEST_TIMEOUT_MS,
+  MAX_AUTOMATIC_RETRIES,
+  INITIAL_BACKOFF_MS,
+  DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
+  GCI_MISSING_JOB_NO_WARNING,
+  isGciSupplierHint,
+  normalizeGciDispatchDate,
+  resolveGciPageHeaderFields,
+  isGciExcludedNonPartItem,
+  appendPagePayloadParts,
+  buildDocketExtractionPrompt,
+  buildRestDocketResponseSchema,
+} from '../../src/server/docketOcr.ts';
+
 interface CloudflareEnv {
   GEMINI_API_KEY?: string;
   GEMINI_PRIMARY_MODEL?: string;
@@ -22,214 +39,8 @@ interface EventContext {
   env: CloudflareEnv;
 }
 
-const DEFAULT_PRIMARY_MODEL = 'gemini-4-hydrogen';
-const DEFAULT_FALLBACK_MODELS = ['gemini-3.1-flash-lite'] as const;
-const GEMINI_REQUEST_TIMEOUT_MS = 22000;
-const MAX_AUTOMATIC_RETRIES = 1;
-const INITIAL_BACKOFF_MS = 1800;
-
-const GCI_MISSING_JOB_NO_WARNING =
-  'GCI Job No is missing or unreadable — verify and enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).';
-
-function isGciSupplierHint(supplierHint?: string): boolean {
-  return typeof supplierHint === 'string' && supplierHint.trim().toLowerCase() === 'gci';
-}
-
-function cleanGciRefToken(raw?: string): string {
-  return String(raw || '')
-    .replace(/^(?:client\s*order\s*(?:no|num|number|#)|job\s*(?:no|num|number|#)|docket\s*(?:no|num|number|#)|order\s*(?:no|num|number|#)|po\s*(?:no|num|number|#)?)\s*[:#.\-]?\s*/i, '')
-    .trim();
-}
-
-function isSyntheticDocketPlaceholder(raw?: string): boolean {
-  return /^DK-(?:REVIEW-)?(?:P?\d+-)?\d+$/i.test(String(raw || '').trim());
-}
-
-function normalizeGciDispatchDate(rawDate?: string): string | undefined {
-  const s = String(rawDate || '').trim();
-  if (!s) return undefined;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-
-  const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-  if (dmy) {
-    let day = parseInt(dmy[1], 10);
-    let month = parseInt(dmy[2], 10);
-    const year = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
-    if (month > 12 && day >= 1 && day <= 12) {
-      const swap = day;
-      day = month;
-      month = swap;
-    }
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    }
-  }
-  return undefined;
-}
-
-function extractGciFieldsFromSelectableText(selectableText?: string): {
-  jobNo?: string;
-  clientOrderNo?: string;
-  dispatchDate?: string;
-} {
-  const text = String(selectableText || '').trim();
-  if (!text) return {};
-  let jobNo: string | undefined;
-  let clientOrderNo: string | undefined;
-  let dispatchDate: string | undefined;
-
-  const clientOrderMatch = text.match(/Client\s*Order\s*(?:No|Num|Number|#)?\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
-  if (clientOrderMatch?.[1] && !/^(?:JOB|NO|DATE|DESPATCH|DISPATCH)$/i.test(clientOrderMatch[1])) {
-    clientOrderNo = clientOrderMatch[1].trim();
-  }
-  const jobMatch = text.match(/Job\s*(?:No|Num|Number|#)\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
-  if (jobMatch?.[1] && !/^(?:NO|DATE|DESPATCH|DISPATCH|BY)$/i.test(jobMatch[1])) {
-    jobNo = jobMatch[1].trim();
-  }
-  const dateMatch = text.match(/(?:Despatch|Dispatch)\s*Date\s*[:#.\-|\s]+\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2})/i);
-  if (dateMatch?.[1]) {
-    dispatchDate = normalizeGciDispatchDate(dateMatch[1].trim());
-  }
-  return { jobNo, clientOrderNo, dispatchDate };
-}
-
-function resolveGciPageHeaderFields(
-  input: {
-    docketNumber?: string;
-    jobNumber?: string;
-    orderNumber?: string;
-    deliveryDate?: string;
-    supplier?: string;
-    validationWarnings?: string[];
-  },
-  options?: { selectableText?: string; isContinuationWithoutHeader?: boolean }
-) {
-  const normId = (s: string) => s.trim().toUpperCase().replace(/\s+/g, '');
-  const rawDocketClean = cleanGciRefToken(input.docketNumber);
-  const rawDocket = isSyntheticDocketPlaceholder(rawDocketClean) ? '' : rawDocketClean;
-  const rawJob = cleanGciRefToken(input.jobNumber);
-  const rawOrder = cleanGciRefToken(input.orderNumber);
-  const textHints = extractGciFieldsFromSelectableText(options?.selectableText);
-
-  const resolvedOrder = rawOrder || textHints.clientOrderNo || '';
-  const orderNorm = normId(resolvedOrder);
-  const textOrderNorm = normId(textHints.clientOrderNo || '');
-
-  let resolvedJob = '';
-  if (rawJob && (!orderNorm || normId(rawJob) !== orderNorm) && (!textOrderNorm || normId(rawJob) !== textOrderNorm)) {
-    resolvedJob = rawJob;
-  } else if (textHints.jobNo && (!orderNorm || normId(textHints.jobNo) !== orderNorm)) {
-    resolvedJob = textHints.jobNo;
-  } else if (
-    rawDocket &&
-    (!orderNorm || normId(rawDocket) !== orderNorm) &&
-    (!textOrderNorm || normId(rawDocket) !== textOrderNorm)
-  ) {
-    resolvedJob = rawDocket;
-  }
-
-  const resolvedDate = normalizeGciDispatchDate(input.deliveryDate) || textHints.dispatchDate;
-  const missingJobNo = !resolvedJob && !options?.isContinuationWithoutHeader;
-  const warnings = Array.from(
-    new Set((input.validationWarnings || []).map((w) => String(w || '').trim()).filter(Boolean))
-  );
-  if (missingJobNo && !warnings.some((w) => /GCI Job No/i.test(w))) {
-    warnings.push(GCI_MISSING_JOB_NO_WARNING);
-  }
-
-  return {
-    docketNumber: resolvedJob,
-    jobNumber: resolvedJob || undefined,
-    orderNumber: resolvedOrder || undefined,
-    deliveryDate: resolvedDate,
-    supplier: 'GCI',
-    missingJobNo,
-    validationWarnings: warnings,
-  };
-}
-
-function isGciExcludedNonPartItem(
-  rawPart?: string | null,
-  rawDesc?: string | null
-): boolean {
-  const cleanPart = String(rawPart || '')
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
-    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const cleanDesc = String(rawDesc || '')
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/^["'“”‘’″′|:*~#;\s]+|["'“”‘’″′|:*~#;\s]+$/g, '')
-    .replace(/\b\d+\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
-    .replace(/\s+(?:EA|EACH|PC|PCS|SET|SETS|OFF)$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const partCanonical = cleanPart
-    .toUpperCase()
-    .replace(/['’`]/g, '')
-    .replace(/[\s\-_./]+/g, '_');
-  const partCompact = partCanonical.replace(/_/g, '');
-
-  if (
-    partCanonical === 'CUSTOMER_LABELS' ||
-    partCanonical === 'CUSTOMER_LABEL' ||
-    partCanonical === 'CUSTOMERS_LABELS' ||
-    partCanonical === 'CUSTOMERS_LABEL' ||
-    partCompact === 'CUSTOMERLABELS' ||
-    partCompact === 'CUSTOMERLABEL' ||
-    partCompact === 'CUSTOMERSLABELS' ||
-    partCanonical === 'DELIVERY_EXCL' ||
-    partCanonical === 'DELIVERY_EXCI' ||
-    partCanonical === 'DELIVERY_EXL' ||
-    partCompact === 'DELIVERYEXCL' ||
-    partCompact === 'DELIVERYEXCI' ||
-    partCompact === 'DELIVERYEXL'
-  ) {
-    return true;
-  }
-
-  const descCanonical = cleanDesc
-    .toUpperCase()
-    .replace(/['’`]/g, '')
-    .replace(/[\s\-_./]+/g, '_');
-  const descCompact = descCanonical.replace(/_/g, '');
-
-  const isCustomerLabelsDesc =
-    descCanonical === 'CUSTOMER_LABELS' ||
-    descCanonical === 'CUSTOMER_LABEL' ||
-    descCanonical === 'CUSTOMERS_LABELS' ||
-    descCanonical === 'CUSTOMERS_LABEL' ||
-    descCompact === 'CUSTOMERLABELS' ||
-    descCompact === 'CUSTOMERLABEL';
-
-  const isCustomersTransportDesc =
-    descCanonical === 'CUSTOMERS_TRANSPORT' ||
-    descCanonical === 'CUSTOMER_TRANSPORT' ||
-    descCanonical === 'DELIVERY_EXCL' ||
-    descCanonical === 'DELIVERY_EXCI' ||
-    descCompact === 'CUSTOMERSTRANSPORT' ||
-    descCompact === 'CUSTOMERTRANSPORT' ||
-    descCompact === 'DELIVERYEXCL';
-
-  if (isCustomerLabelsDesc || isCustomersTransportDesc) {
-    const isCodeMissingOrUnreadable =
-      !cleanPart ||
-      /^(?:PART|UNKNOWN|N\/?A|NONE|NULL|UNREADABLE|ILLEGIBLE|MISSING|\?+|\-+|\d{1,4})$/i.test(cleanPart) ||
-      partCanonical === descCanonical ||
-      partCompact === descCompact ||
-      (isCustomerLabelsDesc && /^(?:CUSTOMERS?|LABELS?)$/i.test(cleanPart)) ||
-      (isCustomersTransportDesc && /^(?:DELIVERY|EXCL|CUSTOMERS?|TRANSPORT)$/i.test(cleanPart));
-
-    if (isCodeMissingOrUnreadable) {
-      return true;
-    }
-  }
-
-  return false;
-}
+const DEFAULT_PRIMARY_MODEL = DEFAULT_PRIMARY_VISION_MODEL;
+const DEFAULT_FALLBACK_MODELS = DEFAULT_FALLBACK_VISION_MODELS;
 
 const pagesModelCooldownUntil = new Map<string, number>();
 const MODEL_COOLDOWN_MS = 5 * 60 * 1000;
@@ -630,106 +441,23 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
 
     for (let i = 0; i < totalPages; i++) {
       const pNum = i + 1;
-      const payload = resolvedPayloads[i];
-      if (payload.upperDataUrl && payload.lowerDataUrl) {
-        const up = parseDataUrl(payload.upperDataUrl);
-        const low = parseDataUrl(payload.lowerDataUrl);
-        parts.push({ inlineData: { mimeType: up.mimeType, data: up.base64Data } });
-        parts.push({ inlineData: { mimeType: low.mimeType, data: low.base64Data } });
-        pageDescriptions.push(`Page ${pNum} (Upper & Lower zoomed slices)`);
-      } else {
-        const full = parseDataUrl(payload.fullDataUrl);
-        parts.push({ inlineData: { mimeType: full.mimeType, data: full.base64Data } });
-        pageDescriptions.push(`Page ${pNum}`);
-      }
-      if (payload.pdfSelectableText && payload.pdfSelectableText.trim()) {
-        parts.push({
-          text: `[SELECTABLE TEXT FROM PDF PAGE ${pNum}]:\n${payload.pdfSelectableText.slice(0, 18000)}`,
-        });
-      }
+      const desc = appendPagePayloadParts(parts, pNum, resolvedPayloads[i]);
+      pageDescriptions.push(desc);
     }
 
-    const systemInstruction = `You are a 100%-recall industrial delivery docket, tax invoice, and laser-cutting manifest extraction engine.
-Transcribe EVERY physical part row literally visible across the document into the JSON 'items' array without skipping or merging rows.
-Preserve original part numbers (Laser Central, GCI, J-series), join wrapped multi-line part numbers cleanly, separate supplier from customer/recipient, never invent missing rows, and mark uncertain rows with confidence='low' and validationWarnings.`;
+    const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
 
     const pageNumbers = Array.from({ length: totalPages }, (_, idx) => idx + 1);
-    const basePromptText = `Examine ${pageDescriptions.join(' and ')} (${totalPages} total pages) and extract EVERY physical part row literally visible in top-to-bottom order.
-Rules:
-1. Extract every physical part row without duplicating overlap slices or skipping seam rows.
-2. Record 'pageHeaders' for pages [${pageNumbers.join(', ')}] with: page, docketNumber, supplier, customerName, deliveryDate, orderNumber, jobNumber, carrier, palletCount, startsNewDocket.
-3. For each row: page, no (exact printed row number), part, desc, rev, mat, thk, dim, wt, unit (EA/PC/PCS/SET/M), qty (dispatched integer quantity, never price $), originalText, confidence ('high'|'medium'|'low'), validationWarnings.
-4. Exclude phone/fax numbers, ABN numbers, postcodes, header consignment barcodes, and charge/tax summary lines (Freight, GST, Subtotal, Total, Balance Due).`;
-
-    const promptText = isGci
-      ? `${basePromptText}
-5. GCI SUPPLIER-SPECIFIC HEADER MAPPING (CRITICAL — DO NOT SWAP):
-   - Selected supplier is GCI. GCI dockets show "Client Order No", "Job No", "Despatch Date" / "Dispatch Date", and "Despatched By".
-   - "Job No" (e.g. 194322) IS the primary Docket / Ref # -> populate BOTH 'docketNumber' and 'jobNumber' with Job No.
-   - "Client Order No" (e.g. 72018) IS the customer PO / Order # -> populate 'orderNumber' ONLY (NEVER 'docketNumber' or 'jobNumber').
-   - "Despatch Date" / "Dispatch Date" (DD/MM/YYYY, e.g. 12/11/2026 -> 2026-11-12) -> populate 'deliveryDate' formatted as YYYY-MM-DD.
-   - Set 'supplier' to "GCI". Use "Job No" as primary docket identifier for multi-docket grouping; if "Job No" is missing/unreadable, leave 'docketNumber' and 'jobNumber' empty "" and note in 'validationWarnings' (never substitute "Client Order No").`
-      : basePromptText;
+    const promptText = buildDocketExtractionPrompt(
+      pageDescriptions,
+      pageNumbers,
+      totalPages,
+      typeof supplierHint === 'string' ? supplierHint : undefined
+    );
 
     parts.push({ text: promptText });
 
-    const responseSchema = {
-      type: 'OBJECT',
-      properties: {
-        docketNumber: { type: 'STRING' },
-        supplier: { type: 'STRING' },
-        customerName: { type: 'STRING' },
-        deliveryDate: { type: 'STRING' },
-        orderNumber: { type: 'STRING' },
-        jobNumber: { type: 'STRING' },
-        carrier: { type: 'STRING' },
-        palletCount: { type: 'INTEGER' },
-        validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
-        pageHeaders: {
-          type: 'ARRAY',
-          items: {
-            type: 'OBJECT',
-            properties: {
-              page: { type: 'INTEGER' },
-              docketNumber: { type: 'STRING' },
-              supplier: { type: 'STRING' },
-              customerName: { type: 'STRING' },
-              deliveryDate: { type: 'STRING' },
-              orderNumber: { type: 'STRING' },
-              jobNumber: { type: 'STRING' },
-              carrier: { type: 'STRING' },
-              palletCount: { type: 'INTEGER' },
-              startsNewDocket: { type: 'BOOLEAN' },
-            },
-            required: ['page'],
-          },
-        },
-        items: {
-          type: 'ARRAY',
-          items: {
-            type: 'OBJECT',
-            properties: {
-              page: { type: 'INTEGER' },
-              no: { type: 'STRING' },
-              part: { type: 'STRING' },
-              desc: { type: 'STRING' },
-              rev: { type: 'STRING' },
-              mat: { type: 'STRING' },
-              thk: { type: 'STRING' },
-              dim: { type: 'STRING' },
-              wt: { type: 'STRING' },
-              unit: { type: 'STRING' },
-              qty: { type: 'NUMBER' },
-              originalText: { type: 'STRING' },
-              confidence: { type: 'STRING' },
-              validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
-            },
-            required: ['no', 'part', 'desc', 'qty'],
-          },
-        },
-      },
-      required: ['items'],
-    };
+    const responseSchema = buildRestDocketResponseSchema();
 
     const { primaryModel, fallbackModels } = resolveConfiguredModels(context.env);
     const allModels = [primaryModel, ...fallbackModels];
@@ -835,44 +563,110 @@ Rules:
       ? parsed.validationWarnings.map((w: any) => String(w || '').trim()).filter(Boolean)
       : [];
 
-    const pageHeaderMap = new Map<number, any>();
-    for (const ph of rawPageHeaders) {
-      const pNo = Number(ph?.page);
-      if (pNo >= 1 && pNo <= totalPages && !pageHeaderMap.has(pNo)) {
-        const rawDate = ph.deliveryDate ? String(ph.deliveryDate).trim() : '';
-        pageHeaderMap.set(pNo, {
-          docketNumber: ph.docketNumber ? String(ph.docketNumber).trim() : '',
-          supplier: ph.supplier ? String(ph.supplier).trim() : '',
-          customerName: ph.customerName ? String(ph.customerName).trim() : '',
-          deliveryDate: isGci ? (normalizeGciDispatchDate(rawDate) || '') : rawDate,
-          carrier: ph.carrier ? String(ph.carrier).trim() : undefined,
-          orderNumber: ph.orderNumber ? String(ph.orderNumber).trim() : undefined,
-          jobNumber: ph.jobNumber ? String(ph.jobNumber).trim() : undefined,
-          palletCount: ph.palletCount ? Math.max(1, Number(ph.palletCount) || 1) : 1,
-          startsNewDocket: Boolean(ph.startsNewDocket),
+    const pageRowBounds = new Map<number, { min?: number; max?: number }>();
+    for (const raw of rawItems) {
+      const pNo = Math.max(1, Math.min(totalPages, Number(raw?.page ?? raw?.pageNumber) || 1));
+      const nVal = parseInt(parseCleanRowNo(raw?.no), 10);
+      if (!Number.isNaN(nVal) && nVal > 0 && nVal <= 1500) {
+        const cur = pageRowBounds.get(pNo) || {};
+        pageRowBounds.set(pNo, {
+          min: cur.min === undefined ? nVal : Math.min(cur.min, nVal),
+          max: cur.max === undefined ? nVal : Math.max(cur.max, nVal),
         });
       }
     }
 
+    const pageHeaderMap = new Map<number, any>();
+    for (const ph of rawPageHeaders) {
+      const pNo = Math.min(totalPages, Math.max(1, Number(ph?.page ?? ph?.pageNumber) || 1));
+      if (!pageHeaderMap.has(pNo)) {
+        const rawDate = ph.deliveryDate ? String(ph.deliveryDate).trim() : '';
+        const dn = String(ph?.docketNumber ?? ph?.referenceNumber ?? '').trim();
+        const jn = String(ph?.jobNumber ?? ph?.jobNo ?? ph?.job_no ?? '').trim();
+        const on = String(ph?.orderNumber ?? ph?.clientOrderNo ?? ph?.client_order_no ?? '').trim();
+        pageHeaderMap.set(pNo, {
+          docketNumber: dn,
+          supplier: ph.supplier ? String(ph.supplier).trim() : '',
+          customerName: ph.customerName ? String(ph.customerName).trim() : '',
+          deliveryDate: isGci ? (normalizeGciDispatchDate(rawDate) || '') : rawDate,
+          carrier: ph.carrier ? String(ph.carrier).trim() : undefined,
+          orderNumber: on || undefined,
+          jobNumber: jn || undefined,
+          palletCount: ph.palletCount ? Math.max(1, Number(ph.palletCount) || 1) : 1,
+          startsNewDocket: Boolean(ph.startsNewDocket),
+          validationWarnings: [] as string[],
+        });
+      }
+    }
+
+    const otherPageIds = new Set<string>();
+    for (let pNo = 2; pNo <= totalPages; pNo++) {
+      const m = pageHeaderMap.get(pNo);
+      if (m?.docketNumber) otherPageIds.add(m.docketNumber);
+      if (m?.jobNumber) otherPageIds.add(m.jobNumber);
+      if (m?.orderNumber) otherPageIds.add(m.orderNumber);
+    }
+    const canBackfillPage1 = totalPages === 1 || rawPageHeaders.length === 0;
+    const topDocket = String(parsed.docketNumber ?? parsed.referenceNumber ?? '').trim();
+    const topJob = String(parsed.jobNumber ?? parsed.jobNo ?? parsed.job_no ?? '').trim();
+    const topOrder = String(parsed.orderNumber ?? parsed.clientOrderNo ?? parsed.client_order_no ?? '').trim();
+
+    if (!pageHeaderMap.has(1)) {
+      pageHeaderMap.set(1, {
+        docketNumber: '',
+        supplier: '',
+        customerName: '',
+        deliveryDate: '',
+        palletCount: 1,
+        startsNewDocket: false,
+        validationWarnings: [] as string[],
+      });
+    }
+    const page1Meta = pageHeaderMap.get(1)!;
+    if (!page1Meta.docketNumber && topDocket && (canBackfillPage1 || !otherPageIds.has(topDocket))) {
+      page1Meta.docketNumber = topDocket;
+    }
+    if (!page1Meta.jobNumber && topJob && (canBackfillPage1 || !otherPageIds.has(topJob))) {
+      page1Meta.jobNumber = topJob;
+    }
+    if (!page1Meta.orderNumber && topOrder && (canBackfillPage1 || !otherPageIds.has(topOrder))) {
+      page1Meta.orderNumber = topOrder;
+    }
+    if (!page1Meta.deliveryDate && parsed.deliveryDate) {
+      const rawTopDate = String(parsed.deliveryDate).trim();
+      page1Meta.deliveryDate = isGci ? (normalizeGciDispatchDate(rawTopDate) || '') : rawTopDate;
+    }
+    if (!page1Meta.supplier && parsed.supplier) {
+      page1Meta.supplier = String(parsed.supplier).trim();
+    }
+    if (!page1Meta.customerName && parsed.customerName) {
+      page1Meta.customerName = String(parsed.customerName).trim();
+    }
+    if (!page1Meta.carrier && parsed.carrier) {
+      page1Meta.carrier = String(parsed.carrier).trim();
+    }
+    if (topWarnings.length > 0 && totalPages === 1) {
+      page1Meta.validationWarnings.push(...topWarnings);
+    }
+
     // Apply GCI-specific header resolution per page BEFORE docket segmentation
-    const gciWarningsExtra: string[] = [];
     if (isGci) {
       for (let pNo = 1; pNo <= totalPages; pNo++) {
-        const ph = pageHeaderMap.get(pNo) || {};
-        const mergedInput =
-          pNo === 1
-            ? {
-                docketNumber: ph.docketNumber || parsed.docketNumber,
-                jobNumber: ph.jobNumber || parsed.jobNumber,
-                orderNumber: ph.orderNumber || parsed.orderNumber,
-                deliveryDate: ph.deliveryDate || parsed.deliveryDate,
-                supplier: ph.supplier || parsed.supplier,
-              }
-            : ph;
-        const resolved = resolveGciPageHeaderFields(mergedInput, {
-          selectableText: resolvedPayloads[pNo - 1]?.pdfSelectableText,
-          isContinuationWithoutHeader: pNo > 1,
-        });
+        const ph = pageHeaderMap.get(pNo) || { validationWarnings: [] };
+        const resolved = resolveGciPageHeaderFields(
+          {
+            docketNumber: ph.docketNumber,
+            jobNumber: ph.jobNumber,
+            orderNumber: ph.orderNumber,
+            deliveryDate: ph.deliveryDate,
+            supplier: ph.supplier,
+            validationWarnings: ph.validationWarnings,
+          },
+          {
+            selectableText: resolvedPayloads[pNo - 1]?.pdfSelectableText,
+            isContinuationWithoutHeader: pNo > 1,
+          }
+        );
         pageHeaderMap.set(pNo, {
           ...ph,
           docketNumber: resolved.docketNumber,
@@ -880,10 +674,8 @@ Rules:
           orderNumber: resolved.orderNumber,
           deliveryDate: resolved.deliveryDate || '',
           supplier: 'GCI',
+          validationWarnings: resolved.validationWarnings,
         });
-        if (resolved.missingJobNo) {
-          gciWarningsExtra.push(GCI_MISSING_JOB_NO_WARNING);
-        }
       }
     }
 
@@ -898,6 +690,8 @@ Rules:
       jobNumber?: string;
       palletCount: number;
       pageNumbers: number[];
+      maxRowSeen: number;
+      validationWarnings: string[];
       separationUncertain: boolean;
       separationReason?: string;
       rawRows: any[];
@@ -906,13 +700,17 @@ Rules:
     let currentKey = '';
 
     for (let pNo = 1; pNo <= totalPages; pNo++) {
-      const ph = pageHeaderMap.get(pNo);
-      const dk = (ph?.docketNumber || (!isGci && pNo === 1 ? String(parsed.docketNumber || '').trim() : '')).trim();
+      const ph = pageHeaderMap.get(pNo) || { validationWarnings: [] };
+      const dk = (ph?.docketNumber || (!isGci && pNo === 1 ? topDocket : '')).trim();
       const normalizedKey = dk ? dk.replace(/[\s_]+/g, '').toUpperCase() : '';
       const startsNew = Boolean(ph?.startsNewDocket);
       const prevSeg = currentKey ? segmentMap.get(currentKey) : undefined;
-      const gciOrderChanged = Boolean(
-        isGci && prevSeg && ph?.orderNumber && prevSeg.orderNumber && ph.orderNumber !== prevSeg.orderNumber
+      const bounds = pageRowBounds.get(pNo) || {};
+      const rowResetDetected = Boolean(
+        prevSeg && bounds.min !== undefined && bounds.min <= 2 && prevSeg.maxRowSeen >= 3
+      );
+      const orderChanged = Boolean(
+        prevSeg && ph?.orderNumber && prevSeg.orderNumber && ph.orderNumber !== prevSeg.orderNumber
       );
 
       if (normalizedKey) {
@@ -927,38 +725,55 @@ Rules:
             customerName: ph?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
             deliveryDate: ph?.deliveryDate || parsedDateNorm || new Date().toISOString().slice(0, 10),
             carrier: ph?.carrier || (parsed.carrier ? String(parsed.carrier).trim() : undefined),
-            orderNumber: ph?.orderNumber || (!isGci && parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined),
-            jobNumber: ph?.jobNumber || (parsed.jobNumber ? String(parsed.jobNumber).trim() : undefined),
+            orderNumber: ph?.orderNumber || (!isGci && topOrder ? topOrder : undefined),
+            jobNumber: ph?.jobNumber || (!isGci && topJob ? topJob : undefined),
             palletCount: ph?.palletCount || Math.max(1, Number(parsed.palletCount) || 1),
             pageNumbers: [pNo],
+            maxRowSeen: bounds.max || 0,
+            validationWarnings: [...(ph.validationWarnings || [])],
             separationUncertain: false,
             rawRows: [],
           });
           segmentOrder.push(normalizedKey);
         } else {
-          segmentMap.get(normalizedKey)!.pageNumbers.push(pNo);
+          const existing = segmentMap.get(normalizedKey)!;
+          existing.pageNumbers.push(pNo);
+          existing.validationWarnings.push(...(ph.validationWarnings || []));
+          existing.maxRowSeen = Math.max(existing.maxRowSeen, bounds.max || 0);
         }
         currentKey = normalizedKey;
-      } else if (!currentKey || startsNew || gciOrderChanged) {
+      } else if (!currentKey || startsNew || orderChanged || rowResetDetected) {
         if (isGci) {
           const fallbackKey = `GCI-MISSING-P${pNo}-${Math.floor(100 + Math.random() * 900)}`;
           const parsedDateNorm = normalizeGciDispatchDate(parsed.deliveryDate ? String(parsed.deliveryDate).trim() : '');
+          if (prevSeg && (!prevSeg.hasExplicitDocketNumber || (!orderChanged && !startsNew))) {
+            prevSeg.separationUncertain = true;
+            prevSeg.separationReason =
+              prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+          }
+          const splitReason =
+            prevSeg
+              ? `Page ${pNo} appears to start a new GCI docket (${
+                  orderChanged ? 'Client Order No changed' : rowResetDetected ? 'row numbering restarted at 1' : 'new header detected'
+                }), but Job No is missing or unreadable. Enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).`
+              : GCI_MISSING_JOB_NO_WARNING;
           segmentMap.set(fallbackKey, {
             docketNumber: '',
             hasExplicitDocketNumber: false,
             supplier: 'GCI',
-            customerName: ph?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
-            deliveryDate: ph?.deliveryDate || parsedDateNorm || new Date().toISOString().slice(0, 10),
+            customerName: ph?.customerName || prevSeg?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
+            deliveryDate: ph?.deliveryDate || prevSeg?.deliveryDate || parsedDateNorm || new Date().toISOString().slice(0, 10),
             carrier: ph?.carrier || (parsed.carrier ? String(parsed.carrier).trim() : undefined),
-            orderNumber: ph?.orderNumber || (pNo === 1 && parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined),
+            orderNumber: ph?.orderNumber || (pNo === 1 && topOrder ? topOrder : undefined),
             jobNumber: undefined,
             palletCount: ph?.palletCount || Math.max(1, Number(parsed.palletCount) || 1),
             pageNumbers: [pNo],
+            maxRowSeen: bounds.max || 0,
+            validationWarnings: Array.from(new Set([...(ph.validationWarnings || []), GCI_MISSING_JOB_NO_WARNING])),
             separationUncertain: true,
-            separationReason: GCI_MISSING_JOB_NO_WARNING,
+            separationReason: splitReason,
             rawRows: [],
           });
-          gciWarningsExtra.push(GCI_MISSING_JOB_NO_WARNING);
           segmentOrder.push(fallbackKey);
           currentKey = fallbackKey;
         } else {
@@ -967,17 +782,24 @@ Rules:
           const fallbackDk = uncertain
             ? `DK-REVIEW-P${pNo}-${Math.floor(100 + Math.random() * 900)}`
             : `DK-${Math.floor(10000 + Math.random() * 90000)}`;
+          if (prevSeg) {
+            prevSeg.separationUncertain = true;
+            prevSeg.separationReason =
+              prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+          }
           segmentMap.set(fallbackKey, {
             docketNumber: fallbackDk,
             hasExplicitDocketNumber: false,
-            supplier: ph?.supplier || String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
-            customerName: ph?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
-            deliveryDate: ph?.deliveryDate || String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
+            supplier: ph?.supplier || prevSeg?.supplier || String(parsed.supplier || 'Steel Fabrication Supplier').trim(),
+            customerName: ph?.customerName || prevSeg?.customerName || (parsed.customerName ? String(parsed.customerName).trim() : undefined),
+            deliveryDate: ph?.deliveryDate || prevSeg?.deliveryDate || String(parsed.deliveryDate || new Date().toISOString().slice(0, 10)).trim(),
             carrier: ph?.carrier || (parsed.carrier ? String(parsed.carrier).trim() : undefined),
-            orderNumber: ph?.orderNumber || (parsed.orderNumber ? String(parsed.orderNumber).trim() : undefined),
-            jobNumber: ph?.jobNumber || (parsed.jobNumber ? String(parsed.jobNumber).trim() : undefined),
+            orderNumber: ph?.orderNumber || (pNo === 1 && topOrder ? topOrder : undefined),
+            jobNumber: ph?.jobNumber || (pNo === 1 && topJob ? topJob : undefined),
             palletCount: ph?.palletCount || Math.max(1, Number(parsed.palletCount) || 1),
             pageNumbers: [pNo],
+            maxRowSeen: bounds.max || 0,
+            validationWarnings: [...(ph.validationWarnings || [])],
             separationUncertain: uncertain,
             separationReason: uncertain
               ? `Page ${pNo} could not be tied to an explicit docket number with certainty. Please confirm.`
@@ -988,12 +810,15 @@ Rules:
           currentKey = fallbackKey;
         }
       } else {
-        segmentMap.get(currentKey)!.pageNumbers.push(pNo);
+        const cur = segmentMap.get(currentKey)!;
+        cur.pageNumbers.push(pNo);
+        cur.validationWarnings.push(...(ph.validationWarnings || []));
+        cur.maxRowSeen = Math.max(cur.maxRowSeen, bounds.max || 0);
       }
     }
 
     for (const raw of rawItems) {
-      const rowPage = Math.max(1, Math.min(totalPages, Number(raw.page) || 1));
+      const rowPage = Math.max(1, Math.min(totalPages, Number(raw?.page ?? raw?.pageNumber) || 1));
       const targetKey =
         segmentOrder.find((k) => segmentMap.get(k)!.pageNumbers.includes(rowPage)) || segmentOrder[0];
       if (targetKey) {
@@ -1001,7 +826,6 @@ Rules:
       }
     }
 
-    const combinedWarnings = Array.from(new Set([...topWarnings, ...gciWarningsExtra]));
     const builtDockets = segmentOrder.map((segKey) => {
       const seg = segmentMap.get(segKey)!;
       const excludedRowNos = new Set<number>();
@@ -1026,6 +850,12 @@ Rules:
         });
       }
       const flaggedRowCount = items.filter((it) => it.confidence === 'low').length;
+      const dedupWarnings = Array.from(new Set(seg.validationWarnings.filter(Boolean)));
+      const segRawText = seg.pageNumbers
+        .map((pNum) => resolvedPayloads[pNum - 1]?.pdfSelectableText?.trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
 
       return {
         docketNumber: seg.docketNumber,
@@ -1037,6 +867,7 @@ Rules:
         jobNumber: seg.jobNumber,
         palletCount: seg.palletCount,
         items,
+        rawTextSummary: segRawText || undefined,
         excludedRowNumbers: excludedRowNos.size > 0 ? Array.from(excludedRowNos).sort((a, b) => a - b) : undefined,
         confidenceScore: items.length > 0 ? (seg.separationUncertain || flaggedRowCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
         needsManualReview: items.length === 0 || seg.separationUncertain || flaggedRowCount > 0 || (isGci && !seg.hasExplicitDocketNumber),
@@ -1049,9 +880,10 @@ Rules:
         fallbackUsed,
         retryAttempts: totalRetryAttempts,
         pagesScanned: seg.pageNumbers.length,
+        hasPrintedNoColumn: parsed.hasPrintedNoColumn !== false,
         flaggedRowCount,
-        validationFlags: combinedWarnings.length > 0 ? combinedWarnings : undefined,
-        validationWarnings: combinedWarnings.length > 0 ? combinedWarnings : undefined,
+        validationFlags: dedupWarnings.length > 0 ? dedupWarnings : undefined,
+        validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : undefined,
       };
     });
 

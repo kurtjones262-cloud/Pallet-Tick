@@ -604,6 +604,39 @@ export function normalizeGciDispatchDate(rawDate?: string): string | undefined {
   return undefined;
 }
 
+function isInvalidGciIdToken(tok: string): boolean {
+  const t = String(tok || '').trim();
+  if (!t || t.length < 3 || t.length > 20) return true;
+  // GCI Job No & Client Order No always contain at least one digit; prevents matching suburb/name/header words
+  if (!/\d/.test(t)) return true;
+  if (
+    /^(?:JOB|NO|NUM|NUMBER|DATE|DESPATCH|DISPATCH|CLIENT|ORDER|BY|TERMS|UN|REV|LINE|QTY|DESP|BACK|EA|PCS|COD|ABN|ACN|PH|PHONE|FAX|QLD|NSW|VIC|WA|SA|TAS|NT|ACT|AU|AUSTRALIA|LOT|UNIT)$/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/.test(t) || /^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function stripGciAddressAndPhoneNoise(line: string): string {
+  return line
+    .replace(/\b(?:QLD|NSW|VIC|WA|SA|TAS|NT|ACT)\s+\d{4}\b/gi, '   ')
+    .replace(/\b(?:ABN|ACN)\s*[:#]?\s*(?:\d[\s\-]*){9,11}\b/gi, '   ')
+    .replace(/\b(?:\+?61|0[23478])\s*\d{4}\s*\d{4}\b/gi, '   ');
+}
+
+function matchGciDateToken(line: string): { dateStr: string; index: number; endIndex: number } | null {
+  const m = line.match(/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b/i);
+  if (!m || m.index === undefined) return null;
+  const normalized = normalizeGciDispatchDate(m[1]);
+  if (!normalized) return null;
+  return { dateStr: normalized, index: m.index, endIndex: m.index + m[0].length };
+}
+
 export function extractGciFieldsFromSelectableText(selectableText?: string): {
   jobNo?: string;
   clientOrderNo?: string;
@@ -616,33 +649,195 @@ export function extractGciFieldsFromSelectableText(selectableText?: string): {
   let clientOrderNo: string | undefined;
   let dispatchDate: string | undefined;
 
-  const clientOrderMatch = text.match(/Client\s*Order\s*(?:No|Num|Number|#)?\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
-  if (clientOrderMatch?.[1] && !/^(?:JOB|NO|DATE|DESPATCH|DISPATCH)$/i.test(clientOrderMatch[1])) {
-    clientOrderNo = clientOrderMatch[1].trim();
-  }
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 
-  const jobMatch = text.match(/Job\s*(?:No|Num|Number|#)\s*[:#.\-|\s]+\s*([A-Z0-9][A-Z0-9\-_/]{2,18})/i);
-  if (jobMatch?.[1] && !/^(?:NO|DATE|DESPATCH|DISPATCH|BY)$/i.test(jobMatch[1])) {
-    jobNo = jobMatch[1].trim();
-  }
+  // 1. Date-anchored multi-line / two-row tabular extraction:
+  //    Header:  "Client Order No   Job No   Despatch Date   Despatched By"
+  //    Values (even with left-column address text interleaved or prepended):
+  //             "PALMWOODS QLD 4555"
+  //             "158 Old Bowling Green Road   72018   194322   12/11/2026   Layla MacDonald"
+  for (let i = 0; i < lines.length; i++) {
+    const headerLine = lines[i];
+    const hasClientOrder = /\bclient\s*order\b/i.test(headerLine);
+    const hasJobNo = /\bjob\s*(?:no|num|number|#)\b/i.test(headerLine);
+    if (!hasClientOrder && !hasJobNo) continue;
 
-  const dateMatch = text.match(/(?:Despatch|Dispatch)\s*Date\s*[:#.\-|\s]+\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2})/i);
-  if (dateMatch?.[1]) {
-    dispatchDate = normalizeGciDispatchDate(dateMatch[1].trim());
-  }
+    // Combine i and i+1 in case wrapped column headers sit on 2 lines
+    const nextLineHeader = i + 1 < lines.length ? `${headerLine} ${lines[i + 1]}` : headerLine;
+    const hasBothSameOrNext =
+      /\bclient\s*order\b/i.test(nextLineHeader) && /\bjob\s*(?:no|num|number|#)\b/i.test(nextLineHeader);
+    if (!hasClientOrder || !hasJobNo) {
+      if (!hasBothSameOrNext) continue;
+    }
 
-  // Fallback for two-line tabular header: "Client Order No | Job No | Despatch Date" -> "72018 | 194322 | 12/11/2026"
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (/\bclient\s*order\b/i.test(lines[i]) && /\bjob\s*no\b/i.test(lines[i])) {
-      const valLine = lines[i + 1];
-      const tabular = valLine.match(/([A-Z0-9\-]{3,16})\s*(?:\||\s{2,}|\s)\s*([A-Z0-9\-]{4,16})(?:\s*(?:\||\s)\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}))?/i);
-      if (tabular) {
-        if (!clientOrderNo && tabular[1]) clientOrderNo = tabular[1].trim();
-        if (!jobNo && tabular[2]) jobNo = tabular[2].trim();
-        if (!dispatchDate && tabular[3]) dispatchDate = normalizeGciDispatchDate(tabular[3].trim());
+    const combinedHdr = hasClientOrder && hasJobNo ? headerLine : nextLineHeader;
+    const orderHdrIdx = combinedHdr.search(/\bclient\s*order\b/i);
+    const jobHdrIdx = combinedHdr.search(/\bjob\s*(?:no|num|number|#)\b/i);
+    const jobFirst = jobHdrIdx >= 0 && orderHdrIdx >= 0 && jobHdrIdx < orderHdrIdx;
+
+    for (let j = i + 1; j <= Math.min(lines.length - 1, i + 6); j++) {
+      const candidateRaw = lines[j];
+      // Skip pure header continuation / shipping address label lines
+      if (/^(?:Client\s*Order|Job\s*No|Despatch\s*Date|Dispatch\s*Date|Shipping\s*Address|Line\s+Ord)/i.test(candidateRaw)) {
+        continue;
       }
-      break;
+      const cleanedLine = stripGciAddressAndPhoneNoise(candidateRaw);
+      const dateHit = matchGciDateToken(cleanedLine);
+
+      if (dateHit) {
+        const beforeDate = cleanedLine.slice(0, dateHit.index).trim();
+        const tokens = beforeDate
+          .split(/\s*(?:\||\s+)\s*/)
+          .map((t) => t.replace(/^[:#.\-]+|[:#.\-]+$/g, '').trim())
+          .filter((t) => !isInvalidGciIdToken(t));
+        if (tokens.length >= 2) {
+          const [tokA, tokB] = tokens.slice(-2);
+          clientOrderNo = jobFirst ? tokB : tokA;
+          jobNo = jobFirst ? tokA : tokB;
+          dispatchDate = dateHit.dateStr;
+          break;
+        }
+      }
+    }
+    if (clientOrderNo && jobNo) break;
+  }
+
+  // 2. Vertical / stacked header block followed by stacked values (e.g. rotated PDFs where each cell is on its own line)
+  if (!jobNo || !clientOrderNo) {
+    const labelOf = (l: string): 'order' | 'job' | 'date' | 'other' | null => {
+      const c = l.replace(/[:#\s]+$/g, '').trim();
+      if (/^Client\s*Order\s*(?:No|Num|Number|#)?$/i.test(c)) return 'order';
+      if (/^Job\s*(?:No|Num|Number|#)$/i.test(c)) return 'job';
+      if (/^(?:Despatch|Dispatch)\s*Date$/i.test(c)) return 'date';
+      if (/^(?:Despatched\s*By|Dispatched\s*By|Terms|Shipping\s*Address)$/i.test(c)) return 'other';
+      return null;
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const lbl = labelOf(lines[i]);
+      if (!lbl || lbl === 'other') continue;
+
+      // Case 2a: Alternating label -> immediate value on next line ("Client Order No\n72018\nJob No\n194322\nDespatch Date\n12/11/2026")
+      if (i + 1 < lines.length && !labelOf(lines[i + 1])) {
+        const valClean = stripGciAddressAndPhoneNoise(lines[i + 1]).trim();
+        if (lbl === 'order' && !clientOrderNo && !isInvalidGciIdToken(valClean)) {
+          clientOrderNo = valClean;
+        } else if (lbl === 'job' && !jobNo && !isInvalidGciIdToken(valClean)) {
+          jobNo = valClean;
+        } else if (lbl === 'date' && !dispatchDate) {
+          const d = normalizeGciDispatchDate(valClean);
+          if (d) dispatchDate = d;
+        }
+        continue;
+      }
+
+      // Case 2b: Stacked consecutive label lines followed by stacked value lines (skipping interleaved address/noise lines)
+      const labelSeq: Array<'order' | 'job' | 'date' | 'other'> = [];
+      let k = i;
+      while (k < lines.length && labelSeq.length < 6) {
+        const lType = labelOf(lines[k]);
+        if (!lType) break;
+        labelSeq.push(lType);
+        k++;
+      }
+      const orderOffset = labelSeq.indexOf('order');
+      const jobOffset = labelSeq.indexOf('job');
+      const dateOffset = labelSeq.indexOf('date');
+      const requiredCount = Math.max(orderOffset, jobOffset, dateOffset) + 1;
+      if (orderOffset >= 0 && jobOffset >= 0 && requiredCount >= 2) {
+        const valueSlice: string[] = [];
+        for (let m = k; m < Math.min(lines.length, k + 14) && valueSlice.length < labelSeq.length; m++) {
+          const candidateLine = lines[m];
+          if (labelOf(candidateLine)) break;
+          if (
+            (/\b(?:QLD|NSW|VIC|WA|SA|TAS|NT|ACT)\s+\d{4}\b/i.test(candidateLine) &&
+              !matchGciDateToken(candidateLine)) ||
+            /\b(?:ROAD|RD|STREET|ST|AVENUE|AVE|DRIVE|DR|COURT|CT|HIGHWAY|HWY|SHIPPING\s*ADDRESS)\b/i.test(
+              candidateLine
+            )
+          ) {
+            continue;
+          }
+          const stripped = stripGciAddressAndPhoneNoise(candidateLine).trim();
+          if (!stripped) continue;
+          valueSlice.push(stripped);
+        }
+        if (valueSlice.length >= requiredCount) {
+          const dateOk =
+            dateOffset === -1 || Boolean(normalizeGciDispatchDate(valueSlice[dateOffset]));
+          if (dateOk) {
+            const orderCand = valueSlice[orderOffset];
+            const jobCand = valueSlice[jobOffset];
+            if (!clientOrderNo && !isInvalidGciIdToken(orderCand)) clientOrderNo = orderCand;
+            if (!jobNo && !isInvalidGciIdToken(jobCand)) jobNo = jobCand;
+            if (!dispatchDate && dateOffset >= 0) {
+              dispatchDate = normalizeGciDispatchDate(valueSlice[dateOffset]);
+            }
+            if (clientOrderNo && jobNo) break;
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Undated two-row tabular fallback (ignoring known address/postcodes)
+  if (!jobNo || !clientOrderNo) {
+    for (let i = 0; i < lines.length - 1; i++) {
+      const hdr = lines[i];
+      if (!(/\bclient\s*order\b/i.test(hdr) && /\bjob\s*(?:no|num|number|#)\b/i.test(hdr))) continue;
+      const orderHdrIdx = hdr.search(/\bclient\s*order\b/i);
+      const jobHdrIdx = hdr.search(/\bjob\s*(?:no|num|number|#)\b/i);
+      const jobFirst = jobHdrIdx >= 0 && orderHdrIdx >= 0 && jobHdrIdx < orderHdrIdx;
+
+      for (let j = i + 1; j <= Math.min(lines.length - 1, i + 4); j++) {
+        const rawVal = lines[j];
+        if (/\b(?:QLD|NSW|VIC|WA|SA|TAS|NT|ACT)\s+\d{4}\b/i.test(rawVal) && !matchGciDateToken(rawVal)) {
+          continue;
+        }
+        if (/\b(?:ROAD|RD|STREET|ST|AVENUE|AVE|DRIVE|DR|COURT|CT|HIGHWAY|HWY|SHIPPING\s*ADDRESS)\b/i.test(rawVal)) {
+          continue;
+        }
+        const cleaned = stripGciAddressAndPhoneNoise(rawVal);
+        const m = cleaned.match(/^\s*([A-Z0-9\-/]{4,18})\s*(?:\||\s+)\s*([A-Z0-9\-/]{4,18})(?:\s|$|\|)/i);
+        if (m && !isInvalidGciIdToken(m[1]) && !isInvalidGciIdToken(m[2])) {
+          if (!clientOrderNo) clientOrderNo = jobFirst ? m[2].trim() : m[1].trim();
+          if (!jobNo) jobNo = jobFirst ? m[1].trim() : m[2].trim();
+          break;
+        }
+      }
+      if (clientOrderNo && jobNo) break;
+    }
+  }
+
+  // 4. Same-line key-value format ("Client Order No: 72018   Job No: 194322   Despatch Date: 12/11/2026")
+  for (const rawLine of lines) {
+    const cleanLine = stripGciAddressAndPhoneNoise(rawLine);
+    if (!clientOrderNo) {
+      const m = cleanLine.match(
+        /\bClient\s*Order\s*(?:No|Num|Number|#)?(?:\s*[:#.\-|]\s*|[ \t]+)([A-Z0-9][A-Z0-9\-_/]{2,18})(?=\s|\||$)/i
+      );
+      if (m?.[1] && !isInvalidGciIdToken(m[1])) {
+        clientOrderNo = m[1].trim();
+      }
+    }
+    if (!jobNo) {
+      const m = cleanLine.match(
+        /\bJob\s*(?:No|Num|Number|#)(?:\s*[:#.\-|]\s*|[ \t]+)([A-Z0-9][A-Z0-9\-_/]{2,18})(?=\s|\||$)/i
+      );
+      if (m?.[1] && !isInvalidGciIdToken(m[1])) {
+        jobNo = m[1].trim();
+      }
+    }
+    if (!dispatchDate) {
+      const dm = cleanLine.match(
+        /\b(?:Despatch|Dispatch)\s*Date(?:\s*[:#.\-|]\s*|[ \t]+)(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b/i
+      );
+      if (dm?.[1]) {
+        dispatchDate = normalizeGciDispatchDate(dm[1].trim());
+      }
     }
   }
 
@@ -817,6 +1012,75 @@ export function isGciExcludedNonPartItem(
   return false;
 }
 
+export function mapBatchPageNumber(rawPage: unknown, batchPageNums: number[]): number {
+  if (!Array.isArray(batchPageNums) || batchPageNums.length === 0) {
+    const n = Number(rawPage);
+    return Number.isInteger(n) && n >= 1 ? n : 1;
+  }
+  if (batchPageNums.length === 1) {
+    // A single-page batch can ONLY correspond to that single page — never let "page: 1" overwrite Page 1.
+    return batchPageNums[0];
+  }
+  const n = Number(rawPage);
+  if (Number.isInteger(n) && batchPageNums.includes(n)) {
+    return n;
+  }
+  if (Number.isInteger(n) && n >= 1 && n <= batchPageNums.length) {
+    return batchPageNums[n - 1];
+  }
+  return batchPageNums[0];
+}
+
+/**
+ * Appends explicit page labels and deduplicated image parts (Full Page first when present,
+ * followed by distinct Upper/Lower zoomed slices) plus optional PDF selectable text.
+ */
+export function appendPagePayloadParts(
+  parts: Array<Record<string, unknown>>,
+  pNum: number,
+  payload: PageSlicePayload
+): string {
+  const seenBase64 = new Set<string>();
+  const labels: string[] = [];
+
+  const pushImage = (dataUrl: string | undefined, label: string, descLabel: string) => {
+    const trimmed = String(dataUrl || '').trim();
+    if (!trimmed) return;
+    const parsed = parseDataUrl(trimmed);
+    if (!parsed.base64Data || seenBase64.has(parsed.base64Data)) return;
+    seenBase64.add(parsed.base64Data);
+    parts.push({ text: label });
+    parts.push({ inlineData: { mimeType: parsed.mimeType, data: parsed.base64Data } });
+    labels.push(descLabel);
+  };
+
+  pushImage(
+    payload.fullDataUrl,
+    `[PAGE ${pNum} - FULL PAGE VIEW (complete header & full layout of Page ${pNum})]:`,
+    'Full Page view'
+  );
+  pushImage(
+    payload.upperDataUrl,
+    `[PAGE ${pNum} - UPPER ZOOMED SLICE of Page ${pNum} (same Page ${pNum}, top 58%)]:`,
+    'Upper slice'
+  );
+  pushImage(
+    payload.lowerDataUrl,
+    `[PAGE ${pNum} - LOWER ZOOMED SLICE of Page ${pNum} (same Page ${pNum}, bottom 58%)]:`,
+    'Lower slice'
+  );
+
+  if (payload.pdfSelectableText && payload.pdfSelectableText.trim()) {
+    parts.push({
+      text: `[SELECTABLE TEXT FROM PDF PAGE ${pNum}]:\n${payload.pdfSelectableText.slice(0, 18000)}`,
+    });
+  }
+
+  return labels.length > 1
+    ? `Page ${pNum} (${labels.join(' + ')} — all belonging strictly to Page ${pNum})`
+    : `Page ${pNum}`;
+}
+
 export function buildDocketExtractionPrompt(
   pageDescriptions: string[],
   pageNumbers: number[],
@@ -830,12 +1094,14 @@ MANDATORY 100%-RECALL EXTRACTION RULES:
    - Record printed "No" of first visible part row in 'firstVisibleRowNo' and last visible row in 'lastVisibleRowNo' (or "" if none).
 2. EXTRACT EVERY SINGLE PART ROW FROM TOP TO BOTTOM:
    - Never skip a numbered row and never merge two separate numbered rows into one item.
-   - If a page is presented as an UPPER half and a LOWER half with center overlap, read top-to-bottom without duplicating overlap rows and without skipping rows near the seam.
+   - If a page is presented with a FULL PAGE view and/or UPPER/LOWER zoomed slices, read top-to-bottom without duplicating rows and without confusing multiple slices of one page for separate pages.
    - Preserve legitimate separate rows even if the same part number appears multiple times with different revisions, pallets, descriptions, or line numbers.
 3. IGNORE NON-PART LINES:
    - Exclude phone/fax numbers, ABN numbers, street/postal codes, delivery instructions, header barcodes, consignment notes, column headers, weights/kg totals, and tax/charge rows (Freight, Delivery, Setup, Pallet Fee, Subtotal, GST, Total, Balance Due).
 4. MULTIPLE DOCKETS / PAGE HEADERS:
-   - Record one entry in 'pageHeaders' for EVERY page (${pageNumbers.join(', ')}) with: page, docketNumber (exact printed Docket No, Delivery Note, Packing Slip, Tax Invoice No; "" if continuation page has no header), supplier (sender/fabricator e.g. Laser Central, GCI), customerName (Deliver To / Customer / Bill To recipient), deliveryDate (YYYY-MM-DD if visible), orderNumber (Customer PO / Order No), jobNumber (Job # / Work Order # if separate), carrier, palletCount, and startsNewDocket (true if this page clearly starts a new docket/invoice).
+   - Record one entry in 'pageHeaders' for EVERY page in [${pageNumbers.join(', ')}] (use exact page number${
+     pageNumbers.length === 1 ? ` page=${pageNumbers[0]}` : ''
+   }) with: page, docketNumber (exact printed Docket No, Delivery Note, Packing Slip, Tax Invoice No; "" if continuation page has no header), supplier (sender/fabricator e.g. Laser Central, GCI), customerName (Deliver To / Customer / Bill To recipient), deliveryDate (YYYY-MM-DD if visible), orderNumber (Customer PO / Order No), jobNumber (Job # / Work Order # if separate), carrier, palletCount, and startsNewDocket (true if this page clearly starts a new docket/invoice).
 5. FIELD MAPPING FOR EACH PART ROW:
    - page: Page number (${pageNumbers.join(' or ')}) where row appears.
    - no: Exact printed "No" / "Item" / "Pos" / "Line" / "#" number (if a NEW docket starts and numbering restarts at 1, keep "1").
@@ -873,12 +1139,15 @@ export function buildRestDocketResponseSchema(): Record<string, unknown> {
   return {
     type: 'OBJECT',
     properties: {
-      docketNumber: { type: 'STRING' },
+      docketNumber: {
+        type: 'STRING',
+        description: 'Primary Docket / Delivery Note / Ref # (for GCI dockets, MUST be the printed Job No, NEVER Client Order No).',
+      },
       supplier: { type: 'STRING' },
       customerName: { type: 'STRING' },
-      deliveryDate: { type: 'STRING' },
-      orderNumber: { type: 'STRING' },
-      jobNumber: { type: 'STRING' },
+      deliveryDate: { type: 'STRING', description: 'Delivery/Despatch Date formatted YYYY-MM-DD when visible.' },
+      orderNumber: { type: 'STRING', description: 'Customer PO / Client Order No (kept separate from Job No / Docket #).' },
+      jobNumber: { type: 'STRING', description: 'Printed Job No / Work Order # (for GCI dockets, exact Job No value e.g. 194322).' },
       carrier: { type: 'STRING' },
       palletCount: { type: 'INTEGER' },
       validationWarnings: { type: 'ARRAY', items: { type: 'STRING' } },
@@ -887,13 +1156,13 @@ export function buildRestDocketResponseSchema(): Record<string, unknown> {
         items: {
           type: 'OBJECT',
           properties: {
-            page: { type: 'INTEGER' },
-            docketNumber: { type: 'STRING' },
+            page: { type: 'INTEGER', description: 'PDF page number requested in prompt.' },
+            docketNumber: { type: 'STRING', description: 'Printed Docket No (or printed Job No for GCI dockets).' },
             supplier: { type: 'STRING' },
             customerName: { type: 'STRING' },
             deliveryDate: { type: 'STRING' },
-            orderNumber: { type: 'STRING' },
-            jobNumber: { type: 'STRING' },
+            orderNumber: { type: 'STRING', description: 'Customer PO / Client Order No on this page.' },
+            jobNumber: { type: 'STRING', description: 'Printed Job No on this page.' },
             carrier: { type: 'STRING' },
             palletCount: { type: 'INTEGER' },
             startsNewDocket: { type: 'BOOLEAN' },
@@ -1208,26 +1477,8 @@ async function extractPageBatchInOneCall(
   const pageDescriptions: string[] = [];
 
   for (const bp of batchPages) {
-    const pNum = bp.pageNumber;
-    const payload = bp.payload;
-    if (payload.upperDataUrl && payload.lowerDataUrl) {
-      const up = parseDataUrl(payload.upperDataUrl);
-      const low = parseDataUrl(payload.lowerDataUrl);
-      parts.push({ inlineData: { mimeType: up.mimeType, data: up.base64Data } });
-      parts.push({ inlineData: { mimeType: low.mimeType, data: low.base64Data } });
-      pageDescriptions.push(
-        `Page ${pNum} (shown as 2 high-res zoomed halves: UPPER 58% of Page ${pNum} followed by LOWER 58% of Page ${pNum})`
-      );
-    } else {
-      const full = parseDataUrl(payload.fullDataUrl);
-      parts.push({ inlineData: { mimeType: full.mimeType, data: full.base64Data } });
-      pageDescriptions.push(`Page ${pNum}`);
-    }
-    if (payload.pdfSelectableText && payload.pdfSelectableText.trim()) {
-      parts.push({
-        text: `[DIRECT SELECTABLE TEXT EXTRACTED FROM PDF PAGE ${pNum}]:\n${payload.pdfSelectableText.slice(0, 18000)}`,
-      });
-    }
+    const desc = appendPagePayloadParts(parts, bp.pageNumber, bp.payload);
+    pageDescriptions.push(desc);
   }
 
   const systemInstruction = DOCKET_EXTRACTION_SYSTEM_INSTRUCTION;
@@ -1242,12 +1493,15 @@ async function extractPageBatchInOneCall(
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      docketNumber: { type: Type.STRING },
+      docketNumber: {
+        type: Type.STRING,
+        description: 'Primary Docket / Delivery Note / Ref # (for GCI dockets, MUST be the printed Job No, NEVER Client Order No).',
+      },
       supplier: { type: Type.STRING },
       customerName: { type: Type.STRING },
-      deliveryDate: { type: Type.STRING },
-      orderNumber: { type: Type.STRING },
-      jobNumber: { type: Type.STRING },
+      deliveryDate: { type: Type.STRING, description: 'Delivery/Despatch Date formatted YYYY-MM-DD when visible.' },
+      orderNumber: { type: Type.STRING, description: 'Customer PO / Client Order No (separate from Job No / Docket #).' },
+      jobNumber: { type: Type.STRING, description: 'Printed Job No / Work Order # (for GCI dockets, exact Job No value e.g. 194322).' },
       carrier: { type: Type.STRING },
       palletCount: { type: Type.INTEGER },
       validationWarnings: { type: Type.ARRAY, items: { type: Type.STRING } },
@@ -1257,13 +1511,13 @@ async function extractPageBatchInOneCall(
         items: {
           type: Type.OBJECT,
           properties: {
-            page: { type: Type.INTEGER },
-            docketNumber: { type: Type.STRING },
+            page: { type: Type.INTEGER, description: 'PDF page number requested in prompt.' },
+            docketNumber: { type: Type.STRING, description: 'Printed Docket No (or printed Job No for GCI dockets).' },
             supplier: { type: Type.STRING },
             customerName: { type: Type.STRING },
             deliveryDate: { type: Type.STRING },
-            orderNumber: { type: Type.STRING },
-            jobNumber: { type: Type.STRING },
+            orderNumber: { type: Type.STRING, description: 'Customer PO / Client Order No on this page.' },
+            jobNumber: { type: Type.STRING, description: 'Printed Job No on this page.' },
             carrier: { type: Type.STRING },
             palletCount: { type: Type.INTEGER },
             startsNewDocket: { type: Type.BOOLEAN },
@@ -1355,13 +1609,16 @@ async function extractPageBatchInOneCall(
   );
 
   return {
-    docketNumber: parsed.docketNumber,
+    docketNumber: String(parsed.docketNumber ?? parsed.referenceNumber ?? '').trim() || undefined,
     supplier: parsed.supplier,
     customerName: parsed.customerName,
     deliveryDate: parsed.deliveryDate,
     carrier: parsed.carrier,
-    orderNumber: parsed.orderNumber,
-    jobNumber: parsed.jobNumber,
+    orderNumber:
+      String(parsed.orderNumber ?? parsed.clientOrderNo ?? parsed.client_order_no ?? '').trim() ||
+      undefined,
+    jobNumber:
+      String(parsed.jobNumber ?? parsed.jobNo ?? parsed.job_no ?? '').trim() || undefined,
     palletCount: parsed.palletCount,
     validationWarnings: Array.isArray(parsed.validationWarnings) ? parsed.validationWarnings : [],
     pageHeaders: Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [],
@@ -1659,9 +1916,11 @@ export async function extractDocketWithGeminiVision(
     const defaultPage = batchPageNums[0];
 
     for (const ph of bRes.pageHeaders || []) {
-      const pNum = Math.min(totalPages, Math.max(1, Number((ph as any).page ?? (ph as any).pageNumber) || defaultPage));
+      const pNum = mapBatchPageNumber((ph as any).page ?? (ph as any).pageNumber, batchPageNums);
       const meta = pageMetaMap.get(pNum)!;
-      const dn = String(ph.docketNumber || '').trim();
+      const dn = String(ph.docketNumber ?? (ph as any).referenceNumber ?? '').trim();
+      const jn = String(ph.jobNumber ?? (ph as any).jobNo ?? (ph as any).job_no ?? '').trim();
+      const on = String(ph.orderNumber ?? (ph as any).clientOrderNo ?? (ph as any).client_order_no ?? '').trim();
       if (dn && !meta.explicitDocketNumber) meta.explicitDocketNumber = dn;
       if (ph.supplier && ph.supplier.trim() && !meta.supplier) meta.supplier = ph.supplier.trim();
       if (ph.customerName && ph.customerName.trim() && !meta.customerName) {
@@ -1676,16 +1935,27 @@ export async function extractDocketWithGeminiVision(
           meta.deliveryDate = trimmedDate;
         }
       }
-      if (ph.orderNumber && ph.orderNumber.trim() && !meta.orderNumber) meta.orderNumber = ph.orderNumber.trim();
-      if (ph.jobNumber && ph.jobNumber.trim() && !meta.jobNumber) meta.jobNumber = ph.jobNumber.trim();
+      if (on && !meta.orderNumber) meta.orderNumber = on;
+      if (jn && !meta.jobNumber) meta.jobNumber = jn;
       if (ph.carrier && ph.carrier.trim() && !meta.carrier) meta.carrier = ph.carrier.trim();
       if (ph.palletCount && ph.palletCount > 0 && !meta.palletCount) meta.palletCount = ph.palletCount;
       if (ph.startsNewDocket) meta.startsNewDocket = true;
     }
 
-    // Backfill page 1 of batch if pageHeaders omitted batch-level header fields
+    // Backfill first page of this batch when top-level batch fields exist and pageHeaders omitted them
     const firstMeta = pageMetaMap.get(defaultPage)!;
-    if (!firstMeta.explicitDocketNumber && bRes.docketNumber?.trim() && (batchPageNums.length === 1 || (bRes.pageHeaders || []).length === 0)) {
+    const otherBatchIds = new Set(
+      batchPageNums.slice(1).flatMap((p) => {
+        const m = pageMetaMap.get(p);
+        return [m?.explicitDocketNumber, m?.jobNumber, m?.orderNumber].filter(Boolean) as string[];
+      })
+    );
+    const canBackfillBatchHeader = batchPageNums.length === 1 || (bRes.pageHeaders || []).length === 0;
+    if (
+      !firstMeta.explicitDocketNumber &&
+      bRes.docketNumber?.trim() &&
+      (canBackfillBatchHeader || !otherBatchIds.has(bRes.docketNumber.trim()))
+    ) {
       firstMeta.explicitDocketNumber = bRes.docketNumber.trim();
     }
     if (!firstMeta.supplier && bRes.supplier?.trim()) firstMeta.supplier = bRes.supplier.trim();
@@ -1701,15 +1971,27 @@ export async function extractDocketWithGeminiVision(
         firstMeta.deliveryDate = trimmedDate;
       }
     }
-    if (!firstMeta.orderNumber && bRes.orderNumber?.trim()) firstMeta.orderNumber = bRes.orderNumber.trim();
-    if (!firstMeta.jobNumber && bRes.jobNumber?.trim()) firstMeta.jobNumber = bRes.jobNumber.trim();
+    if (
+      !firstMeta.orderNumber &&
+      bRes.orderNumber?.trim() &&
+      (canBackfillBatchHeader || !otherBatchIds.has(bRes.orderNumber.trim()))
+    ) {
+      firstMeta.orderNumber = bRes.orderNumber.trim();
+    }
+    if (
+      !firstMeta.jobNumber &&
+      bRes.jobNumber?.trim() &&
+      (canBackfillBatchHeader || !otherBatchIds.has(bRes.jobNumber.trim()))
+    ) {
+      firstMeta.jobNumber = bRes.jobNumber.trim();
+    }
     if (!firstMeta.carrier && bRes.carrier?.trim()) firstMeta.carrier = bRes.carrier.trim();
-    if (Array.isArray(bRes.validationWarnings) && bRes.validationWarnings.length > 0) {
+    if (Array.isArray(bRes.validationWarnings) && bRes.validationWarnings.length > 0 && batchPageNums.length === 1) {
       firstMeta.validationWarnings.push(...bRes.validationWarnings.map((w) => String(w || '').trim()).filter(Boolean));
     }
 
     for (const rawIt of bRes.items || []) {
-      const targetPage = Math.min(totalPages, Math.max(1, Number((rawIt as any).page ?? (rawIt as any).pageNumber) || defaultPage));
+      const targetPage = mapBatchPageNumber((rawIt as any).page ?? (rawIt as any).pageNumber, batchPageNums);
       const meta = pageMetaMap.get(targetPage)!;
       meta.rawItems.push({ ...rawIt, page: targetPage });
       const nVal = parseInt(parseCleanRowNo(rawIt.no), 10);
@@ -1735,7 +2017,7 @@ export async function extractDocketWithGeminiVision(
         },
         {
           selectableText: resolvedPayloads[p - 1]?.pdfSelectableText,
-          // Evaluate missingJobNo accurately later if this page turns out to be a continuation page
+          // Evaluate missingJobNo per-segment once we know whether p > 1 is an independent docket or genuine continuation
           isContinuationWithoutHeader: p > 1,
         }
       );
@@ -1878,8 +2160,11 @@ export async function extractDocketWithGeminiVision(
         const reason = `Page ${p} appears to start a new GCI docket (${
           orderChanged ? 'Client Order No changed' : rowResetDetected ? 'row numbering restarted at 1' : 'new header detected'
         }), but Job No is missing or unreadable. Enter the printed Job No into Docket / Ref # manually (Client Order No was not substituted).`;
-        prevSeg.separationUncertain = true;
-        prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        // Only mark previous segment uncertain if it lacked an explicit Job No or the split wasn't clearly signaled by a new Client Order No / new docket flag
+        if (!prevSeg.hasExplicitDocketNumber || (!orderChanged && !meta.startsNewDocket)) {
+          prevSeg.separationUncertain = true;
+          prevSeg.separationReason = prevSeg.separationReason || 'Verify multi-page boundary against adjoining pages.';
+        }
         segments.push({
           docketKey: missingKey,
           explicitDocketNumber: '',
@@ -2067,6 +2352,11 @@ export async function extractDocketWithGeminiVision(
 
     const dedupWarnings = Array.from(new Set(seg.validationWarnings.filter(Boolean)));
     const flaggedCount = validItems.filter((it) => it.confidence === 'low').length;
+    const segRawText = seg.pageNumbers
+      .map((pNum) => resolvedPayloads[pNum - 1]?.pdfSelectableText?.trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
 
     builtDockets.push({
       docketNumber: seg.explicitDocketNumber,
@@ -2078,6 +2368,7 @@ export async function extractDocketWithGeminiVision(
       jobNumber: seg.jobNumber,
       palletCount: seg.palletCount,
       items: validItems,
+      rawTextSummary: segRawText || undefined,
       confidenceScore: validItems.length > 0 ? (seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber) ? 80 : 100) : 0,
       needsManualReview: validItems.length === 0 || seg.separationUncertain || flaggedCount > 0 || (isGci && !seg.hasExplicitDocketNumber),
       separationUncertain: seg.separationUncertain,

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Plus,
@@ -162,6 +162,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   const [showPhotoViewer, setShowPhotoViewer] = useState(false);
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
+  const isSavingRef = useRef(false);
 
   // Add Part Modal State inside Review Screen
   const [showAddPartForm, setShowAddPartForm] = useState(false);
@@ -182,6 +183,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
 
   // Re-run OCR State (preserving manual edits)
   const [isRetryingOcr, setIsRetryingOcr] = useState(false);
+  const isRetryingRef = useRef(false);
   const [retryOcrStatus, setRetryOcrStatus] = useState<string | null>(null);
   const [retryOcrError, setRetryOcrError] = useState<string | null>(null);
   const [activeExtractionMeta, setActiveExtractionMeta] = useState({
@@ -376,7 +378,8 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   };
 
   const handleRerunOcrPreservingManualEdits = async () => {
-    if (attachedPages.length === 0 || isRetryingOcr) return;
+    if (attachedPages.length === 0 || isRetryingOcr || isRetryingRef.current) return;
+    isRetryingRef.current = true;
     setIsRetryingOcr(true);
     setRetryOcrError(null);
     setRetryOcrStatus('Re-running Gemini 4 Hydrogen extraction while preserving your manual edits...');
@@ -456,6 +459,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       );
       setRetryOcrStatus(null);
     } finally {
+      isRetryingRef.current = false;
       setIsRetryingOcr(false);
     }
   };
@@ -488,6 +492,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
   const isDuplicateInBatch = duplicateInBatchSet.has(activeDocketKey);
 
   const handleConfirmImport = async () => {
+    if (isSaving || isSavingRef.current) return;
     setRetryOcrError(null);
 
     // Validate all separated dockets before committing any
@@ -532,6 +537,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
       }
     }
 
+    isSavingRef.current = true;
     setIsSaving(true);
     const createdDeliveries: Delivery[] = [];
     try {
@@ -640,6 +646,7 @@ export const DocketOcrReviewModal: React.FC<DocketOcrReviewModalProps> = ({
         err?.message || 'Failed to save one or more separated dockets. Please check docket numbers.'
       );
     } finally {
+      isSavingRef.current = false;
       setIsSaving(false);
     }
   };

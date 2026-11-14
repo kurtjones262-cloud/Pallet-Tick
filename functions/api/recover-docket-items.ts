@@ -18,7 +18,7 @@ interface EventContext {
 
 const DEFAULT_PRIMARY_MODEL = 'gemini-4-hydrogen';
 const DEFAULT_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-const GEMINI_REQUEST_TIMEOUT_MS = 22000;
+const GEMINI_REQUEST_TIMEOUT_MS = 35000;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);

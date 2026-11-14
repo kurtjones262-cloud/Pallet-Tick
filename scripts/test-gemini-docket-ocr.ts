@@ -2,14 +2,26 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import workerEntry from '../worker.ts';
+import { onRequestPost as pagesExtractPost } from '../functions/api/extract-docket.ts';
 import {
   DEFAULT_PRIMARY_VISION_MODEL,
   DEFAULT_FALLBACK_VISION_MODELS,
+  GEMINI_REQUEST_TIMEOUT_MS,
+  GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS,
   resolveConfiguredVisionModels,
   generateWithRetryAndFallback,
+  appendPagePayloadParts,
+  logOcrEvent,
+  summarizePartsForDiagnostics,
+  clearGeminiModelCooldownsForTesting,
 } from '../src/server/docketOcr.ts';
 import { validateAndNormalizeGeminiDocket } from '../src/utils/docketParser.ts';
 import {
+  CLIENT_SINGLE_PAGE_PER_REQUEST_TIMEOUT_MS,
+  CLIENT_MULTI_PAGE_PER_REQUEST_TIMEOUT_MS,
+  CLIENT_SINGLE_PAGE_OVERALL_TIMEOUT_MS,
+  CLIENT_MULTI_PAGE_OVERALL_TIMEOUT_MS,
+  resolveClientExtractionTimeouts,
   DocketOfflineError,
   executeGeminiDocketExtraction,
   performSmartDocketExtraction,
@@ -555,13 +567,233 @@ async function runTests() {
   passed += 4;
 
   // ---------------------------------------------------------------------------
-  // 7. Live Gemini API Verification (Explicitly Skipped When GEMINI_API_KEY Unset)
+  // 7. Timeout Strategy, Safe Diagnostics Telemetry & Payload Optimization
+  // ---------------------------------------------------------------------------
+  console.log('\n--- 7. Timeout Strategy, Safe Diagnostics & Payload Optimization ---');
+
+  // 7a. Platform-safe timeout tiers (never truncated prematurely at 22s/45s)
+  assert.equal(GEMINI_REQUEST_TIMEOUT_MS, 45000);
+  assert.equal(GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS, 75000);
+  const singleTimeouts = resolveClientExtractionTimeouts(1);
+  assert.equal(singleTimeouts.perRequestTimeoutMs, CLIENT_SINGLE_PAGE_PER_REQUEST_TIMEOUT_MS);
+  assert.equal(singleTimeouts.overallTimeoutMs, CLIENT_SINGLE_PAGE_OVERALL_TIMEOUT_MS);
+  const multiTimeouts = resolveClientExtractionTimeouts(3);
+  assert.equal(multiTimeouts.perRequestTimeoutMs, CLIENT_MULTI_PAGE_PER_REQUEST_TIMEOUT_MS);
+  assert.equal(multiTimeouts.overallTimeoutMs, CLIENT_MULTI_PAGE_OVERALL_TIMEOUT_MS);
+  assert(multiTimeouts.perRequestTimeoutMs > 45000 && multiTimeouts.perRequestTimeoutMs < 100000);
+
+  const customTimeouts = resolveClientExtractionTimeouts(3, {
+    clientPerRequestTimeoutMs: 70000,
+    clientOverallTimeoutMs: 85000,
+  });
+  assert.equal(customTimeouts.perRequestTimeoutMs, 70000);
+  assert.equal(customTimeouts.overallTimeoutMs, 85000);
+
+  // 7b. Slow primary response within requestTimeoutMs completes cleanly on gemini-4-hydrogen (NO fallback/downgrade)
+  clearGeminiModelCooldownsForTesting();
+  const slowPrimaryRes = await generateWithRetryAndFallback(
+    {
+      models: {
+        generateContent: async () => {
+          await new Promise((r) => setTimeout(r, 60));
+          return {
+            text: JSON.stringify({
+              docketNumber: '194322',
+              supplier: 'GCI',
+              deliveryDate: '2026-11-12',
+              orderNumber: '72018',
+              jobNumber: '194322',
+              items: [
+                { no: '1', part: 'GCI-P1', desc: 'Gusset Plate', qty: 4 },
+              ],
+            }),
+          };
+        },
+      },
+    },
+    { LOW: 'LOW', MEDIUM: 'MEDIUM' },
+    [
+      { text: '[PAGE 1 - FULL PAGE VIEW]:' },
+      { inlineData: { mimeType: 'image/jpeg', data: 'AAAA1111BBBB2222' } },
+    ],
+    'System instruction',
+    {},
+    'batch',
+    undefined,
+    10,
+    400
+  );
+  assert.equal(slowPrimaryRes.modelUsed, 'gemini-4-hydrogen');
+  assert.equal(slowPrimaryRes.fallbackUsed, false);
+  assert.equal(slowPrimaryRes.diagnostics.model, 'gemini-4-hydrogen');
+  assert.equal(slowPrimaryRes.diagnostics.statusCode, 200);
+  assert.equal(slowPrimaryRes.diagnostics.imageCount, 1);
+  assert(slowPrimaryRes.diagnostics.approxPayloadBytes >= 64);
+  assert(slowPrimaryRes.diagnostics.durationMs >= 45);
+  assert(slowPrimaryRes.diagnostics.requestStartedAt.includes('T'));
+  assert(slowPrimaryRes.diagnostics.requestCompletedAt.includes('T'));
+
+  // 7c. Log sanitization preserves imageCount & approxPayloadBytes while redacting keys/secrets/base64/text
+  const capturedLogs: string[] = [];
+  const origConsoleLog = console.log;
+  console.log = (...args: any[]) => {
+    capturedLogs.push(args.map((a) => String(a)).join(' '));
+  };
+  try {
+    logOcrEvent('info', 'diag_probe', {
+      model: 'gemini-4-hydrogen',
+      imageCount: 9,
+      approxPayloadBytes: 512000,
+      durationMs: 1234,
+      statusCode: 200,
+      requestStartedAt: '2026-11-14T00:00:00.000Z',
+      requestCompletedAt: '2026-11-14T00:00:01.234Z',
+      providerErrorMessage: 'Request to https://example.test?key=SECRET_API_KEY_12345 failed',
+      secretValue: 'must-not-appear',
+      base64Payload: 'must-not-appear',
+      rawText: 'must-not-appear',
+    });
+  } finally {
+    console.log = origConsoleLog;
+  }
+  const loggedObj = JSON.parse(capturedLogs[0] || '{}');
+  assert.equal(loggedObj.imageCount, 9);
+  assert.equal(loggedObj.approxPayloadBytes, 512000);
+  assert.equal(loggedObj.durationMs, 1234);
+  assert.equal(loggedObj.statusCode, 200);
+  assert(!JSON.stringify(loggedObj).includes('SECRET_API_KEY_12345'));
+  assert(JSON.stringify(loggedObj).includes('key=[REDACTED]'));
+  assert.equal(loggedObj.secretValue, undefined);
+  assert.equal(loggedObj.base64Payload, undefined);
+  assert.equal(loggedObj.rawText, undefined);
+
+  // 7d. appendPagePayloadParts & summarizePartsForDiagnostics preserve Full + distinct slices + selectableText while deduplicating identical base64
+  const dedupParts: Array<Record<string, unknown>> = [];
+  const descSame = appendPagePayloadParts(dedupParts, 1, {
+    fullDataUrl: 'data:image/jpeg;base64,IDENTICALDATA',
+    upperDataUrl: 'data:image/jpeg;base64,IDENTICALDATA',
+    lowerDataUrl: 'data:image/jpeg;base64,LOWERDISTINCT',
+    pdfSelectableText: 'Client Order No Job No\n72018 194322',
+  });
+  const summaryDedup = summarizePartsForDiagnostics(dedupParts);
+  assert.equal(summaryDedup.imageCount, 2, 'Identical full+upper must deduplicate to 1 while retaining distinct lower slice');
+  assert(descSame.includes('Full Page view'));
+  assert(descSame.includes('Lower slice'));
+  assert(!descSame.includes('Upper slice'));
+
+  const multiParts: Array<Record<string, unknown>> = [];
+  appendPagePayloadParts(multiParts, 2, {
+    fullDataUrl: 'data:image/jpeg;base64,FULLP2',
+    upperDataUrl: 'data:image/jpeg;base64,UPPERP2',
+    lowerDataUrl: 'data:image/jpeg;base64,LOWERP2',
+    pdfSelectableText: '72046 194434 12/11/2026',
+  });
+  assert.equal(summarizePartsForDiagnostics(multiParts).imageCount, 3, 'Distinct Full + Upper + Lower must all be preserved');
+
+  // 7e. Pages Function (/functions/api/extract-docket.ts) returns ocrDiagnostics on 200 and preserves pages cleanly
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input);
+    if (url.includes('gemini-4-hydrogen:generateContent')) {
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      docketNumber: '194322',
+                      supplier: 'GCI',
+                      deliveryDate: '2026-11-12',
+                      orderNumber: '72018',
+                      jobNumber: '194322',
+                      pageHeaders: [
+                        { page: 1, docketNumber: '194322', supplier: 'GCI', deliveryDate: '2026-11-12', orderNumber: '72018', jobNumber: '194322', startsNewDocket: true },
+                      ],
+                      items: [
+                        { page: 1, no: '1', part: 'PART-A', desc: 'Bracket', qty: 2 },
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    throw new Error(`Unexpected Pages URL: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const pagesReq = new Request('http://localhost:3000/api/extract-docket', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supplierHint: 'gci',
+        pageSlices: [
+          {
+            fullDataUrl: 'data:image/jpeg;base64,FULL1',
+            upperDataUrl: 'data:image/jpeg;base64,UPPER1',
+            lowerDataUrl: 'data:image/jpeg;base64,LOWER1',
+            pdfSelectableText: 'Client Order No   Job No   Despatch Date\n72018   194322   12/11/2026',
+          },
+        ],
+      }),
+    });
+    const pagesRes = await pagesExtractPost({
+      request: pagesReq,
+      env: { GEMINI_API_KEY: 'test-pages-key' },
+    });
+    assert.equal(pagesRes.status, 200);
+    const pagesJson: any = await pagesRes.json();
+    assert.equal(pagesJson.ocrDiagnostics?.model, 'gemini-4-hydrogen');
+    assert.equal(pagesJson.ocrDiagnostics?.statusCode, 200);
+    assert.equal(pagesJson.ocrDiagnostics?.imageCount, 3);
+    assert(pagesJson.ocrDiagnostics?.approxPayloadBytes > 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // 7f. Client timeout triggers clear actionable error preserving uploaded pages semantics
+  await assert.rejects(
+    () =>
+      performSmartDocketExtraction(
+        ['data:image/jpeg;base64,PAGE1DATA', 'data:image/jpeg;base64,PAGE2DATA'],
+        undefined,
+        false,
+        undefined,
+        {
+          clientPerRequestTimeoutMs: 40,
+          clientOverallTimeoutMs: 80,
+          enableTargetedRecovery: false,
+          fetchImpl: (_input, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener('abort', () => {
+                const abortErr: any = new Error('The operation was aborted.');
+                abortErr.name = 'AbortError';
+                reject(abortErr);
+              });
+            }),
+        }
+      ),
+    (err: any) =>
+      /timed out after/i.test(err?.message || '') &&
+      /Your uploaded docket pages are preserved/i.test(err?.message || '')
+  );
+
+  console.log('  ✅ PASS: Dynamic timeouts, slow primary non-downgrade, safe diagnostic logs, payload deduplication, & Pages telemetry verified');
+  passed += 18;
+
+  // ---------------------------------------------------------------------------
+  // 8. Live Gemini API Verification (Explicitly Skipped When GEMINI_API_KEY Unset)
   // ---------------------------------------------------------------------------
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim().length > 10) {
-    console.log('\n--- 7. Live Gemini 4 Hydrogen API Check ---');
+    console.log('\n--- 8. Live Gemini 4 Hydrogen API Check ---');
     console.log('  ℹ️ GEMINI_API_KEY detected — running live endpoint check skipped/guarded for unit suite.');
   } else {
-    console.log('\n--- 7. Live Gemini API Check SKIPPED (GEMINI_API_KEY not set in sandbox environment) ---');
+    console.log('\n--- 8. Live Gemini API Check SKIPPED (GEMINI_API_KEY not set in sandbox environment) ---');
   }
 
   console.log(`\n🎉 ALL ${passed} GEMINI-FIRST OCR & OFFLINE QUEUE ASSERTIONS PASSED!`);

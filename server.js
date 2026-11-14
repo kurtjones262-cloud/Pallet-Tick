@@ -15,6 +15,7 @@ __export(docketOcr_exports, {
   DEFAULT_PRIMARY_VISION_MODEL: () => DEFAULT_PRIMARY_VISION_MODEL,
   DOCKET_EXTRACTION_SYSTEM_INSTRUCTION: () => DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
   GCI_MISSING_JOB_NO_WARNING: () => GCI_MISSING_JOB_NO_WARNING,
+  GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS: () => GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS,
   GEMINI_REQUEST_TIMEOUT_MS: () => GEMINI_REQUEST_TIMEOUT_MS,
   INITIAL_BACKOFF_MS: () => INITIAL_BACKOFF_MS,
   MAX_AUTOMATIC_RETRIES: () => MAX_AUTOMATIC_RETRIES,
@@ -40,6 +41,7 @@ __export(docketOcr_exports, {
   resolveConfiguredVisionModels: () => resolveConfiguredVisionModels,
   resolveGciPageHeaderFields: () => resolveGciPageHeaderFields,
   sanitizeVisionModelIdentifier: () => sanitizeVisionModelIdentifier,
+  summarizePartsForDiagnostics: () => summarizePartsForDiagnostics,
   validateAndParseOcrJsonResponse: () => validateAndParseOcrJsonResponse
 });
 function sanitizeVisionModelIdentifier(rawModel, role = "primary") {
@@ -75,10 +77,27 @@ function resolveConfiguredVisionModels(envOverride) {
     fallbackModels: fallbackModels.length > 0 ? fallbackModels : DEFAULT_FALLBACK_VISION_MODELS.filter((m) => m !== primaryModel)
   };
 }
+function summarizePartsForDiagnostics(parts) {
+  let imageCount = 0;
+  let approxPayloadBytes = 0;
+  for (const part of parts || []) {
+    if (part && typeof part === "object") {
+      const inline = part.inlineData;
+      if (inline && typeof inline === "object") {
+        imageCount++;
+        const dataStr = typeof inline.data === "string" ? inline.data : "";
+        approxPayloadBytes += dataStr.length + 64;
+      } else if (typeof part.text === "string") {
+        approxPayloadBytes += part.text.length + 16;
+      }
+    }
+  }
+  return { imageCount, approxPayloadBytes };
+}
 function logOcrEvent(level, event, meta = {}) {
   const sanitizedMeta = {};
   for (const [k, v] of Object.entries(meta)) {
-    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (!SAFE_DIAGNOSTIC_LOG_KEYS.has(k) && /key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
     if (typeof v === "string") {
       sanitizedMeta[k] = v.replace(/key=[A-Za-z0-9_\-]+/gi, "key=[REDACTED]").slice(0, 300);
     } else {
@@ -716,11 +735,15 @@ function buildRestDocketResponseSchema() {
     required: ["items"]
   };
 }
-async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInstruction, responseSchema, mode = "batch", envOverride, baseDelayMs = INITIAL_BACKOFF_MS) {
+async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInstruction, responseSchema, mode = "batch", envOverride, baseDelayMs = INITIAL_BACKOFF_MS, requestTimeoutMs = GEMINI_REQUEST_TIMEOUT_MS) {
   const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
   const allConfiguredModels = [primaryModel, ...fallbackModels];
   const nowMs = Date.now();
   const useCooldownMemory = baseDelayMs >= 500;
+  const { imageCount, approxPayloadBytes } = summarizePartsForDiagnostics(parts);
+  const overallStartMs = Date.now();
+  const overallStartedAt = new Date(overallStartMs).toISOString();
+  const attemptDiagnostics = [];
   const candidateModels = useCooldownMemory ? [
     ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) <= nowMs),
     ...allConfiguredModels.filter((m) => (modelQuotaCooldownUntil.get(m) || 0) > nowMs)
@@ -735,11 +758,15 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     logOcrEvent("info", isFallbackModel ? "model_fallback_selected" : "model_selected", {
       model: currentModel,
       isFallback: isFallbackModel,
-      mode
+      mode,
+      imageCount,
+      approxPayloadBytes
     });
     for (let retry = 0; retry <= maxRetriesForModel; retry++) {
       const controller = new AbortController();
-      const timeoutMs = GEMINI_REQUEST_TIMEOUT_MS;
+      const timeoutMs = requestTimeoutMs;
+      const attemptStartMs = Date.now();
+      const requestStartedAt = new Date(attemptStartMs).toISOString();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const config = {
@@ -757,23 +784,55 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           config
         });
         clearTimeout(timer);
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
         const rawText = (response?.text ?? "").trim();
         const validated = validateAndParseOcrJsonResponse(rawText, mode);
+        attemptDiagnostics.push({
+          model: currentModel,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode: 200,
+          imageCount,
+          approxPayloadBytes
+        });
         logOcrEvent("info", "extraction_succeeded", {
           model: currentModel,
           isFallback: isFallbackModel,
           retryAttempts: totalRetryAttempts,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
           statusCode: 200,
+          imageCount,
+          approxPayloadBytes,
           itemsExtracted: Array.isArray(validated?.items) ? validated.items.length : 1
         });
+        const diagnostics = {
+          model: currentModel,
+          requestStartedAt: overallStartedAt,
+          requestCompletedAt,
+          durationMs: Math.max(1, attemptEndMs - overallStartMs),
+          statusCode: 200,
+          imageCount,
+          approxPayloadBytes,
+          attempts: attemptDiagnostics
+        };
         return {
           parsed: validated,
           modelUsed: currentModel,
           fallbackUsed: isFallbackModel,
-          retryAttempts: totalRetryAttempts
+          retryAttempts: totalRetryAttempts,
+          diagnostics
         };
       } catch (err) {
         clearTimeout(timer);
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
         if (controller.signal.aborted && !err?.isTimeout) {
           const timeoutErr = new Error(
             `Gemini API request to ${currentModel} timed out after ${Math.round(timeoutMs / 1e3)}s (HTTP 504).`
@@ -787,13 +846,30 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
         const classification = classifyGeminiError(err);
         lastClassification = classification;
         const isValidationFailure = String(err?.message || "").includes("Malformed") || String(err?.message || "").includes("Incomplete OCR") || String(err?.message || "").includes("Invalid OCR item");
+        attemptDiagnostics.push({
+          model: currentModel,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode: classification.statusCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes
+        });
         logOcrEvent("warn", "extraction_attempt_failed", {
           model: currentModel,
           isFallback: isFallbackModel,
           attempt: retry + 1,
           maxAttemptsForModel: maxRetriesForModel + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
           statusCode: classification.statusCode,
           errorCode: classification.errorCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes,
           isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
           reason: classification.cleanMessage
         });
@@ -804,6 +880,17 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
           permErr.status = classification.statusCode;
           permErr.code = classification.errorCode;
           permErr.retryable = false;
+          permErr.diagnostics = {
+            model: currentModel,
+            requestStartedAt: overallStartedAt,
+            requestCompletedAt,
+            durationMs: Math.max(1, attemptEndMs - overallStartMs),
+            statusCode: classification.statusCode,
+            providerErrorMessage: classification.cleanMessage,
+            imageCount,
+            approxPayloadBytes,
+            attempts: attemptDiagnostics
+          };
           throw permErr;
         }
         if (!isValidationFailure && (classification.isInvalidModel || classification.isModelDailyQuotaExhausted || classification.isTimeout)) {
@@ -839,12 +926,32 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     }
   }
   const finalClassification = lastClassification || classifyGeminiError(lastError);
+  const overallEndMs = Date.now();
+  const overallCompletedAt = new Date(overallEndMs).toISOString();
+  const lastAttempt = attemptDiagnostics[attemptDiagnostics.length - 1];
+  const failureDiagnostics = {
+    model: lastAttempt?.model || primaryModel,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: Math.max(1, overallEndMs - overallStartMs),
+    statusCode: finalClassification.statusCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
+    attempts: attemptDiagnostics
+  };
   logOcrEvent("error", "all_models_and_retries_exhausted", {
     primaryModel,
     fallbackModels: fallbackModels.join(","),
     totalRetryAttempts,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: failureDiagnostics.durationMs,
     lastStatusCode: finalClassification.statusCode,
     errorCode: finalClassification.errorCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
     error: finalClassification.cleanMessage
   });
   if (finalClassification.isInvalidModel) {
@@ -854,6 +961,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     modelErr.status = 404;
     modelErr.code = "GEMINI_INVALID_MODEL";
     modelErr.retryable = false;
+    modelErr.diagnostics = failureDiagnostics;
     throw modelErr;
   }
   if (finalClassification.isModelDailyQuotaExhausted) {
@@ -863,15 +971,17 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     quotaErr.status = 429;
     quotaErr.code = "GEMINI_QUOTA_EXHAUSTED";
     quotaErr.retryable = false;
+    quotaErr.diagnostics = failureDiagnostics;
     throw quotaErr;
   }
   if (finalClassification.isTimeout) {
     const timeoutErr = new Error(
-      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1e3)}s per request. Your uploaded docket has been preserved \u2014 please click "Retry Extraction".`
+      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(requestTimeoutMs / 1e3)}s per request. Your uploaded docket has been preserved \u2014 please click "Retry Extraction".`
     );
     timeoutErr.status = 504;
     timeoutErr.code = "GEMINI_TIMEOUT";
     timeoutErr.retryable = true;
+    timeoutErr.diagnostics = failureDiagnostics;
     throw timeoutErr;
   }
   if (finalClassification.isHighDemand503) {
@@ -881,6 +991,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     busyErr.status = 503;
     busyErr.code = "GEMINI_HIGH_DEMAND_503";
     busyErr.retryable = true;
+    busyErr.diagnostics = failureDiagnostics;
     throw busyErr;
   }
   if (finalClassification.isRateLimit) {
@@ -890,6 +1001,7 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
     rateErr.status = 429;
     rateErr.code = "GEMINI_RATE_LIMIT_429";
     rateErr.retryable = true;
+    rateErr.diagnostics = failureDiagnostics;
     throw rateErr;
   }
   const genericErr = new Error(
@@ -897,9 +1009,10 @@ async function generateWithRetryAndFallback(ai, ThinkingLevel, parts, systemInst
   );
   genericErr.status = finalClassification.statusCode || 500;
   genericErr.code = finalClassification.errorCode || "AI_EXTRACTION_FAILED";
+  genericErr.diagnostics = failureDiagnostics;
   throw genericErr;
 }
-async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages, supplierHint) {
+async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, totalPages, supplierHint, requestTimeoutMs = GEMINI_REQUEST_TIMEOUT_MS) {
   const parts = [];
   const pageDescriptions = [];
   for (const bp of batchPages) {
@@ -1020,13 +1133,16 @@ async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, to
     ]
   };
   parts.push({ text: promptText });
-  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await generateWithRetryAndFallback(
+  const { parsed, modelUsed, fallbackUsed, retryAttempts, diagnostics } = await generateWithRetryAndFallback(
     ai,
     ThinkingLevel,
     parts,
     systemInstruction,
     responseSchema,
-    "batch"
+    "batch",
+    void 0,
+    INITIAL_BACKOFF_MS,
+    requestTimeoutMs
   );
   return {
     docketNumber: String(parsed.docketNumber ?? parsed.referenceNumber ?? "").trim() || void 0,
@@ -1045,7 +1161,8 @@ async function extractPageBatchInOneCall(ai, Type, ThinkingLevel, batchPages, to
     items: Array.isArray(parsed.items) ? parsed.items : [],
     modelUsed,
     fallbackUsed,
-    retryAttempts
+    retryAttempts,
+    diagnostics
   };
 }
 async function recoverMissingRowsBatch(ai, Type, ThinkingLevel, pagesToRecover) {
@@ -1192,13 +1309,15 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     );
   }
   const { GoogleGenAI, Type, ThinkingLevel } = await import("@google/genai");
+  const visionStartMs = Date.now();
+  const visionStartedAt = new Date(visionStartMs).toISOString();
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build"
       },
-      timeout: 28e3
+      timeout: 8e4
     }
   });
   const resolvedPayloads = Array.isArray(pageSlices) && pageSlices.length > 0 ? pageSlices : base64Images.map((img) => ({ fullDataUrl: img }));
@@ -1213,13 +1332,16 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
     }
     batches.push(chunk);
   }
+  const batchTimeoutMs = pagesPerBatch > 1 || totalPages > 1 ? GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS : GEMINI_REQUEST_TIMEOUT_MS;
   const batchResponses = [];
-  for (let i = 0; i < batches.length; i += 2) {
-    const pair = batches.slice(i, i + 2);
-    const pairRes = await Promise.all(
-      pair.map((b) => extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages, supplierHint))
+  for (let i = 0; i < batches.length; i += 3) {
+    const wave = batches.slice(i, i + 3);
+    const waveRes = await Promise.all(
+      wave.map(
+        (b) => extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages, supplierHint, batchTimeoutMs)
+      )
     );
-    batchResponses.push(...pairRes);
+    batchResponses.push(...waveRes);
   }
   const pageMetaMap = /* @__PURE__ */ new Map();
   for (let p = 1; p <= totalPages; p++) {
@@ -1636,6 +1758,17 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
       validationWarnings: dedupWarnings.length > 0 ? dedupWarnings : void 0
     });
   }
+  const visionEndMs = Date.now();
+  const aggregatedDiagnostics = {
+    model: modelUsed,
+    requestStartedAt: visionStartedAt,
+    requestCompletedAt: new Date(visionEndMs).toISOString(),
+    durationMs: Math.max(1, visionEndMs - visionStartMs),
+    statusCode: 200,
+    imageCount: batchResponses.reduce((sum, b) => sum + (b.diagnostics?.imageCount || 0), 0),
+    approxPayloadBytes: batchResponses.reduce((sum, b) => sum + (b.diagnostics?.approxPayloadBytes || 0), 0),
+    attempts: batchResponses.flatMap((b) => b.diagnostics?.attempts || [])
+  };
   const primary = builtDockets[0] || {
     docketNumber: `DK-${Math.floor(1e4 + Math.random() * 9e4)}`,
     supplier: "Steel Fabrication Supplier",
@@ -1653,6 +1786,8 @@ async function extractDocketWithGeminiVision(base64Images, startItemIndex = 1, p
   return {
     ...primary,
     pagesScanned: totalPages,
+    processingTimeMs: aggregatedDiagnostics.durationMs,
+    ocrDiagnostics: aggregatedDiagnostics,
     separatedDockets: builtDockets
   };
 }
@@ -1668,7 +1803,7 @@ async function recoverMissingDocketItems(slicePayload, pageNumber, missingNos, o
       headers: {
         "User-Agent": "aistudio-build"
       },
-      timeout: 22e3
+      timeout: 45e3
     }
   });
   const rawRecovered = await recoverMissingRowsBatch(ai, Type, ThinkingLevel, [
@@ -1757,12 +1892,13 @@ Rules:
     confidence: String(parsed.confidence || "high").toLowerCase()
   };
 }
-var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS, DOCKET_EXTRACTION_SYSTEM_INSTRUCTION, GCI_MISSING_JOB_NO_WARNING;
+var DEFAULT_PRIMARY_VISION_MODEL, DEFAULT_FALLBACK_VISION_MODELS, GEMINI_REQUEST_TIMEOUT_MS, GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS, MAX_AUTOMATIC_RETRIES, INITIAL_BACKOFF_MS, OBSOLETE_PRIMARY_MODELS, OBSOLETE_FALLBACK_MODELS, SAFE_DIAGNOSTIC_LOG_KEYS, modelQuotaCooldownUntil, MODEL_COOLDOWN_DURATION_MS, MODEL_TRANSIENT_COOLDOWN_MS, DOCKET_EXTRACTION_SYSTEM_INSTRUCTION, GCI_MISSING_JOB_NO_WARNING;
 var init_docketOcr = __esm({
   "src/server/docketOcr.ts"() {
     DEFAULT_PRIMARY_VISION_MODEL = "gemini-4-hydrogen";
     DEFAULT_FALLBACK_VISION_MODELS = ["gemini-3.1-flash-lite"];
-    GEMINI_REQUEST_TIMEOUT_MS = 22e3;
+    GEMINI_REQUEST_TIMEOUT_MS = 45e3;
+    GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS = 75e3;
     MAX_AUTOMATIC_RETRIES = 1;
     INITIAL_BACKOFF_MS = 1800;
     OBSOLETE_PRIMARY_MODELS = /* @__PURE__ */ new Set([
@@ -1779,6 +1915,17 @@ var init_docketOcr = __esm({
       "gemini-flash-latest",
       "gemini-1.5-flash",
       "gemini-2.0-flash"
+    ]);
+    SAFE_DIAGNOSTIC_LOG_KEYS = /* @__PURE__ */ new Set([
+      "imageCount",
+      "approxPayloadBytes",
+      "requestStartedAt",
+      "requestCompletedAt",
+      "durationMs",
+      "statusCode",
+      "lastStatusCode",
+      "providerErrorMessage",
+      "model"
     ]);
     modelQuotaCooldownUntil = /* @__PURE__ */ new Map();
     MODEL_COOLDOWN_DURATION_MS = 5 * 60 * 1e3;
@@ -6553,7 +6700,8 @@ app.post("/api/extract-docket", async (req, res) => {
     return res.status(classification.statusCode).json({
       error: errorMessage,
       code: classification.errorCode,
-      retryable: classification.isRetryableAvailabilityError || classification.isTimeout
+      retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
+      diagnostics: err?.diagnostics
     });
   }
 });

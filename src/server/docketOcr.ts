@@ -88,12 +88,38 @@ export interface ExtractedDocketResult {
   separatedDockets?: ExtractedDocketResult[];
   ocrConfidence?: number;
   parserConfidence?: number;
+  ocrDiagnostics?: OcrDiagnosticsSummary;
+}
+
+export interface OcrAttemptDiagnostics {
+  model: string;
+  attempt: number;
+  requestStartedAt: string;
+  requestCompletedAt: string;
+  durationMs: number;
+  statusCode: number;
+  providerErrorMessage?: string;
+  imageCount: number;
+  approxPayloadBytes: number;
+}
+
+export interface OcrDiagnosticsSummary {
+  model: string;
+  requestStartedAt: string;
+  requestCompletedAt: string;
+  durationMs: number;
+  statusCode: number;
+  providerErrorMessage?: string;
+  imageCount: number;
+  approxPayloadBytes: number;
+  attempts?: OcrAttemptDiagnostics[];
 }
 
 export const DEFAULT_PRIMARY_VISION_MODEL = 'gemini-4-hydrogen';
 export const DEFAULT_FALLBACK_VISION_MODELS = ['gemini-3.1-flash-lite'] as const;
 
-export const GEMINI_REQUEST_TIMEOUT_MS = 22000;
+export const GEMINI_REQUEST_TIMEOUT_MS = 45000;
+export const GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS = 75000;
 export const MAX_AUTOMATIC_RETRIES = 1;
 export const INITIAL_BACKOFF_MS = 1800;
 
@@ -174,6 +200,43 @@ export function resolveConfiguredVisionModels(envOverride?: Record<string, unkno
   };
 }
 
+const SAFE_DIAGNOSTIC_LOG_KEYS = new Set([
+  'imageCount',
+  'approxPayloadBytes',
+  'requestStartedAt',
+  'requestCompletedAt',
+  'durationMs',
+  'statusCode',
+  'lastStatusCode',
+  'providerErrorMessage',
+  'model',
+]);
+
+/**
+ * Safely computes image count and approximate wire payload size from Gemini request parts
+ * without exposing document contents or base64 data.
+ */
+export function summarizePartsForDiagnostics(parts: Array<Record<string, unknown>>): {
+  imageCount: number;
+  approxPayloadBytes: number;
+} {
+  let imageCount = 0;
+  let approxPayloadBytes = 0;
+  for (const part of parts || []) {
+    if (part && typeof part === 'object') {
+      const inline = (part as any).inlineData;
+      if (inline && typeof inline === 'object') {
+        imageCount++;
+        const dataStr = typeof inline.data === 'string' ? inline.data : '';
+        approxPayloadBytes += dataStr.length + 64;
+      } else if (typeof (part as any).text === 'string') {
+        approxPayloadBytes += (part as any).text.length + 16;
+      }
+    }
+  }
+  return { imageCount, approxPayloadBytes };
+}
+
 /**
  * Safe structured logger for OCR model selection, retries, status codes, and failures.
  * Strictly strips any potential API key query strings and never logs document/image contents.
@@ -185,7 +248,7 @@ export function logOcrEvent(
 ): void {
   const sanitizedMeta: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(meta)) {
-    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (!SAFE_DIAGNOSTIC_LOG_KEYS.has(k) && /key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
     if (typeof v === 'string') {
       sanitizedMeta[k] = v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300);
     } else {
@@ -354,7 +417,7 @@ export function classifyGeminiError(err: any): {
   }
 
   // Only retry transient 503/502/500 or transient per-minute 429 rate-limits.
-  // Never retry 404 invalid model, 401/403 auth, 400 bad request, daily quota exhaustion, or 22s request timeouts.
+  // Never retry 404 invalid model, 401/403 auth, 400 bad request, daily quota exhaustion, or request timeouts.
   const isRetryableAvailabilityError =
     !isAuthError &&
     !isInvalidModel &&
@@ -527,6 +590,7 @@ export interface BatchExtractionResponse {
   modelUsed: string;
   fallbackUsed: boolean;
   retryAttempts: number;
+  diagnostics?: OcrDiagnosticsSummary;
 }
 
 export const DOCKET_EXTRACTION_SYSTEM_INSTRUCTION = `You are a 100%-recall industrial delivery docket, tax invoice, and steel/laser-cutting manifest extraction engine.
@@ -1203,12 +1267,13 @@ export function buildRestDocketResponseSchema(): Record<string, unknown> {
 
 /**
  * Executes a Gemini generateContent call with:
- * 1. Per-request 22s AbortController timeout
+ * 1. Per-request 45s AbortController timeout (configurable via requestTimeoutMs)
  * 2. At most 1 automatic retry for transient HTTP 503/502 or rate-limit errors
  * 3. Immediate fast failover on 404 invalid model, daily quota exhaustion, or timeout
  * 4. Immediate abort on 401/403 authentication or 400 malformed request errors
  * 5. Cooldown tracking for unavailable or quota-exhausted models
  * 6. Strict validation of extracted JSON data before accepting results
+ * 7. Safe operational diagnostics (model, start/completion timestamps, durationMs, statusCode, imageCount, approxPayloadBytes)
  */
 export async function generateWithRetryAndFallback(
   ai: any,
@@ -1218,17 +1283,23 @@ export async function generateWithRetryAndFallback(
   responseSchema: any,
   mode: 'batch' | 'recovery' | 'label' = 'batch',
   envOverride?: Record<string, unknown>,
-  baseDelayMs: number = INITIAL_BACKOFF_MS
+  baseDelayMs: number = INITIAL_BACKOFF_MS,
+  requestTimeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS
 ): Promise<{
   parsed: any;
   modelUsed: string;
   fallbackUsed: boolean;
   retryAttempts: number;
+  diagnostics: OcrDiagnosticsSummary;
 }> {
   const { primaryModel, fallbackModels } = resolveConfiguredVisionModels(envOverride);
   const allConfiguredModels = [primaryModel, ...fallbackModels];
   const nowMs = Date.now();
   const useCooldownMemory = baseDelayMs >= 500;
+  const { imageCount, approxPayloadBytes } = summarizePartsForDiagnostics(parts);
+  const overallStartMs = Date.now();
+  const overallStartedAt = new Date(overallStartMs).toISOString();
+  const attemptDiagnostics: OcrAttemptDiagnostics[] = [];
 
   // Place models not in cooldown first so subsequent calls don't re-hit an exhausted/unavailable model
   const candidateModels = useCooldownMemory
@@ -1251,11 +1322,15 @@ export async function generateWithRetryAndFallback(
       model: currentModel,
       isFallback: isFallbackModel,
       mode,
+      imageCount,
+      approxPayloadBytes,
     });
 
     for (let retry = 0; retry <= maxRetriesForModel; retry++) {
       const controller = new AbortController();
-      const timeoutMs = GEMINI_REQUEST_TIMEOUT_MS;
+      const timeoutMs = requestTimeoutMs;
+      const attemptStartMs = Date.now();
+      const requestStartedAt = new Date(attemptStartMs).toISOString();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
@@ -1278,25 +1353,61 @@ export async function generateWithRetryAndFallback(
         });
         clearTimeout(timer);
 
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
+
         const rawText = (response?.text ?? '').trim();
         const validated = validateAndParseOcrJsonResponse(rawText, mode);
+
+        attemptDiagnostics.push({
+          model: currentModel,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode: 200,
+          imageCount,
+          approxPayloadBytes,
+        });
 
         logOcrEvent('info', 'extraction_succeeded', {
           model: currentModel,
           isFallback: isFallbackModel,
           retryAttempts: totalRetryAttempts,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
           statusCode: 200,
+          imageCount,
+          approxPayloadBytes,
           itemsExtracted: Array.isArray(validated?.items) ? validated.items.length : 1,
         });
+
+        const diagnostics: OcrDiagnosticsSummary = {
+          model: currentModel,
+          requestStartedAt: overallStartedAt,
+          requestCompletedAt,
+          durationMs: Math.max(1, attemptEndMs - overallStartMs),
+          statusCode: 200,
+          imageCount,
+          approxPayloadBytes,
+          attempts: attemptDiagnostics,
+        };
 
         return {
           parsed: validated,
           modelUsed: currentModel,
           fallbackUsed: isFallbackModel,
           retryAttempts: totalRetryAttempts,
+          diagnostics,
         };
       } catch (err: any) {
         clearTimeout(timer);
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
+
         if (controller.signal.aborted && !err?.isTimeout) {
           const timeoutErr: any = new Error(
             `Gemini API request to ${currentModel} timed out after ${Math.round(timeoutMs / 1000)}s (HTTP 504).`
@@ -1316,13 +1427,31 @@ export async function generateWithRetryAndFallback(
           String(err?.message || '').includes('Incomplete OCR') ||
           String(err?.message || '').includes('Invalid OCR item');
 
+        attemptDiagnostics.push({
+          model: currentModel,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode: classification.statusCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes,
+        });
+
         logOcrEvent('warn', 'extraction_attempt_failed', {
           model: currentModel,
           isFallback: isFallbackModel,
           attempt: retry + 1,
           maxAttemptsForModel: maxRetriesForModel + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
           statusCode: classification.statusCode,
           errorCode: classification.errorCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes,
           isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
           reason: classification.cleanMessage,
         });
@@ -1340,10 +1469,21 @@ export async function generateWithRetryAndFallback(
           permErr.status = classification.statusCode;
           permErr.code = classification.errorCode;
           permErr.retryable = false;
+          permErr.diagnostics = {
+            model: currentModel,
+            requestStartedAt: overallStartedAt,
+            requestCompletedAt,
+            durationMs: Math.max(1, attemptEndMs - overallStartMs),
+            statusCode: classification.statusCode,
+            providerErrorMessage: classification.cleanMessage,
+            imageCount,
+            approxPayloadBytes,
+            attempts: attemptDiagnostics,
+          } satisfies OcrDiagnosticsSummary;
           throw permErr;
         }
 
-        // Do not retry 404 invalid model, daily quota exhaustion, or 22s request timeout on the same model:
+        // Do not retry 404 invalid model, daily quota exhaustion, or request timeout on the same model:
         // record cooldown and immediately advance to the next fallback model if available.
         if (
           !isValidationFailure &&
@@ -1392,13 +1532,33 @@ export async function generateWithRetryAndFallback(
   }
 
   const finalClassification = lastClassification || classifyGeminiError(lastError);
+  const overallEndMs = Date.now();
+  const overallCompletedAt = new Date(overallEndMs).toISOString();
+  const lastAttempt = attemptDiagnostics[attemptDiagnostics.length - 1];
+  const failureDiagnostics: OcrDiagnosticsSummary = {
+    model: lastAttempt?.model || primaryModel,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: Math.max(1, overallEndMs - overallStartMs),
+    statusCode: finalClassification.statusCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
+    attempts: attemptDiagnostics,
+  };
 
   logOcrEvent('error', 'all_models_and_retries_exhausted', {
     primaryModel,
     fallbackModels: fallbackModels.join(','),
     totalRetryAttempts,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: failureDiagnostics.durationMs,
     lastStatusCode: finalClassification.statusCode,
     errorCode: finalClassification.errorCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
     error: finalClassification.cleanMessage,
   });
 
@@ -1409,6 +1569,7 @@ export async function generateWithRetryAndFallback(
     modelErr.status = 404;
     modelErr.code = 'GEMINI_INVALID_MODEL';
     modelErr.retryable = false;
+    modelErr.diagnostics = failureDiagnostics;
     throw modelErr;
   }
 
@@ -1419,16 +1580,18 @@ export async function generateWithRetryAndFallback(
     quotaErr.status = 429;
     quotaErr.code = 'GEMINI_QUOTA_EXHAUSTED';
     quotaErr.retryable = false;
+    quotaErr.diagnostics = failureDiagnostics;
     throw quotaErr;
   }
 
   if (finalClassification.isTimeout) {
     const timeoutErr: any = new Error(
-      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s per request. Your uploaded docket has been preserved — please click "Retry Extraction".`
+      `Gemini AI extraction timed out (HTTP 504) after ${Math.round(requestTimeoutMs / 1000)}s per request. Your uploaded docket has been preserved — please click "Retry Extraction".`
     );
     timeoutErr.status = 504;
     timeoutErr.code = 'GEMINI_TIMEOUT';
     timeoutErr.retryable = true;
+    timeoutErr.diagnostics = failureDiagnostics;
     throw timeoutErr;
   }
 
@@ -1439,6 +1602,7 @@ export async function generateWithRetryAndFallback(
     busyErr.status = 503;
     busyErr.code = 'GEMINI_HIGH_DEMAND_503';
     busyErr.retryable = true;
+    busyErr.diagnostics = failureDiagnostics;
     throw busyErr;
   }
 
@@ -1449,6 +1613,7 @@ export async function generateWithRetryAndFallback(
     rateErr.status = 429;
     rateErr.code = 'GEMINI_RATE_LIMIT_429';
     rateErr.retryable = true;
+    rateErr.diagnostics = failureDiagnostics;
     throw rateErr;
   }
 
@@ -1458,6 +1623,7 @@ export async function generateWithRetryAndFallback(
   );
   genericErr.status = finalClassification.statusCode || 500;
   genericErr.code = finalClassification.errorCode || 'AI_EXTRACTION_FAILED';
+  genericErr.diagnostics = failureDiagnostics;
   throw genericErr;
 }
 
@@ -1471,7 +1637,8 @@ async function extractPageBatchInOneCall(
   ThinkingLevel: any,
   batchPages: Array<{ pageNumber: number; payload: PageSlicePayload }>,
   totalPages: number,
-  supplierHint?: string
+  supplierHint?: string,
+  requestTimeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS
 ): Promise<BatchExtractionResponse> {
   const parts: any[] = [];
   const pageDescriptions: string[] = [];
@@ -1599,14 +1766,18 @@ async function extractPageBatchInOneCall(
 
   parts.push({ text: promptText });
 
-  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await generateWithRetryAndFallback(
-    ai,
-    ThinkingLevel,
-    parts,
-    systemInstruction,
-    responseSchema,
-    'batch'
-  );
+  const { parsed, modelUsed, fallbackUsed, retryAttempts, diagnostics } =
+    await generateWithRetryAndFallback(
+      ai,
+      ThinkingLevel,
+      parts,
+      systemInstruction,
+      responseSchema,
+      'batch',
+      undefined,
+      INITIAL_BACKOFF_MS,
+      requestTimeoutMs
+    );
 
   return {
     docketNumber: String(parsed.docketNumber ?? parsed.referenceNumber ?? '').trim() || undefined,
@@ -1629,6 +1800,7 @@ async function extractPageBatchInOneCall(
     modelUsed,
     fallbackUsed,
     retryAttempts,
+    diagnostics,
   };
 }
 
@@ -1833,13 +2005,16 @@ export async function extractDocketWithGeminiVision(
 
   const { GoogleGenAI, Type, ThinkingLevel } = await import('@google/genai');
 
+  const visionStartMs = Date.now();
+  const visionStartedAt = new Date(visionStartMs).toISOString();
+
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
-      timeout: 28000,
+      timeout: 80000,
     },
   });
 
@@ -1861,13 +2036,20 @@ export async function extractDocketWithGeminiVision(
     batches.push(chunk);
   }
 
+  const batchTimeoutMs =
+    pagesPerBatch > 1 || totalPages > 1
+      ? GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS
+      : GEMINI_REQUEST_TIMEOUT_MS;
+
   const batchResponses: BatchExtractionResponse[] = [];
-  for (let i = 0; i < batches.length; i += 2) {
-    const pair = batches.slice(i, i + 2);
-    const pairRes = await Promise.all(
-      pair.map((b) => extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages, supplierHint))
+  for (let i = 0; i < batches.length; i += 3) {
+    const wave = batches.slice(i, i + 3);
+    const waveRes = await Promise.all(
+      wave.map((b) =>
+        extractPageBatchInOneCall(ai, Type, ThinkingLevel, b, totalPages, supplierHint, batchTimeoutMs)
+      )
     );
-    batchResponses.push(...pairRes);
+    batchResponses.push(...waveRes);
   }
 
   // Segment pages into independent dockets using pageHeaders and row-numbering continuity
@@ -2390,6 +2572,18 @@ export async function extractDocketWithGeminiVision(
     });
   }
 
+  const visionEndMs = Date.now();
+  const aggregatedDiagnostics: OcrDiagnosticsSummary = {
+    model: modelUsed,
+    requestStartedAt: visionStartedAt,
+    requestCompletedAt: new Date(visionEndMs).toISOString(),
+    durationMs: Math.max(1, visionEndMs - visionStartMs),
+    statusCode: 200,
+    imageCount: batchResponses.reduce((sum, b) => sum + (b.diagnostics?.imageCount || 0), 0),
+    approxPayloadBytes: batchResponses.reduce((sum, b) => sum + (b.diagnostics?.approxPayloadBytes || 0), 0),
+    attempts: batchResponses.flatMap((b) => b.diagnostics?.attempts || []),
+  };
+
   const primary = builtDockets[0] || {
     docketNumber: `DK-${Math.floor(10000 + Math.random() * 90000)}`,
     supplier: 'Steel Fabrication Supplier',
@@ -2408,6 +2602,8 @@ export async function extractDocketWithGeminiVision(
   return {
     ...primary,
     pagesScanned: totalPages,
+    processingTimeMs: aggregatedDiagnostics.durationMs,
+    ocrDiagnostics: aggregatedDiagnostics,
     separatedDockets: builtDockets,
   };
 }
@@ -2434,7 +2630,7 @@ export async function recoverMissingDocketItems(
       headers: {
         'User-Agent': 'aistudio-build',
       },
-      timeout: 22000,
+      timeout: 45000,
     },
   });
 

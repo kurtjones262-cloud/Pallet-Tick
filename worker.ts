@@ -24,6 +24,7 @@ import {
   DEFAULT_PRIMARY_VISION_MODEL,
   DEFAULT_FALLBACK_VISION_MODELS,
   GEMINI_REQUEST_TIMEOUT_MS,
+  GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS,
   MAX_AUTOMATIC_RETRIES,
   INITIAL_BACKOFF_MS,
   DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
@@ -39,6 +40,9 @@ import {
   normalizeGciDispatchDate,
   resolveGciPageHeaderFields,
   appendPagePayloadParts,
+  summarizePartsForDiagnostics,
+  OcrAttemptDiagnostics,
+  OcrDiagnosticsSummary,
 } from './src/server/docketOcr.ts';
 
 export interface Env {
@@ -70,10 +74,21 @@ function computeExponentialBackoffWithJitter(retryAttempt: number, baseMs: numbe
   return Math.min(8000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 450));
 }
 
+const SAFE_WORKER_LOG_KEYS = new Set([
+  'imageCount',
+  'approxPayloadBytes',
+  'requestStartedAt',
+  'requestCompletedAt',
+  'durationMs',
+  'statusCode',
+  'providerErrorMessage',
+  'model',
+]);
+
 function logWorkerOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta: Record<string, unknown> = {}) {
   const safe: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(meta)) {
-    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (!SAFE_WORKER_LOG_KEYS.has(k) && /key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
     safe[k] = typeof v === 'string' ? v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300) : v;
   }
   const msg = JSON.stringify({ timestamp: new Date().toISOString(), component: 'PartTrack-Worker-OCR', event, ...safe });
@@ -120,7 +135,7 @@ async function callGeminiRestSingleAttempt(
   parts: Array<Record<string, unknown>>,
   responseSchema: Record<string, unknown>,
   timeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS
-): Promise<string> {
+): Promise<{ text: string; statusCode: number }> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const generationConfig: Record<string, unknown> = {
@@ -180,9 +195,11 @@ async function callGeminiRestSingleAttempt(
   const result: any = await response.json();
   const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
-    throw new Error('Malformed OCR response: Empty response received from Gemini AI model.');
+    const emptyErr: any = new Error('Malformed OCR response: Empty response received from Gemini AI model.');
+    emptyErr.status = response.status || 502;
+    throw emptyErr;
   }
-  return text;
+  return { text, statusCode: response.status || 200 };
 }
 
 async function callGeminiRestWithRetryAndFallback(
@@ -191,11 +208,23 @@ async function callGeminiRestWithRetryAndFallback(
   systemInstruction: string,
   parts: Array<Record<string, unknown>>,
   responseSchema: Record<string, unknown>,
-  mode: 'batch' | 'recovery' | 'label' = 'batch'
-): Promise<{ parsed: any; modelUsed: string; fallbackUsed: boolean; retryAttempts: number }> {
+  mode: 'batch' | 'recovery' | 'label' = 'batch',
+  timeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS,
+  maxTotalBudgetMs: number = timeoutMs > GEMINI_REQUEST_TIMEOUT_MS ? 85000 : 80000
+): Promise<{
+  parsed: any;
+  modelUsed: string;
+  fallbackUsed: boolean;
+  retryAttempts: number;
+  diagnostics: OcrDiagnosticsSummary;
+}> {
   const { primaryModel, fallbackModels } = resolveWorkerModels(env);
   const allConfiguredModels = [primaryModel, ...fallbackModels];
   const nowMs = Date.now();
+  const { imageCount, approxPayloadBytes } = summarizePartsForDiagnostics(parts);
+  const overallStartMs = Date.now();
+  const overallStartedAt = new Date(overallStartMs).toISOString();
+  const attemptDiagnostics: OcrAttemptDiagnostics[] = [];
 
   const candidateModels = [
     ...allConfiguredModels.filter((m) => (workerModelCooldownUntil.get(m) || 0) <= nowMs),
@@ -211,37 +240,87 @@ async function callGeminiRestWithRetryAndFallback(
     const isFallback = model !== primaryModel;
     const maxRetries = MAX_AUTOMATIC_RETRIES;
 
+    const remainingBeforeModelMs = maxTotalBudgetMs - (Date.now() - overallStartMs);
+    if (remainingBeforeModelMs < 4000) {
+      break;
+    }
+
     logWorkerOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
       model,
       isFallback,
       mode,
+      imageCount,
+      approxPayloadBytes,
     });
 
     for (let retry = 0; retry <= maxRetries; retry++) {
+      const remainingBudgetMs = maxTotalBudgetMs - (Date.now() - overallStartMs);
+      if (remainingBudgetMs < 4000) {
+        break;
+      }
+      const attemptTimeoutMs = Math.min(timeoutMs, remainingBudgetMs);
+      const attemptStartMs = Date.now();
+      const requestStartedAt = new Date(attemptStartMs).toISOString();
       try {
-        const rawJsonText = await callGeminiRestSingleAttempt(
+        const { text: rawJsonText, statusCode } = await callGeminiRestSingleAttempt(
           apiKey,
           model,
           systemInstruction,
           parts,
           responseSchema,
-          GEMINI_REQUEST_TIMEOUT_MS
+          attemptTimeoutMs
         );
         const parsed = validateAndParseOcrJsonResponse(rawJsonText, mode);
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
+
+        attemptDiagnostics.push({
+          model,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode,
+          imageCount,
+          approxPayloadBytes,
+        });
+
         logWorkerOcrEvent('info', 'extraction_succeeded', {
           model,
           isFallback,
           retryAttempts: totalRetryAttempts,
-          statusCode: 200,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode,
+          imageCount,
+          approxPayloadBytes,
           itemsExtracted: Array.isArray(parsed?.items) ? parsed.items.length : 1,
         });
+
+        const diagnostics: OcrDiagnosticsSummary = {
+          model,
+          requestStartedAt: overallStartedAt,
+          requestCompletedAt,
+          durationMs: Math.max(1, attemptEndMs - overallStartMs),
+          statusCode,
+          imageCount,
+          approxPayloadBytes,
+          attempts: attemptDiagnostics,
+        };
+
         return {
           parsed,
           modelUsed: model,
           fallbackUsed: isFallback,
           retryAttempts: totalRetryAttempts,
+          diagnostics,
         };
       } catch (err: any) {
+        const attemptEndMs = Date.now();
+        const requestCompletedAt = new Date(attemptEndMs).toISOString();
+        const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
         lastError = err;
         const classification = classifyGeminiError(err);
         lastClassification = classification;
@@ -249,13 +328,31 @@ async function callGeminiRestWithRetryAndFallback(
         const isValidationFailure =
           /Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
 
+        attemptDiagnostics.push({
+          model,
+          attempt: retry + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
+          statusCode: classification.statusCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes,
+        });
+
         logWorkerOcrEvent('warn', 'extraction_attempt_failed', {
           model,
           isFallback,
           attempt: retry + 1,
           maxAttempts: maxRetries + 1,
+          requestStartedAt,
+          requestCompletedAt,
+          durationMs,
           statusCode: classification.statusCode,
           errorCode: classification.errorCode,
+          providerErrorMessage: classification.cleanMessage,
+          imageCount,
+          approxPayloadBytes,
           isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
           reason: classification.cleanMessage,
         });
@@ -266,10 +363,21 @@ async function callGeminiRestWithRetryAndFallback(
           permErr.status = classification.statusCode;
           permErr.code = classification.errorCode;
           permErr.retryable = false;
+          permErr.diagnostics = {
+            model,
+            requestStartedAt: overallStartedAt,
+            requestCompletedAt,
+            durationMs: Math.max(1, attemptEndMs - overallStartMs),
+            statusCode: classification.statusCode,
+            providerErrorMessage: classification.cleanMessage,
+            imageCount,
+            approxPayloadBytes,
+            attempts: attemptDiagnostics,
+          } satisfies OcrDiagnosticsSummary;
           throw permErr;
         }
 
-        // Never retry 404 invalid model, daily quota exhaustion, or 22s timeout on the same model:
+        // Never retry 404 invalid model, daily quota exhaustion, or request timeout on the same model:
         // record cooldown and immediately fail over to the next model.
         if (
           !isValidationFailure &&
@@ -312,13 +420,32 @@ async function callGeminiRestWithRetryAndFallback(
   }
 
   const finalClassification = lastClassification || classifyGeminiError(lastError);
+  const overallEndMs = Date.now();
+  const overallCompletedAt = new Date(overallEndMs).toISOString();
+  const failureDiagnostics: OcrDiagnosticsSummary = {
+    model: attemptDiagnostics[attemptDiagnostics.length - 1]?.model || primaryModel,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: Math.max(1, overallEndMs - overallStartMs),
+    statusCode: finalClassification.statusCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
+    attempts: attemptDiagnostics,
+  };
 
   logWorkerOcrEvent('error', 'all_models_and_retries_exhausted', {
     primaryModel,
     fallbackModels: fallbackModels.join(','),
     totalRetryAttempts,
+    requestStartedAt: overallStartedAt,
+    requestCompletedAt: overallCompletedAt,
+    durationMs: failureDiagnostics.durationMs,
     statusCode: finalClassification.statusCode,
     errorCode: finalClassification.errorCode,
+    providerErrorMessage: finalClassification.cleanMessage,
+    imageCount,
+    approxPayloadBytes,
     error: finalClassification.cleanMessage,
   });
 
@@ -329,6 +456,7 @@ async function callGeminiRestWithRetryAndFallback(
   finalErr.status = finalClassification.statusCode;
   finalErr.code = finalClassification.errorCode;
   finalErr.retryable = finalClassification.isRetryableAvailabilityError || finalClassification.isTimeout;
+  finalErr.diagnostics = failureDiagnostics;
   throw finalErr;
 }
 
@@ -399,13 +527,20 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
 
   const responseSchema = buildRestDocketResponseSchema();
 
-  const { parsed, modelUsed, fallbackUsed, retryAttempts } = await callGeminiRestWithRetryAndFallback(
-    apiKey,
-    env,
-    systemInstruction,
-    parts,
-    responseSchema
-  );
+  const workerTimeoutMs =
+    totalPages > 1 ? GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS : GEMINI_REQUEST_TIMEOUT_MS;
+
+  const { parsed, modelUsed, fallbackUsed, retryAttempts, diagnostics } =
+    await callGeminiRestWithRetryAndFallback(
+      apiKey,
+      env,
+      systemInstruction,
+      parts,
+      responseSchema,
+      'batch',
+      workerTimeoutMs,
+      totalPages > 1 ? 85000 : 80000
+    );
 
   const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
   const rawPageHeaders: any[] = Array.isArray(parsed.pageHeaders) ? parsed.pageHeaders : [];
@@ -821,6 +956,8 @@ async function handleExtractDocket(request: Request, env: Env): Promise<Response
   const responsePayload = {
     ...primary,
     pagesScanned: totalPages,
+    processingTimeMs: diagnostics.durationMs,
+    ocrDiagnostics: diagnostics,
     separatedDockets: builtDockets,
   };
 
@@ -1094,7 +1231,7 @@ export default {
             : classification.errorCode === 'GEMINI_RATE_LIMIT_429'
             ? 'Gemini AI rate limit reached (HTTP 429). Your uploaded docket has been preserved — please wait a few seconds and click "Retry Extraction".'
             : classification.errorCode === 'GEMINI_TIMEOUT'
-            ? `Gemini AI request timed out after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s (HTTP 504). Your uploaded docket has been preserved — please click "Retry Extraction".`
+            ? `${classification.cleanMessage || 'Gemini AI request timed out (HTTP 504).'} Your uploaded docket has been preserved — please click "Retry Extraction".`
             : classification.errorCode === 'GEMINI_HIGH_DEMAND_503'
             ? 'Gemini AI is currently experiencing temporary high demand (HTTP 503). Your uploaded docket has been preserved — please click "Retry Extraction".'
             : classification.cleanMessage || 'Gemini AI invoice extraction failed.';
@@ -1104,6 +1241,7 @@ export default {
             error: errorMessage,
             code: classification.errorCode,
             retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
+            diagnostics: err?.diagnostics,
           }),
           {
             status: classification.statusCode,

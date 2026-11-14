@@ -54,6 +54,7 @@ export interface SmartDocketExtractionOptions {
   forceGemini?: boolean;
   fetchImpl?: typeof fetch;
   clientBaseBackoffMs?: number;
+  clientPerRequestTimeoutMs?: number;
   clientOverallTimeoutMs?: number;
   sourceFileIds?: string[];
   enableTargetedRecovery?: boolean;
@@ -71,8 +72,38 @@ export class DocketOfflineError extends Error {
 
 export const CLIENT_MAX_AUTOMATIC_RETRIES = 1;
 export const CLIENT_INITIAL_BACKOFF_MS = 1800;
-export const CLIENT_OVERALL_TIMEOUT_MS = 50000; // 50s overall client timeout (within 45-60s requirement)
-export const CLIENT_PER_REQUEST_TIMEOUT_MS = 45000;
+export const CLIENT_SINGLE_PAGE_PER_REQUEST_TIMEOUT_MS = 65000;
+export const CLIENT_MULTI_PAGE_PER_REQUEST_TIMEOUT_MS = 92000; // Within Cloudflare 100s HTTP 524 edge window
+export const CLIENT_SINGLE_PAGE_OVERALL_TIMEOUT_MS = 75000;
+export const CLIENT_MULTI_PAGE_OVERALL_TIMEOUT_MS = 110000;
+export const CLIENT_OVERALL_TIMEOUT_MS = CLIENT_MULTI_PAGE_OVERALL_TIMEOUT_MS;
+export const CLIENT_PER_REQUEST_TIMEOUT_MS = CLIENT_MULTI_PAGE_PER_REQUEST_TIMEOUT_MS;
+
+export function resolveClientExtractionTimeouts(
+  totalPages: number,
+  options?: SmartDocketExtractionOptions
+): { perRequestTimeoutMs: number; overallTimeoutMs: number } {
+  const defaultPerReq =
+    totalPages > 1
+      ? CLIENT_MULTI_PAGE_PER_REQUEST_TIMEOUT_MS
+      : CLIENT_SINGLE_PAGE_PER_REQUEST_TIMEOUT_MS;
+  const defaultOverall =
+    totalPages > 1
+      ? CLIENT_MULTI_PAGE_OVERALL_TIMEOUT_MS
+      : CLIENT_SINGLE_PAGE_OVERALL_TIMEOUT_MS;
+
+  const perRequestTimeoutMs =
+    typeof options?.clientPerRequestTimeoutMs === 'number' && options.clientPerRequestTimeoutMs > 0
+      ? options.clientPerRequestTimeoutMs
+      : defaultPerReq;
+
+  const overallTimeoutMs =
+    typeof options?.clientOverallTimeoutMs === 'number' && options.clientOverallTimeoutMs > 0
+      ? options.clientOverallTimeoutMs
+      : Math.max(defaultOverall, perRequestTimeoutMs);
+
+  return { perRequestTimeoutMs, overallTimeoutMs };
+}
 
 function computeClientBackoffWithJitter(
   attemptIndex: number,
@@ -191,10 +222,12 @@ export async function prepareColorImageForGemini(
 /**
  * Creates a full-page image PLUS two overlapping high-resolution horizontal slices
  * (upper 0%-58%, lower 42%-100%) so Gemini Vision captures dense multi-column industrial tables accurately.
+ * Tuned to 1800px / JPEG 0.82 by default to keep multi-page 3-slice payloads fast and compact without losing legibility.
  */
 export async function preparePageSlicesForGemini(
   source: string | File,
-  maxDimension: number = 2200
+  maxDimension: number = 1800,
+  jpegQuality: number = 0.82
 ): Promise<{
   fullDataUrl: string;
   upperDataUrl: string;
@@ -245,7 +278,7 @@ export async function preparePageSlicesForGemini(
       fullCtx.imageSmoothingEnabled = true;
       fullCtx.imageSmoothingQuality = 'high';
       fullCtx.drawImage(img, 0, 0, width, height);
-      const fullDataUrl = fullCanvas.toDataURL('image/jpeg', 0.88);
+      const fullDataUrl = fullCanvas.toDataURL('image/jpeg', jpegQuality);
 
       const upperH = Math.max(1, Math.round(height * 0.58));
       const upperCanvas = document.createElement('canvas');
@@ -255,7 +288,7 @@ export async function preparePageSlicesForGemini(
       let upperDataUrl = fullDataUrl;
       if (upperCtx) {
         upperCtx.drawImage(fullCanvas, 0, 0, width, upperH, 0, 0, width, upperH);
-        upperDataUrl = upperCanvas.toDataURL('image/jpeg', 0.9);
+        upperDataUrl = upperCanvas.toDataURL('image/jpeg', jpegQuality);
       }
 
       const lowerStartY = Math.floor(height * 0.42);
@@ -267,7 +300,7 @@ export async function preparePageSlicesForGemini(
       let lowerDataUrl = fullDataUrl;
       if (lowerCtx) {
         lowerCtx.drawImage(fullCanvas, 0, lowerStartY, width, lowerH, 0, 0, width, lowerH);
-        lowerDataUrl = lowerCanvas.toDataURL('image/jpeg', 0.9);
+        lowerDataUrl = lowerCanvas.toDataURL('image/jpeg', jpegQuality);
       }
 
       resolve({
@@ -333,7 +366,7 @@ async function attemptTargetedUnresolvedRowRecovery(
     };
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 22000);
+    const timer = setTimeout(() => controller.abort(), 35000);
 
     let response: Response;
     try {
@@ -416,7 +449,7 @@ async function attemptTargetedUnresolvedRowRecovery(
 /**
  * Primary Gemini-First Docket & Invoice Extraction Pipeline (`gemini-4-hydrogen` -> `gemini-3.1-flash-lite` fallback):
  * - Prepares high-resolution images + overlapping upper/lower horizontal slices + PDF selectable text hints.
- * - Enforces an overall 50s client timeout (45-60s range).
+ * - Uses dynamic platform-safe client timeouts (65s single-page / 92s multi-page inside Cloudflare 100s limit).
  * - Allows at most 1 automatic client retry on transient errors (503, 502, 429, network drop).
  * - Never retries permanent errors (400, 401, 403, 404, quota exceeded) or Cloudflare 524 / 504 timeouts.
  * - Never displays "Gemini busy" unless an actual retry is occurring.
@@ -432,7 +465,8 @@ export async function executeGeminiDocketExtraction(
   const totalPages = images.length;
   const fetchFn = options?.fetchImpl || fetch;
   const baseBackoffMs = options?.clientBaseBackoffMs ?? CLIENT_INITIAL_BACKOFF_MS;
-  const overallTimeoutMs = options?.clientOverallTimeoutMs ?? CLIENT_OVERALL_TIMEOUT_MS;
+  const { perRequestTimeoutMs: configuredPerRequestTimeoutMs, overallTimeoutMs } =
+    resolveClientExtractionTimeouts(totalPages, options);
   const startMs = performance.now();
 
   onProgress?.({
@@ -447,7 +481,7 @@ export async function executeGeminiDocketExtraction(
   });
 
   const preparedList = await Promise.all(
-    images.map((img) => preparePageSlicesForGemini(img, 2200))
+    images.map((img) => preparePageSlicesForGemini(img, 1800, 0.82))
   );
 
   const processedPages: OfflineDocketExtractionOutput['processedPages'] = preparedList.map(
@@ -466,16 +500,23 @@ export async function executeGeminiDocketExtraction(
     })
   );
 
+  const stripBase64Prefix = (url?: string) =>
+    String(url || '').replace(/^data:[^;]+;base64,/i, '').trim();
+
+  let clientWireImageCount = 0;
   const wireSlices: PageSlicePayload[] = processedPages.map((p) => {
     const sp = p.slicePayload!;
-    const distinctUpper =
-      sp.upperDataUrl && sp.upperDataUrl !== sp.fullDataUrl ? sp.upperDataUrl : undefined;
+    const fullB64 = stripBase64Prefix(sp.fullDataUrl);
+    const upperB64 = stripBase64Prefix(sp.upperDataUrl);
+    const lowerB64 = stripBase64Prefix(sp.lowerDataUrl);
+    const distinctUpper = sp.upperDataUrl && upperB64 && upperB64 !== fullB64 ? sp.upperDataUrl : undefined;
     const distinctLower =
-      sp.lowerDataUrl &&
-      sp.lowerDataUrl !== sp.fullDataUrl &&
-      sp.lowerDataUrl !== sp.upperDataUrl
+      sp.lowerDataUrl && lowerB64 && lowerB64 !== fullB64 && lowerB64 !== upperB64
         ? sp.lowerDataUrl
         : undefined;
+    if (fullB64) clientWireImageCount++;
+    if (distinctUpper) clientWireImageCount++;
+    if (distinctLower) clientWireImageCount++;
     return {
       fullDataUrl: sp.fullDataUrl,
       upperDataUrl: distinctUpper,
@@ -491,13 +532,17 @@ export async function executeGeminiDocketExtraction(
     startItemIndex: 1,
     supplierHint: options?.supplierHint,
   });
+  const approxPayloadBytes = requestBody.length;
 
   let lastError: Error | null = null;
+  let lastClientStartedAt = new Date().toISOString();
+  let lastClientCompletedAt = lastClientStartedAt;
+  let lastClientDurationMs = 0;
 
   for (let retryAttempt = 0; retryAttempt <= CLIENT_MAX_AUTOMATIC_RETRIES; retryAttempt++) {
     const elapsedSoFarMs = performance.now() - startMs;
     const remainingBudgetMs = overallTimeoutMs - elapsedSoFarMs;
-    if (remainingBudgetMs <= 1500) {
+    if (remainingBudgetMs <= 50) {
       throw new Error(
         `Gemini AI extraction timed out after ${Math.round(overallTimeoutMs / 1000)}s. Your uploaded docket pages are preserved — please click "Retry Extraction" or review manually.`
       );
@@ -506,7 +551,7 @@ export async function executeGeminiDocketExtraction(
     let progressTimer: ReturnType<typeof setInterval> | null = null;
     let requestAbortTimer: ReturnType<typeof setTimeout> | null = null;
     const controller = new AbortController();
-    const requestTimeoutMs = Math.min(CLIENT_PER_REQUEST_TIMEOUT_MS, Math.max(2000, remainingBudgetMs));
+    const requestTimeoutMs = Math.min(configuredPerRequestTimeoutMs, Math.max(50, remainingBudgetMs));
     requestAbortTimer = setTimeout(() => controller.abort(), requestTimeoutMs);
 
     try {
@@ -526,7 +571,7 @@ export async function executeGeminiDocketExtraction(
       });
 
       progressTimer = setInterval(() => {
-        simulatedPercent = Math.min(90, simulatedPercent + 5);
+        simulatedPercent = Math.min(92, simulatedPercent + 4);
         const estPage = Math.min(
           totalPages,
           Math.max(1, Math.ceil(((simulatedPercent - 25) / 68) * totalPages))
@@ -547,6 +592,17 @@ export async function executeGeminiDocketExtraction(
         });
       }, 900);
 
+      const attemptStartMs = performance.now();
+      lastClientStartedAt = new Date().toISOString();
+      console.info('[PartTrack OCR] request_started', {
+        totalPages,
+        imageCount: clientWireImageCount,
+        approxPayloadBytes,
+        requestTimeoutMs,
+        attempt: retryAttempt + 1,
+        requestStartedAt: lastClientStartedAt,
+      });
+
       let response: Response;
       try {
         response = await fetchFn(extractApiUrl, {
@@ -556,15 +612,27 @@ export async function executeGeminiDocketExtraction(
           signal: controller.signal,
         });
       } catch (networkErr: any) {
+        lastClientDurationMs = Math.max(1, Math.round(performance.now() - attemptStartMs));
+        lastClientCompletedAt = new Date().toISOString();
         const netMsg = networkErr?.message || String(networkErr || '');
         const isAbortedTimeout =
           controller.signal.aborted ||
           networkErr?.name === 'AbortError' ||
           /aborted|timed out|timeout/i.test(netMsg);
 
+        console.warn('[PartTrack OCR] request_failed', {
+          totalPages,
+          imageCount: clientWireImageCount,
+          approxPayloadBytes,
+          durationMs: lastClientDurationMs,
+          requestStartedAt: lastClientStartedAt,
+          requestCompletedAt: lastClientCompletedAt,
+          isAbortedTimeout,
+        });
+
         if (isAbortedTimeout) {
           throw new Error(
-            `Gemini AI extraction timed out after ${Math.round(requestTimeoutMs / 1000)}s without completing. Your uploaded docket pages are preserved — please click "Retry Extraction".`
+            `Gemini AI extraction timed out after ${Math.round(requestTimeoutMs / 1000)}s without completing (${totalPages} page${totalPages === 1 ? '' : 's'}, ${clientWireImageCount} image${clientWireImageCount === 1 ? '' : 's'}, ~${Math.round(approxPayloadBytes / 1024)} KB). Your uploaded docket pages are preserved — please click "Retry Extraction".`
           );
         }
 
@@ -599,10 +667,26 @@ export async function executeGeminiDocketExtraction(
         }
       }
 
+      lastClientDurationMs = Math.max(1, Math.round(performance.now() - attemptStartMs));
+      lastClientCompletedAt = new Date().toISOString();
+
       if (!response.ok) {
         const errBody = await response.json().catch(() => ({}));
         const code = String(errBody?.code || '');
         const rawMsg = String(errBody?.error || '');
+        const serverDiag = errBody?.diagnostics;
+
+        console.warn('[PartTrack OCR] request_error_response', {
+          statusCode: response.status,
+          code,
+          model: serverDiag?.model,
+          providerErrorMessage: serverDiag?.providerErrorMessage || rawMsg.slice(0, 200),
+          durationMs: serverDiag?.durationMs ?? lastClientDurationMs,
+          imageCount: serverDiag?.imageCount ?? clientWireImageCount,
+          approxPayloadBytes: serverDiag?.approxPayloadBytes ?? approxPayloadBytes,
+          requestStartedAt: lastClientStartedAt,
+          requestCompletedAt: lastClientCompletedAt,
+        });
 
         if (
           code === 'MISSING_GEMINI_API_KEY' ||
@@ -763,6 +847,26 @@ export async function executeGeminiDocketExtraction(
 
       const elapsedMs = Math.max(1, Math.round(performance.now() - startMs));
       const resolvedModelName = normalizedResult.aiModelUsed || DEFAULT_PRIMARY_VISION_MODEL;
+      const mergedDiagnostics = rawJson?.ocrDiagnostics || {
+        model: resolvedModelName,
+        requestStartedAt: lastClientStartedAt,
+        requestCompletedAt: lastClientCompletedAt,
+        durationMs: lastClientDurationMs || elapsedMs,
+        statusCode: 200,
+        imageCount: clientWireImageCount,
+        approxPayloadBytes,
+      };
+
+      console.info('[PartTrack OCR] request_succeeded', {
+        model: resolvedModelName,
+        totalPages,
+        imageCount: mergedDiagnostics.imageCount ?? clientWireImageCount,
+        approxPayloadBytes: mergedDiagnostics.approxPayloadBytes ?? approxPayloadBytes,
+        durationMs: mergedDiagnostics.durationMs ?? elapsedMs,
+        statusCode: mergedDiagnostics.statusCode ?? 200,
+        requestStartedAt: mergedDiagnostics.requestStartedAt || lastClientStartedAt,
+        requestCompletedAt: mergedDiagnostics.requestCompletedAt || lastClientCompletedAt,
+      });
 
       const enrichedResult: ExtractedDocketResult = {
         ...normalizedResult,
@@ -774,6 +878,7 @@ export async function executeGeminiDocketExtraction(
         fallbackUsed: Boolean(normalizedResult.fallbackUsed),
         geminiFallbackReason: fallbackReason,
         processingTimeMs: elapsedMs,
+        ocrDiagnostics: mergedDiagnostics,
       };
 
       onProgress?.({

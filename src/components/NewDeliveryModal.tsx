@@ -108,6 +108,8 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [loadingFileStatus, setLoadingFileStatus] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+  const isExtractingRef = useRef(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [ocrProgress, setOcrProgress] = useState<OcrProgressUpdate | null>(null);
   const [ocrError, setOcrError] = useState<string | null>(null);
   const [offlineQueueNotice, setOfflineQueueNotice] = useState<string | null>(null);
@@ -124,6 +126,19 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
     }> | null
   >(null);
   const [pendingUploads, setPendingUploads] = useState<PendingDocketUpload[]>([]);
+
+  useEffect(() => {
+    if (!isProcessing) {
+      setElapsedSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    setElapsedSeconds(0);
+    const id = setInterval(() => {
+      setElapsedSeconds(Math.max(1, Math.floor((Date.now() - startedAt) / 1000)));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isProcessing]);
 
   const refreshPendingUploads = useCallback(() => {
     listPendingDocketUploads()
@@ -325,7 +340,8 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
   };
 
   const handleExtractPartsFromDocket = async () => {
-    if (capturedPages.length === 0) return;
+    if (capturedPages.length === 0 || isExtractingRef.current) return;
+    isExtractingRef.current = true;
 
     setOcrError(null);
     setOfflineQueueNotice(null);
@@ -364,28 +380,28 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
       );
     };
 
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      await queueCurrentPagesOffline();
-      return;
-    }
-
-    setIsProcessing(true);
-    setOcrProgress({
-      currentPage: 1,
-      totalPages: capturedPages.length,
-      stage: 'preparing',
-      percent: 5,
-      statusText: 'Preparing docket for Gemini 4 Hydrogen Vision...',
-    });
-
-    apiNotifyDocketProcessing({
-      fileName: capturedPages[0]?.name || 'Delivery Docket',
-      fileCount: capturedPages.length,
-      supplier: SUPPLIER_RULES[selectedSupplierRule]?.name,
-      status: 'processing',
-    }).catch(() => {});
-
     try {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        await queueCurrentPagesOffline();
+        return;
+      }
+
+      setIsProcessing(true);
+      setOcrProgress({
+        currentPage: 1,
+        totalPages: capturedPages.length,
+        stage: 'preparing',
+        percent: 5,
+        statusText: 'Preparing docket for Gemini 4 Hydrogen Vision...',
+      });
+
+      apiNotifyDocketProcessing({
+        fileName: capturedPages[0]?.name || 'Delivery Docket',
+        fileCount: capturedPages.length,
+        supplier: SUPPLIER_RULES[selectedSupplierRule]?.name,
+        status: 'processing',
+      }).catch(() => {});
+
       const imagesToProcess = capturedPages.map((p) => p.dataUrl);
       const pageTextHints = capturedPages.map((p) => p.textHint || {});
       const sourceFileIds = capturedPages.map((p) => p.sourceFileId || p.id);
@@ -432,6 +448,8 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
         err?.message ||
           'Docket extraction failed. Ensure docket image or PDF is legible.'
       );
+    } finally {
+      isExtractingRef.current = false;
     }
   };
 
@@ -587,7 +605,7 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
 
                   <span className="font-mono text-xs text-[var(--pt-text-muted,#737B94)] tabular-nums">
                     {ocrProgress?.percent || 20}% complete · Page {ocrProgress?.currentPage || 1} of{' '}
-                    {ocrProgress?.totalPages || 1}
+                    {ocrProgress?.totalPages || 1} · {elapsedSeconds}s elapsed
                   </span>
                 </div>
               ) : (
@@ -611,8 +629,10 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                             Your {capturedPages.length} uploaded page(s) are preserved.
                           </span>
                           <button
+                            type="button"
+                            disabled={isProcessing}
                             onClick={handleExtractPartsFromDocket}
-                            className="px-3 py-1.5 rounded-lg pt-btn-primary font-mono font-bold text-xs cursor-pointer shadow-2xs"
+                            className="px-3 py-1.5 rounded-lg pt-btn-primary font-mono font-bold text-xs cursor-pointer shadow-2xs disabled:opacity-50"
                           >
                             Retry Extraction
                           </button>
@@ -952,8 +972,9 @@ export const NewDeliveryModal: React.FC<NewDeliveryModalProps> = ({
                         {/* Explicit User Confirmation Button to Start Processing */}
                         <button
                           type="button"
+                          disabled={isProcessing || capturedPages.length === 0}
                           onClick={handleExtractPartsFromDocket}
-                          className="w-full h-11 px-4 pt-btn-primary font-mono font-bold text-xs tracking-wider uppercase rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-sm"
+                          className="w-full h-11 px-4 pt-btn-primary font-mono font-bold text-xs tracking-wider uppercase rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-colors shadow-sm disabled:opacity-50"
                         >
                           <Check className="w-4 h-4 stroke-[2.5]" />
                           <span>

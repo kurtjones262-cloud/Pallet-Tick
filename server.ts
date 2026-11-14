@@ -218,6 +218,7 @@ app.post('/api/extract-docket', async (req: ExpressRequest, res: ExpressResponse
       error: errorMessage,
       code: classification.errorCode,
       retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
+      diagnostics: err?.diagnostics,
     });
   }
 });

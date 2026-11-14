@@ -3,7 +3,7 @@
  *
  * Secure server-side Gemini AI Vision invoice & docket extraction with:
  * - Primary model: gemini-4-hydrogen (ThinkingLevel LOW), secondary fallback: gemini-3.1-flash-lite
- * - Per-request 22s AbortController timeout, max 1 retry on transient 503/502/429 errors
+ * - Per-request 45s AbortController timeout, max 1 retry on transient 503/502/429 errors
  * - Fast failover on 404 invalid model, daily quota exhaustion, or timeout; immediate abort on 401/403/400
  * - Multi-docket segmentation via pageHeaders & startsNewDocket
  * - Rich structured item fields (rev, unit, originalText, confidence, validationWarnings)
@@ -13,6 +13,7 @@ import {
   DEFAULT_PRIMARY_VISION_MODEL,
   DEFAULT_FALLBACK_VISION_MODELS,
   GEMINI_REQUEST_TIMEOUT_MS,
+  GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS,
   MAX_AUTOMATIC_RETRIES,
   INITIAL_BACKOFF_MS,
   DOCKET_EXTRACTION_SYSTEM_INSTRUCTION,
@@ -24,6 +25,9 @@ import {
   appendPagePayloadParts,
   buildDocketExtractionPrompt,
   buildRestDocketResponseSchema,
+  summarizePartsForDiagnostics,
+  OcrAttemptDiagnostics,
+  OcrDiagnosticsSummary,
 } from '../../src/server/docketOcr.ts';
 
 interface CloudflareEnv {
@@ -55,10 +59,21 @@ function computeExponentialBackoffWithJitter(retryAttempt: number, baseMs: numbe
   return Math.min(8000, baseMs * Math.pow(2, exp) + Math.floor(Math.random() * 450));
 }
 
+const SAFE_PAGES_LOG_KEYS = new Set([
+  'imageCount',
+  'approxPayloadBytes',
+  'requestStartedAt',
+  'requestCompletedAt',
+  'durationMs',
+  'statusCode',
+  'providerErrorMessage',
+  'model',
+]);
+
 function logPagesOcrEvent(level: 'info' | 'warn' | 'error', event: string, meta: Record<string, unknown> = {}) {
   const safe: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(meta)) {
-    if (/key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
+    if (!SAFE_PAGES_LOG_KEYS.has(k) && /key|token|secret|image|base64|dataurl|text/i.test(k)) continue;
     safe[k] = typeof v === 'string' ? v.replace(/key=[A-Za-z0-9_\-]+/gi, 'key=[REDACTED]').slice(0, 300) : v;
   }
   const msg = JSON.stringify({ timestamp: new Date().toISOString(), component: 'PartTrack-Pages-OCR', event, ...safe });
@@ -317,8 +332,9 @@ async function callGeminiRestSingleAttempt(
   model: string,
   systemInstruction: string,
   parts: Array<Record<string, unknown>>,
-  responseSchema: Record<string, unknown>
-): Promise<string> {
+  responseSchema: Record<string, unknown>,
+  timeoutMs: number = GEMINI_REQUEST_TIMEOUT_MS
+): Promise<{ text: string; statusCode: number }> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const generationConfig: Record<string, unknown> = {
@@ -338,7 +354,7 @@ async function callGeminiRestSingleAttempt(
   };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let response: Response;
   try {
@@ -351,9 +367,10 @@ async function callGeminiRestSingleAttempt(
   } catch (fetchErr: any) {
     if (controller.signal.aborted || fetchErr?.name === 'AbortError') {
       const timeoutErr: any = new Error(
-        `Gemini API request to ${model} timed out after ${Math.round(GEMINI_REQUEST_TIMEOUT_MS / 1000)}s (HTTP 504).`
+        `Gemini API request to ${model} timed out after ${Math.round(timeoutMs / 1000)}s (HTTP 504).`
       );
       timeoutErr.status = 504;
+      timeoutErr.code = 'GEMINI_TIMEOUT';
       timeoutErr.isTimeout = true;
       throw timeoutErr;
     }
@@ -372,9 +389,11 @@ async function callGeminiRestSingleAttempt(
   const result: any = await response.json();
   const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
-    throw new Error('Malformed OCR response: Empty response received from Gemini AI model.');
+    const emptyErr: any = new Error('Malformed OCR response: Empty response received from Gemini AI model.');
+    emptyErr.status = response.status || 502;
+    throw emptyErr;
   }
-  return text;
+  return { text, statusCode: response.status || 200 };
 }
 
 export const onRequestOptions = async (): Promise<Response> => {
@@ -467,6 +486,16 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
       ...allModels.filter((m) => (pagesModelCooldownUntil.get(m) || 0) > nowMs),
     ];
 
+    const { imageCount, approxPayloadBytes } = summarizePartsForDiagnostics(parts);
+    const overallStartMs = Date.now();
+    const overallStartedAt = new Date(overallStartMs).toISOString();
+    const attemptDiagnostics: OcrAttemptDiagnostics[] = [];
+    let finalDiagnostics: OcrDiagnosticsSummary | undefined;
+
+    const pagesTimeoutMs =
+      totalPages > 1 ? GEMINI_MULTI_PAGE_REQUEST_TIMEOUT_MS : GEMINI_REQUEST_TIMEOUT_MS;
+    const maxTotalBudgetMs = totalPages > 1 ? 85000 : 80000;
+
     let parsed: any = null;
     let lastError: any = null;
     let modelUsed: string = primaryModel;
@@ -477,44 +506,110 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
       const model = candidateModels[mIdx];
       const isFallback = model !== primaryModel;
 
+      const remainingBeforeModelMs = maxTotalBudgetMs - (Date.now() - overallStartMs);
+      if (remainingBeforeModelMs < 4000) {
+        break;
+      }
+
       logPagesOcrEvent('info', isFallback ? 'model_fallback_selected' : 'model_selected', {
         model,
         isFallback,
+        imageCount,
+        approxPayloadBytes,
       });
 
       for (let retry = 0; retry <= MAX_AUTOMATIC_RETRIES; retry++) {
+        const remainingBudgetMs = maxTotalBudgetMs - (Date.now() - overallStartMs);
+        if (remainingBudgetMs < 4000) {
+          break;
+        }
+        const attemptTimeoutMs = Math.min(pagesTimeoutMs, remainingBudgetMs);
+        const attemptStartMs = Date.now();
+        const requestStartedAt = new Date(attemptStartMs).toISOString();
         try {
-          const rawJsonText = await callGeminiRestSingleAttempt(
+          const { text: rawJsonText, statusCode } = await callGeminiRestSingleAttempt(
             apiKey,
             model,
             systemInstruction,
             parts,
-            responseSchema
+            responseSchema,
+            attemptTimeoutMs
           );
           parsed = validateOcrPayload(rawJsonText);
           modelUsed = model;
           fallbackUsed = isFallback;
+          const attemptEndMs = Date.now();
+          const requestCompletedAt = new Date(attemptEndMs).toISOString();
+          const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
+
+          attemptDiagnostics.push({
+            model,
+            attempt: retry + 1,
+            requestStartedAt,
+            requestCompletedAt,
+            durationMs,
+            statusCode,
+            imageCount,
+            approxPayloadBytes,
+          });
+          finalDiagnostics = {
+            model,
+            requestStartedAt: overallStartedAt,
+            requestCompletedAt,
+            durationMs: Math.max(1, attemptEndMs - overallStartMs),
+            statusCode,
+            imageCount,
+            approxPayloadBytes,
+            attempts: attemptDiagnostics,
+          };
+
           logPagesOcrEvent('info', 'extraction_succeeded', {
             model,
             isFallback,
             retryAttempts: totalRetryAttempts,
-            statusCode: 200,
+            requestStartedAt,
+            requestCompletedAt,
+            durationMs,
+            statusCode,
+            imageCount,
+            approxPayloadBytes,
             itemsExtracted: parsed.items.length,
           });
           break;
         } catch (err: any) {
+          const attemptEndMs = Date.now();
+          const requestCompletedAt = new Date(attemptEndMs).toISOString();
+          const durationMs = Math.max(1, attemptEndMs - attemptStartMs);
           lastError = err;
           const classification = classifyGeminiError(err);
           const msg = String(err?.message || '');
           const isValidationFailure = /Malformed|Incomplete OCR|Invalid OCR item/i.test(msg);
+
+          attemptDiagnostics.push({
+            model,
+            attempt: retry + 1,
+            requestStartedAt,
+            requestCompletedAt,
+            durationMs,
+            statusCode: classification.statusCode,
+            providerErrorMessage: classification.cleanMessage,
+            imageCount,
+            approxPayloadBytes,
+          });
 
           logPagesOcrEvent('warn', 'extraction_attempt_failed', {
             model,
             isFallback,
             attempt: retry + 1,
             maxAttempts: MAX_AUTOMATIC_RETRIES + 1,
+            requestStartedAt,
+            requestCompletedAt,
+            durationMs,
             statusCode: classification.statusCode,
             errorCode: classification.errorCode,
+            providerErrorMessage: classification.cleanMessage,
+            imageCount,
+            approxPayloadBytes,
             isRetryable: classification.isRetryableAvailabilityError || isValidationFailure,
             reason: classification.cleanMessage,
           });
@@ -523,6 +618,17 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
             const permErr: any = new Error(classification.cleanMessage);
             permErr.status = classification.statusCode;
             permErr.code = classification.errorCode;
+            permErr.diagnostics = {
+              model,
+              requestStartedAt: overallStartedAt,
+              requestCompletedAt,
+              durationMs: Math.max(1, attemptEndMs - overallStartMs),
+              statusCode: classification.statusCode,
+              providerErrorMessage: classification.cleanMessage,
+              imageCount,
+              approxPayloadBytes,
+              attempts: attemptDiagnostics,
+            } satisfies OcrDiagnosticsSummary;
             throw permErr;
           }
 
@@ -554,7 +660,21 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
     }
 
     if (!parsed) {
-      throw lastError || new Error('Could not extract parts from docket images.');
+      const errToThrow: any = lastError || new Error('Could not extract parts from docket images.');
+      const lastClassification = classifyGeminiError(errToThrow);
+      const overallEndMs = Date.now();
+      errToThrow.diagnostics = errToThrow.diagnostics || {
+        model: attemptDiagnostics[attemptDiagnostics.length - 1]?.model || primaryModel,
+        requestStartedAt: overallStartedAt,
+        requestCompletedAt: new Date(overallEndMs).toISOString(),
+        durationMs: Math.max(1, overallEndMs - overallStartMs),
+        statusCode: lastClassification.statusCode,
+        providerErrorMessage: lastClassification.cleanMessage,
+        imageCount,
+        approxPayloadBytes,
+        attempts: attemptDiagnostics,
+      };
+      throw errToThrow;
     }
 
     const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
@@ -891,6 +1011,8 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
     const responsePayload = {
       ...primary,
       pagesScanned: totalPages,
+      processingTimeMs: finalDiagnostics?.durationMs,
+      ocrDiagnostics: finalDiagnostics,
       separatedDockets: builtDockets,
     };
 
@@ -910,6 +1032,7 @@ export const onRequestPost = async (context: EventContext): Promise<Response> =>
           : classification.cleanMessage || 'Gemini AI invoice extraction failed.',
         code,
         retryable: classification.isRetryableAvailabilityError || classification.isTimeout,
+        diagnostics: err?.diagnostics,
       }),
       {
         status,
